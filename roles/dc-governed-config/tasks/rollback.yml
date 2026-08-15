@@ -1,0 +1,156 @@
+---
+# Restore the most recent pre-merge config and bring the Gateway back.
+#
+# This exists because the first real rollback was three sudo commands pasted
+# from a chat transcript, with a placeholder in one of them. That is the
+# operator-memory step TASK-212 criterion 4 objects to, wearing a different hat:
+# a recovery procedure that lives only in someone's scrollback is not a tested
+# procedure, and the moment you need it is the worst moment to be improvising.
+#
+# Run: ansible-playbook playbooks/governed-rollback.yml
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+- name: Find the available backups
+  ansible.builtin.find:
+    paths: "{{ dc_openclaw_backup_dir }}"
+    patterns: "openclaw.json.*"
+    file_type: file
+  register: dc_backups
+
+- name: Refuse to roll back to nothing
+  ansible.builtin.fail:
+    msg: >-
+      No backup found in {{ dc_openclaw_backup_dir }}. There is nothing to
+      restore, and overwriting the current config with a guess would be worse
+      than leaving it. If the Gateway is down, read its journal rather than
+      reaching for this playbook.
+  when: dc_backups.matched | int == 0
+
+# Newest by mtime rather than by filename. The names are timestamped, so sorting
+# by name usually agrees -- but "usually" is doing load-bearing work in that
+# sentence and mtime is the fact we actually mean.
+- name: Select the most recent backup
+  ansible.builtin.set_fact:
+    dc_restore_from: >-
+      {{ (dc_backups.files | sort(attribute='mtime') | last).path }}
+
+- name: Confirm the backup parses before trusting it
+  ansible.builtin.slurp:
+    src: "{{ dc_restore_from }}"
+  register: dc_restore_raw
+
+- name: Parse the backup
+  ansible.builtin.set_fact:
+    dc_restore_parsed: "{{ dc_restore_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse to restore a backup that will not parse
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_restore_from }} could not be parsed as JSON, so restoring it would
+      replace one broken config with another. Inspect it by hand.
+  when: dc_restore_parsed is not defined
+
+# Taken before the restore, so a rollback that turns out to be the wrong move is
+# itself reversible. Rolling back should not be a one-way door.
+- name: Preserve the current config before overwriting it
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-rollback.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  failed_when: false
+
+- name: Restore the backup
+  ansible.builtin.copy:
+    src: "{{ dc_restore_from }}"
+    dest: "{{ dc_openclaw_config_path }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+# systemd refuses to start a unit that has hit StartLimitBurst until the failure
+# state is cleared. Without this the restart below reports failure for a reason
+# unrelated to the config just restored.
+- name: Clear the failed state so systemd will start the unit again
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - reset-failed
+      - "{{ dc_openclaw_service }}"
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
+  changed_when: true
+  failed_when: false
+
+- name: Start the gateway on the restored config
+  ansible.builtin.systemd_service:
+    name: "{{ dc_openclaw_service }}"
+    scope: "{{ dc_openclaw_service_scope }}"
+    state: restarted
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
+
+# A restart that returns cleanly is not evidence the process stayed up. This
+# unit died 2.3 seconds in, which a bare `state: restarted` would have reported
+# as success.
+- name: Give the gateway a moment to fail if it is going to
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Read the unit state back
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - is-active
+      - "{{ dc_openclaw_service }}"
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
+  register: dc_post_rollback
+  changed_when: false
+  failed_when: false
+
+- name: Confirm the gateway is actually running
+  ansible.builtin.assert:
+    that:
+      - (dc_post_rollback.stdout | default('') | trim) == 'active'
+    fail_msg: >-
+      Restored {{ dc_restore_from }} but the unit is
+      '{{ dc_post_rollback.stdout | default('unknown') | trim }}' after 15
+      seconds. The config was not the only problem, or not the problem at all.
+      Read the journal:
+      `journalctl --{{ dc_openclaw_service_scope }} -u {{ dc_openclaw_service }} -n 40`
+      as {{ dc_openclaw_user }}.
+    success_msg: "gateway active on restored config"
+
+- name: Emit the rollback receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-GOVERNED-CONFIG ROLLBACK RECEIPT |
+      restored_from={{ dc_restore_from }} |
+      target={{ dc_openclaw_config_path }} |
+      unit={{ dc_openclaw_service }} ({{ dc_openclaw_service_scope }} scope) |
+      state={{ dc_post_rollback.stdout | default('unknown') | trim }} |
+      backups_available={{ dc_backups.matched }}

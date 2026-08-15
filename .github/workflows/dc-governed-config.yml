@@ -76,11 +76,16 @@ jobs:
       - name: Install Ansible collections
         run: ansible-galaxy collection install -r requirements.yml
 
-      - name: Lint the governed playbook and role
-        run: ansible-lint playbooks/governed-lab.yml
+      # Both entry points, named explicitly. Upstream's lint.yml enumerates its
+      # targets by hand and stopped covering playbooks/deploy.yml the moment it
+      # was added; a glob avoids inheriting that failure mode here.
+      - name: Lint the governed playbooks and role
+        run: ansible-lint playbooks/governed-lab.yml playbooks/governed-rollback.yml
 
       - name: Syntax check
-        run: ansible-playbook playbooks/governed-lab.yml --syntax-check
+        run: |
+          ansible-playbook playbooks/governed-lab.yml --syntax-check
+          ansible-playbook playbooks/governed-rollback.yml --syntax-check
 
   merge-contract:
     name: Governance overlay merge contract
