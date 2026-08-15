@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Choose the newest backup that OpenClaw would actually accept.
 
-Usage: select_backup.py <backup-dir>   # schema on stdin
+Usage: select_backup.py <backup-dir> <schema-path>
+       select_backup.py <backup-dir>              # schema on stdin
+
+The schema path exists because `ansible.builtin.script` has no `stdin`
+parameter. See validate_overlay.py for the full note; the same defect was in
+this file's caller, which meant the ROLLBACK path was broken too — the recovery
+tool would have failed at the moment it was needed.
 
 Replaces "restore the most recent backup", which failed on 2026-08-15 in three
 separate ways at once:
@@ -106,12 +112,21 @@ def sort_key(path: Path) -> str:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: select_backup.py <backup-dir>  (schema on stdin)", file=sys.stderr)
+        print("usage: select_backup.py <backup-dir> [schema-path]", file=sys.stderr)
         return 2
 
-    schema_raw = sys.stdin.read()
+    if len(sys.argv) > 2:
+        try:
+            with open(sys.argv[2]) as handle:
+                schema_raw = handle.read()
+        except OSError as exc:
+            print(f"cannot read schema at {sys.argv[2]}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        schema_raw = sys.stdin.read()
+
     if not schema_raw.strip():
-        print("no schema on stdin; refusing to call any backup good unchecked", file=sys.stderr)
+        print("schema is empty; refusing to call any backup good unchecked", file=sys.stderr)
         return 2
     schema = json.loads(schema_raw)
     defs = schema.get("$defs") or schema.get("definitions") or {}

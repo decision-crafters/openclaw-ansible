@@ -197,6 +197,12 @@ dc_openclaw_entrypoint: ""
 # through runuser it returns the unit state.
 dc_runuser: "/usr/sbin/runuser"
 
+# Where the live schema is staged for the validator and the backup selector.
+# Root-owned 0600 and deleted immediately after use. A file rather than a pipe
+# because `ansible.builtin.script` has no `stdin` parameter, and because the
+# schema is ~1.9MB — large enough that a module argument is the wrong carrier.
+dc_schema_staging_path: "/root/.dc-openclaw-schema.json"
+
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge
 # that silently creates a file would be clobbered by the next onboarding run,

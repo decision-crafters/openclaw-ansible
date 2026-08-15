@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """Check a governance overlay against OpenClaw's own config schema.
 
-Usage: validate_overlay.py '<overlay-json>'   # schema on stdin
+Usage: validate_overlay.py '<overlay-json>' <schema-path>
+       validate_overlay.py '<overlay-json>'            # schema on stdin
+
+The schema path exists because `ansible.builtin.script` has no `stdin`
+parameter — that belongs to `command`/`shell`. The role passed one anyway and
+failed at runtime with "Unsupported parameters", which neither
+`ansible-playbook --syntax-check` nor `ansible-lint` catches: module arguments
+are validated when the module runs, not when the playbook is parsed.
+
+stdin is kept as a fallback so this stays usable by hand and from tests.
 
 Exists because of a specific failure. Every assertion in this role verified that
 values reached the merged config; none verified that OpenClaw would accept it.
@@ -100,7 +109,7 @@ def walk(overlay, schema: dict, defs: dict, path: list[str], errors: list[str]) 
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: validate_overlay.py '<overlay-json>'  (schema on stdin)", file=sys.stderr)
+        print("usage: validate_overlay.py '<overlay-json>' [schema-path]", file=sys.stderr)
         return 2
 
     try:
@@ -109,9 +118,18 @@ def main() -> int:
         print(f"overlay is not valid JSON: {exc}", file=sys.stderr)
         return 2
 
-    raw = sys.stdin.read()
+    if len(sys.argv) > 2:
+        try:
+            with open(sys.argv[2]) as handle:
+                raw = handle.read()
+        except OSError as exc:
+            print(f"cannot read schema at {sys.argv[2]}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        raw = sys.stdin.read()
+
     if not raw.strip():
-        print("no schema on stdin; refusing to report a config valid unchecked", file=sys.stderr)
+        print("schema is empty; refusing to report a config valid unchecked", file=sys.stderr)
         return 2
 
     try:

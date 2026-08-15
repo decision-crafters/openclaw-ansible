@@ -107,3 +107,10 @@ jobs:
 
       - name: Prove the overlay overrides permissive values and preserves the rest
         run: python3 tests/dc_merge_contract.py
+
+      # Neither --syntax-check nor ansible-lint validates module arguments —
+      # those are checked by the module, on the target, at run time. That let
+      # `ansible.builtin.script` be given a `stdin:` it does not accept, in both
+      # the apply path and the rollback path, through every gate above.
+      - name: Reject module parameters that only fail at run time
+        run: python3 tests/dc_module_args.py

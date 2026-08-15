@@ -222,17 +222,39 @@
     - (dc_schema_raw.rc | default(1)) != 0 or (dc_schema_raw.stdout | default('') | length) == 0
     - dc_fail_closed | bool
 
+# Written to a file rather than piped. `ansible.builtin.script` has no `stdin`
+# parameter — that belongs to command/shell — and passing one failed at runtime
+# with "Unsupported parameters". Neither `--syntax-check` nor `ansible-lint`
+# catches it: module arguments are validated when the module runs.
+#
+# A file also avoids ferrying ~1.9MB of schema through a module argument.
+- name: Stage the live schema where the validator can read it
+  ansible.builtin.copy:
+    content: "{{ dc_schema_raw.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
 - name: Check every governed key against the schema
   ansible.builtin.script:
     cmd: >-
       files/validate_overlay.py
       {{ dc_governance_overlay | to_json | quote }}
+      {{ dc_schema_staging_path | quote }}
     executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
-  args:
-    stdin: "{{ dc_schema_raw.stdout }}"
   register: dc_schema_check
   changed_when: false
   failed_when: false
+
+# Removed whether the check passed or failed, and before the fail task below, so
+# a rejected overlay does not leave the schema lying around.
+- name: Remove the staged schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
 
 - name: Refuse to write a config the schema rejects
   ansible.builtin.fail:

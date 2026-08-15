@@ -66,15 +66,35 @@
     - (dc_schema_raw.rc | default(1)) != 0 or (dc_schema_raw.stdout | default('') | length) == 0
     - dc_fail_closed | bool
 
+# Same fix as tasks/main.yml: `ansible.builtin.script` has no `stdin` parameter.
+# This file carried the identical defect, which meant the ROLLBACK path was
+# broken too — the recovery tool would have failed at the exact moment it was
+# needed, after a bad apply, with the Gateway already down.
+- name: Stage the live schema where the selector can read it
+  ansible.builtin.copy:
+    content: "{{ dc_schema_raw.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
 - name: Select the newest backup the schema accepts
   ansible.builtin.script:
-    cmd: "files/select_backup.py {{ dc_openclaw_backup_dir | quote }}"
+    cmd: >-
+      files/select_backup.py
+      {{ dc_openclaw_backup_dir | quote }}
+      {{ dc_schema_staging_path | quote }}
     executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
-  args:
-    stdin: "{{ dc_schema_raw.stdout }}"
   register: dc_selection
   changed_when: false
   failed_when: false
+
+- name: Remove the staged schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
 
 - name: Refuse when no backup is loadable
   ansible.builtin.fail:
