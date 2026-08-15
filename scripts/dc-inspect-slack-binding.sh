@@ -121,6 +121,108 @@ PY
 fi
 echo
 
+# --- 1b. The founder's baseline requirements, scored against the config -----
+# Section 1 prints what is configured. This asks the different question: of the
+# nine elements the founder listed for "baseline Slack", which are actually
+# present? Printing config and leaving the reader to notice an ABSENT key is how
+# a missing control gets read as a satisfied one.
+echo "=== 1b. Baseline requirements — present or absent ==========================="
+if [ -r "$CONFIG" ]; then
+  python3 - "$CONFIG" <<'PY'
+import json, sys
+try:
+    conf = json.load(open(sys.argv[1]))
+except Exception:
+    print("  config unparseable — every row below is UNKNOWN, not absent.")
+    raise SystemExit(0)
+
+slack = (conf.get("channels") or {}).get("slack") or {}
+if not slack:
+    print("  No channels.slack section. Rows below are UNKNOWN.")
+    raise SystemExit(0)
+
+# Key names are guessed across plausible spellings on purpose. A miss must read
+# as "not found under the names checked", never as "no restriction exists".
+def first_present(*names):
+    for n in names:
+        if n in slack and slack[n] not in (None, "", [], {}):
+            return n, slack[n]
+    return None, None
+
+rows = []
+
+k, v = first_present("allowedUsers", "allowUsers", "permittedUsers",
+                     "users", "allowlist", "allowFrom")
+rows.append(("named permitted human sender(s)", k, v,
+             "ANY workspace user who can reach the bot can drive it"))
+
+k, v = first_present("channels", "allowedChannels", "channelAllowlist",
+                     "conversations")
+rows.append(("bounded channel/conversation scope", k, v,
+             "no channel allowlist in config"))
+
+k, v = first_present("groupPolicy")
+rows.append(("group policy", k, v,
+             "unset — behaviour is whatever the default is"))
+
+k, v = first_present("dm", "allowDM", "dmPolicy", "directMessages")
+rows.append(("DM reachability stated", k, v, "not stated in config"))
+
+k, v = first_present("dedup", "deduplication", "loopProtection", "ignoreBots")
+rows.append(("loop/dedup protection", k, v,
+             "not configured here; may be internal to the connector"))
+
+for label, key, value, absent_note in rows:
+    if key:
+        print(f"  PRESENT  {label}: {key} = {json.dumps(value)}")
+    else:
+        print(f"  ABSENT   {label} — {absent_note}")
+
+print()
+print("  Full channels.slack key list (names only, for anything missed above):")
+print("   ", sorted(slack.keys()))
+caps = slack.get("capabilities")
+if isinstance(caps, dict):
+    print("  capabilities:", json.dumps(caps))
+PY
+else
+  echo "  config unreadable — UNKNOWN."
+fi
+echo
+
+# The enum is the honest answer to "is 'open' as broad as it sounds". Reading the
+# value and inferring from the word would be exactly the mistake that put an IP
+# address into gateway.bind, which is also an enum.
+echo "  --- what values groupPolicy actually accepts (from the live schema) ---"
+OC_ENTRY="$(awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}' \
+  "$OC_HOME/.config/systemd/user/$UNIT" 2>/dev/null)"
+if [ -n "${OC_ENTRY:-}" ]; then
+  runuser -u "$OC_USER" -- /usr/bin/node "$OC_ENTRY" config schema 2>/dev/null \
+  | python3 -c "
+import json,sys
+try: s=json.load(sys.stdin)
+except Exception: print('    could not read schema'); raise SystemExit
+defs=s.get('\$defs') or s.get('definitions') or {}
+def deref(n,d=0):
+    while isinstance(n,dict) and '\$ref' in n and d<30:
+        n=defs.get(n['\$ref'].split('/')[-1],{}); d+=1
+    return n or {}
+n=deref(s)
+for p in ('channels','slack','groupPolicy'):
+    n=deref((n.get('properties') or {}).get(p,{}))
+    if not n: print(f'    path stops at {p!r} — key not in schema under channels.slack'); raise SystemExit
+vals=n.get('enum')
+if not vals:
+    for b in (n.get('anyOf') or n.get('oneOf') or []):
+        b=deref(b); vals=(vals or [])+b.get('enum',[])
+print('    groupPolicy allowed values:', vals or '<not enum-constrained>')
+print('    description:', (n.get('description') or '<none>')[:400])
+"
+else
+  echo "    could not locate the OpenClaw entrypoint; schema not consulted"
+fi
+echo
+
 # --- 2. Where the credential actually comes from ----------------------------
 echo "=== 2. Credential source (names only, never values) ========================"
 ENVFILE="$OC_HOME/.env"
@@ -147,8 +249,45 @@ echo "=== 3. Slack identity and granted scopes =================================
 # `export FOO=` is as common as `FOO=` in a .env that gets sourced, and missing
 # it would report the token absent — an UNKNOWN that looks like a finding.
 TOKEN="$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?SLACK_BOT_TOKEN=["'"'"']?([^"'"'"'[:space:]]+).*/\2/p' "$ENVFILE" 2>/dev/null | head -1)"
+
+# The first run of this script on host `openclaw` (2026-08-15) reported identity
+# and scopes UNKNOWN because it looked only in .env, which holds OLLAMA_API_KEY
+# and nothing else. The Slack credentials are in the config, under
+# `channels.slack.botToken` — a location section 1 had already printed, redacted,
+# two screens above the "no token found" message.
+#
+# So the envelope's most important question went unanswered because the lookup
+# and the discovery were written as if they were about different things. Falling
+# back to the config is not a convenience; without it the script reports UNKNOWN
+# for something it is holding.
+if [ -z "${TOKEN:-}" ] && [ -r "$CONFIG" ]; then
+  TOKEN="$(python3 - "$CONFIG" <<'PY'
+import json, sys
+try:
+    conf = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+# Both known homes. Slack registers twice on this host: credentials under
+# `channels.slack`, an enablement flag under `plugins.entries.slack`.
+for path in (("channels", "slack", "botToken"),
+             ("plugins", "entries", "slack", "botToken"),
+             ("channels", "slack", "token")):
+    node = conf
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            node = None
+            break
+        node = node[part]
+    if isinstance(node, str) and node.startswith("xox"):
+        print(node)
+        break
+PY
+)"
+  [ -n "${TOKEN:-}" ] && echo "  token source: $CONFIG (channels.slack) — not .env"
+fi
+
 if [ -z "${TOKEN:-}" ]; then
-  echo "  No SLACK_BOT_TOKEN found in $ENVFILE."
+  echo "  No bot token found in $ENVFILE or $CONFIG."
   echo "  Identity and scopes are UNKNOWN — this is the single most important"
   echo "  gap in the envelope, because scopes are what actually bound the app."
   echo "  If the token lives elsewhere, re-run with: SLACK_TOKEN=xoxb-... $0"
