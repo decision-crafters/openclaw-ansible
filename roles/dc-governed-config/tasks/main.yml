@@ -135,12 +135,14 @@
 - name: Obtain the live config schema from OpenClaw
   ansible.builtin.command:
     argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
       - /usr/bin/node
       - "{{ dc_openclaw_entrypoint }}"
       - config
       - schema
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
   register: dc_schema_raw
   changed_when: false
   failed_when: false

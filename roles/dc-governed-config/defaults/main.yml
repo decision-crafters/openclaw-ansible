@@ -104,6 +104,20 @@ dc_openclaw_service_scope: "user"
 # today is wrong after the next upgrade. Set it explicitly only to override.
 dc_openclaw_entrypoint: ""
 
+# How this role switches from root to the service account.
+#
+# NOT Ansible's become. The playbook is invoked with `-e ansible_become=false`
+# to avoid a sudo password prompt on a host without passwordless sudo, and that
+# flag disables `become_user` too — so tasks that meant to run as the service
+# account silently ran as root instead. Root cannot connect to another user's
+# systemd session bus, which surfaced as "Operation not permitted" and reads
+# like a permissions problem rather than the identity problem it is.
+#
+# `runuser` needs no password when invoked by root and is unaffected by how the
+# playbook was called. Proven on the host 2026-08-15: as root the call fails,
+# through runuser it returns the unit state.
+dc_runuser: "/usr/sbin/runuser"
+
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge
 # that silently creates a file would be clobbered by the next onboarding run,

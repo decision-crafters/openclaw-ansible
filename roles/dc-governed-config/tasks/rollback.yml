@@ -86,14 +86,16 @@
 - name: Clear the failed state so systemd will start the unit again
   ansible.builtin.command:
     argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
       - env
       - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - reset-failed
       - "{{ dc_openclaw_service }}"
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
   # Reported `changed: true` unconditionally while carrying failed_when: false,
   # so a failure to clear the state was indistinguishable from success. It did
   # exactly that on 2026-08-15. rc now decides.
@@ -104,14 +106,16 @@
 - name: Start the gateway on the restored config
   ansible.builtin.command:
     argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
       - env
       - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - restart
       - "{{ dc_openclaw_service }}"
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
   changed_when: true
 
 # A restart that returns cleanly is not evidence the process stayed up. This
@@ -124,14 +128,16 @@
 - name: Read the unit state back
   ansible.builtin.command:
     argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
       - env
       - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - is-active
       - "{{ dc_openclaw_service }}"
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
   register: dc_post_rollback
   changed_when: false
   failed_when: false
