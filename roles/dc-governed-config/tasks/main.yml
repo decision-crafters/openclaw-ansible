@@ -7,6 +7,18 @@
 # be silently overwritten, leaving an operator believing controls were applied
 # when onboarding had replaced them. Refusing is the safer failure.
 
+# Resolved rather than configured. The uid is needed for XDG_RUNTIME_DIR when
+# talking to the service account's user-scope systemd, and a hardcoded value
+# would be correct on exactly one host.
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
 - name: Confirm the governed config target exists
   ansible.builtin.stat:
     path: "{{ dc_openclaw_config_path }}"

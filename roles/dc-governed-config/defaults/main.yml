@@ -67,11 +67,16 @@ dc_tools_elevated_enabled: false
 # defence in depth, not this control.
 dc_gateway_bind: "127.0.0.1"
 
-# Systemd unit installed by `openclaw onboard --install-daemon`. Set this to
-# whatever onboarding actually named it — the role refuses to finish if the unit
-# cannot be found, because a written config that is not loaded is worse than one
-# that was never written.
-dc_openclaw_service: "openclaw.service"
+# Systemd unit installed by `openclaw onboard --install-daemon`. Verified on the
+# TASK-217 host 2026-08-15: onboarding installs a **user** unit at
+# ~/.config/systemd/user/openclaw-gateway.service, not a system unit. The scope
+# matters as much as the name — a system-scope systemctl call cannot see it, and
+# would report the unit missing rather than failing for the real reason.
+dc_openclaw_service: "openclaw-gateway.service"
+
+# Systemd scope for that unit. `user` because onboarding installs it under the
+# service account rather than into /etc/systemd/system.
+dc_openclaw_service_scope: "user"
 
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge
