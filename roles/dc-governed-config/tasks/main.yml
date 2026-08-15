@@ -113,8 +113,31 @@
       gateway:
         bind: "{{ dc_gateway_bind }}"
       plugins:
-        allow: "{{ dc_plugins_allow }}"
         deny: "{{ dc_plugins_deny }}"
+
+# `plugins.allow` is deliberately NOT written when empty, which differs from how
+# this role treats tools.allow.
+#
+# For tools, OpenClaw documents that a non-empty allow-list blocks everything
+# outside it — so empty means inactive, and writing [] to clear an inherited
+# list is safe and necessary. For PLUGINS that behaviour is not documented
+# anywhere verified. The host's config (inspected 2026-08-15) has no
+# plugins.allow at all, so writing [] would introduce a key whose empty-list
+# semantics are an assumption.
+#
+# If OpenClaw read [] as "permit nothing" rather than "no allow-list", it would
+# disable every plugin — including slack, the operator's only route to this
+# Gateway, and ollama, the model provider. That is the exact shape of the
+# gateway.bind failure: a plausible reading of an unverified value, applied to a
+# live daemon.
+#
+# deny wins over allow and over per-plugin enablement, so deny alone is
+# sufficient. An absent key cannot be misread.
+- name: Include a plugin allow-list only when one is deliberately configured
+  ansible.builtin.set_fact:
+    dc_governance_overlay: >-
+      {{ dc_governance_overlay | combine({'plugins': {'allow': dc_plugins_allow}}, recursive=True) }}
+  when: dc_plugins_allow | length > 0
 
 # Checked before the schema gate, because this failure is not a schema failure.
 # `plugins.deny: ["slack"]` is perfectly legal config — the schema would accept

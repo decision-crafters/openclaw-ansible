@@ -110,16 +110,33 @@ ONBOARDED: dict[str, Any] = {
     },
     "tools": {"allow": ["read", "exec", "write"], "elevated": {"enabled": True}},
     "gateway": {"bind": "0.0.0.0", "port": 18789},
-    "channels": {"telegram": {"token": "KEEP-ME"}},
     "session": {"historyLimit": 50},
-    # Sibling keys under `plugins`, which the overlay now writes into. The exact
-    # location of Slack's credential on the real host is unconfirmed; what this
-    # models is the structural risk, which does not depend on knowing it. The
-    # overlay sets two keys under `plugins` and must not take the others with
-    # them — and one of the others is what lets the operator reach the Gateway.
+    # Mirrors the real host, inspected 2026-08-15. Earlier this modelled Slack's
+    # credential under `plugins.entries.slack`, which was a guess and was wrong
+    # in an instructive way: Slack registers TWICE. Credentials live under
+    # `channels.slack`; `plugins.entries.slack` carries only an enabled flag.
+    #
+    # Keeping the invented shape would have kept this suite green while testing
+    # a config the host does not have.
+    "channels": {
+        "telegram": {"token": "KEEP-ME"},
+        "slack": {
+            "enabled": True,
+            "botToken": "xoxb-KEEP-ME-TOO-000000000000000000000000",
+            "appToken": "xapp-AND-ME-00000000000000000000000000000",
+            "groupPolicy": "open",
+            "capabilities": {"interactiveReplies": True},
+        },
+    },
     "plugins": {
-        "entries": {"slack": {"botToken": "KEEP-ME-TOO", "appToken": "AND-ME"}},
-        "bundledDiscovery": True,
+        "entries": {
+            "ollama": {"enabled": True},
+            "slack": {"enabled": True},
+            # Enabled AND provisioned with a live key on the host. deny must win
+            # over this, which is the documented precedence.
+            "firecrawl": {"enabled": True,
+                          "config": {"webSearch": {"apiKey": "fc-KEEP-OUT"}}},
+        },
     },
 }
 
@@ -130,7 +147,12 @@ OVERLAY: dict[str, Any] = {
     "tools": {"allow": ALLOW, "deny": DENY, "exec": {"mode": EXEC_MODE},
               "elevated": {"enabled": False}},
     "gateway": {"bind": BIND},
-    "plugins": {"allow": PLUGINS_ALLOW, "deny": PLUGINS_DENY},
+    # plugins.allow is written ONLY when non-empty, mirroring tasks/main.yml.
+    # An empty list is not written, because the host has no such key and the
+    # empty-list semantics for plugins are undocumented — writing [] would
+    # assert a meaning rather than apply a control. deny alone is sufficient.
+    "plugins": ({"deny": PLUGINS_DENY} if not PLUGINS_ALLOW
+                else {"deny": PLUGINS_DENY, "allow": PLUGINS_ALLOW}),
 }
 
 
@@ -256,21 +278,49 @@ def main() -> int:
         # separate layer: plugins run in-process with the Gateway, outside the
         # sandbox every other control here depends on.
         ("firecrawl reaches plugins.deny", "firecrawl" in merged["plugins"]["deny"]),
-        ("no plugin allow-list survives", merged["plugins"].get("allow", []) == PLUGINS_ALLOW),
+        # Not "an empty allow-list is written" — no allow key is written at all.
+        # The host has none, and [] would assert an undocumented meaning against
+        # a live daemon. deny wins over allow and over per-plugin enablement, so
+        # nothing is lost; an absent key cannot be misread.
+        ("no plugin allow-list is introduced",
+         PLUGINS_ALLOW != [] or "allow" not in merged["plugins"]),
         # The merge must not deny a required plugin by either route.
         ("slack is not denied", "slack" not in merged["plugins"]["deny"]),
         ("slack is not excluded by omission",
          merged["plugins"].get("allow", []) == [] or "slack" in merged["plugins"]["allow"]),
-        # The credential the operator's own access depends on. `combine` merges
-        # dicts key by key, so this survives — but it survives by a property of
-        # the merge, and properties that hold by accident stop holding quietly.
-        ("slack credentials preserved",
-         merged["plugins"]["entries"]["slack"]["botToken"] == "KEEP-ME-TOO"),
-        ("unrelated plugin keys preserved", merged["plugins"]["bundledDiscovery"] is True),
+        # firecrawl is enabled with a live credential on the host, so this is a
+        # provisioned capability rather than a dormant one. deny overrides
+        # per-plugin enablement, which is the documented precedence.
+        ("deny survives alongside per-plugin enablement",
+         merged["plugins"]["entries"]["firecrawl"]["enabled"] is True
+         and "firecrawl" in merged["plugins"]["deny"]),
+        # `combine(recursive=True)` merges dicts key by key, so writing
+        # plugins.deny must not replace the whole `plugins` subtree and take
+        # `entries` with it. That survives by a property of the merge, and
+        # properties that hold by accident stop holding quietly.
+        ("plugins.entries survives writing plugins.deny",
+         set(merged["plugins"]["entries"]) == {"ollama", "slack", "firecrawl"}),
+        ("nested plugin config survives",
+         merged["plugins"]["entries"]["firecrawl"]["config"]["webSearch"]["apiKey"] == "fc-KEEP-OUT"),
         # Everything outside the governance surface is left alone.
         ("agent model preserved", merged["agents"]["defaults"]["model"] == "anthropic/claude-sonnet-4"),
         ("agent entries preserved", merged["agents"]["entries"][0]["id"] == "main"),
         ("channel credentials preserved", merged["channels"]["telegram"]["token"] == "KEEP-ME"),
+        # The keys the operator's own access depends on. The overlay writes
+        # nothing under `channels`, so these survive — but "survives because we
+        # never touch it" is a property worth pinning, since the next person to
+        # extend this overlay will not know that.
+        ("slack bot token preserved",
+         merged["channels"]["slack"]["botToken"].startswith("xoxb-KEEP-ME-TOO")),
+        ("slack app token preserved",
+         merged["channels"]["slack"]["appToken"].startswith("xapp-AND-ME")),
+        ("slack channel stays enabled", merged["channels"]["slack"]["enabled"] is True),
+        ("slack connector settings untouched",
+         merged["channels"]["slack"]["groupPolicy"] == "open"
+         and merged["channels"]["slack"]["capabilities"]["interactiveReplies"] is True),
+        ("ollama stays enabled", merged["plugins"]["entries"]["ollama"]["enabled"] is True),
+        ("slack plugin entry stays enabled",
+         merged["plugins"]["entries"]["slack"]["enabled"] is True),
         ("unrelated gateway keys preserved", merged["gateway"]["port"] == 18789),
         ("unrelated top-level keys preserved", merged["session"]["historyLimit"] == 50),
     ]

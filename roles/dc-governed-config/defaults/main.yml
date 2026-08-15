@@ -112,15 +112,23 @@ dc_tools_exec_mode: "deny"
 dc_plugins_deny:
   - firecrawl
 
-# Left empty deliberately, and for a sharper reason than tools.allow.
+# Left empty deliberately, and unlike dc_tools_allow, an empty value here means
+# the key is NOT WRITTEN AT ALL. See tasks/main.yml for why.
 #
-# `plugins.allow` is an exclusive allowlist that gates BUNDLED plugins too, so a
-# populated list must enumerate all ~49 of them or silently drop whatever it
-# forgot. One of the things it would forget is `slack` — and per the founder
-# decision of 2026-08-15, Slack is the operator's only route to this Gateway
-# until Tailscale exists. An allowlist is therefore not merely awkward here; it
-# is a control whose most likely failure is locking Tosin out of his own runtime
-# without reporting anything.
+# Short version: OpenClaw documents that a non-empty tools allow-list blocks
+# everything outside it, so empty means inactive there. The equivalent behaviour
+# for plugins is not documented anywhere verified, and the host has no
+# plugins.allow key today. Writing [] would be asserting a meaning we assumed.
+#
+# The stakes make that unattractive. `plugins.allow` is an exclusive allowlist
+# gating BUNDLED plugins too, so a populated list must enumerate all ~49 or
+# silently drop whatever it forgot — and one of the things it would forget is
+# `slack`, the operator's only route to this Gateway until Tailscale exists. A
+# control whose most likely failure is locking the founder out of his own
+# runtime, silently, is one to leave unset unless it is genuinely needed.
+#
+# Setting this non-empty is supported and will be written, but the role first
+# refuses any list omitting a dc_plugins_required entry.
 dc_plugins_allow: []
 
 # Plugins that must REMAIN LOADED. Not written to the config — nothing here
