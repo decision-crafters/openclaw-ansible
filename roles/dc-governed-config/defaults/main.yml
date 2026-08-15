@@ -1,0 +1,81 @@
+---
+# Decision Crafters governed OpenClaw configuration.
+#
+# Every value here defaults to the most restrictive setting that still permits a
+# read-only research runtime. Widening any of them is a governance decision, not
+# a deployment preference, so each is overridable but none is permissive by
+# default.
+#
+# Provenance: PRM-5 v0.4 (Notion, canonical). Do not edit these values to make a
+# deployment work — change PRM-5 first, then mirror it here.
+
+# Where the governed config lives. Onboarding owns this file; this role merges
+# into it and never creates it. See tasks/main.yml for why.
+dc_openclaw_user: "{{ openclaw_user | default('openclaw') }}"
+dc_openclaw_home: "{{ openclaw_home | default('/home/openclaw') }}"
+dc_openclaw_config_path: "{{ dc_openclaw_home }}/.openclaw/openclaw.json"
+
+# Timestamped backup taken before every merge, so criterion 10 rollback is a
+# file copy rather than a reinstall.
+dc_openclaw_backup_dir: "{{ dc_openclaw_home }}/.openclaw/dc-backups"
+
+# --- Sandbox -----------------------------------------------------------------
+# "all" sandboxes every agent, not just non-main ones. "ro" gives the sandbox a
+# read-only view of the workspace: enough to read a frozen source packet, not
+# enough to write one.
+dc_sandbox_mode: "all"            # off | non-main | all
+dc_sandbox_workspace_access: "ro"  # none | ro | rw
+
+# --- Tool policy -------------------------------------------------------------
+# Expressed as deny rather than allow deliberately. OpenClaw documents that
+# "deny always wins", so a capability added to a future OpenClaw release cannot
+# arrive pre-permitted into this profile. An allow-list would silently admit
+# every tool it had never heard of.
+dc_tools_deny:
+  - exec
+  - process
+  - write
+  - edit
+  - apply_patch
+  - browser
+  - cron
+  - gateway
+  - nodes
+  - message
+
+# Cleared deliberately, and this is load-bearing.
+#
+# OpenClaw documents that a non-empty `allow` blocks everything not in it. If
+# onboarding wrote an allow-list, leaving it in place would make the effective
+# tool policy half ours and half whatever onboarding happened to choose — a
+# policy nobody declared. Setting it empty deactivates the allow-list so the
+# deny list above is the whole policy.
+#
+# An empty allow is not the same as a permissive one: with `allow` inactive,
+# every tool outside `dc_tools_deny` is available, which is the intended
+# read-only research profile. Narrow the profile by extending deny, not by
+# populating allow.
+dc_tools_allow: []
+
+# Elevated affects exec only, and exec is denied above. Disabled regardless, so
+# the two controls do not depend on each other.
+dc_tools_elevated_enabled: false
+
+# --- Gateway -----------------------------------------------------------------
+# Loopback only. TASK-217 criterion 4 requires the Gateway bound to loopback or
+# an approved tailnet address — a firewall in front of a wildcard listener is
+# defence in depth, not this control.
+dc_gateway_bind: "127.0.0.1"
+
+# Systemd unit installed by `openclaw onboard --install-daemon`. Set this to
+# whatever onboarding actually named it — the role refuses to finish if the unit
+# cannot be found, because a written config that is not loaded is worse than one
+# that was never written.
+dc_openclaw_service: "openclaw.service"
+
+# --- Behaviour ---------------------------------------------------------------
+# Refuse rather than proceed when the config is missing or unparseable. A merge
+# that silently creates a file would be clobbered by the next onboarding run,
+# and a config that looks applied but is not is the exact failure this role
+# exists to prevent.
+dc_fail_closed: true

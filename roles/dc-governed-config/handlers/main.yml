@@ -1,0 +1,39 @@
+---
+# The config on disk and the config in the running process must not disagree.
+#
+# A gateway that keeps running with the pre-merge config while the file shows
+# the governed one is the worst outcome this role can produce: an operator reads
+# the file, sees the sandbox enabled, and is wrong. So a restart that cannot be
+# performed is a loud failure, not a warning.
+
+- name: Locate the onboarding-installed gateway unit
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - list-unit-files
+      - "{{ dc_openclaw_service }}"
+      - --no-legend
+  register: dc_unit_lookup
+  changed_when: false
+  failed_when: false
+  listen: Restart openclaw gateway
+
+- name: Refuse to leave the running config diverged from the file
+  ansible.builtin.fail:
+    msg: >-
+      The governed config was written but unit '{{ dc_openclaw_service }}' was
+      not found, so the running Gateway is still using the previous
+      configuration. The file now shows controls that are not in effect, which
+      is more dangerous than not having written it. `openclaw onboard
+      --install-daemon` names this unit; set dc_openclaw_service to match, then
+      re-run. Restart by hand if the daemon is managed another way.
+  when:
+    - dc_unit_lookup.stdout | default('') | trim | length == 0
+    - dc_fail_closed | bool
+  listen: Restart openclaw gateway
+
+- name: Restart the gateway so the governed config takes effect
+  ansible.builtin.systemd_service:
+    name: "{{ dc_openclaw_service }}"
+    state: restarted
+  listen: Restart openclaw gateway

@@ -1,0 +1,25 @@
+---
+galaxy_info:
+  role_name: dc_governed_config
+  author: Decision Crafters
+  description: >-
+    Merges Decision Crafters governance controls into an existing OpenClaw
+    configuration: sandbox enabled, workspace read-only, mutating tools denied,
+    elevated execution disabled, gateway bound to loopback.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+        - resolute
+  galaxy_tags:
+    - openclaw
+    - security
+    - governance
+
+# Deliberately no dependency on the openclaw role. This must run after
+# `openclaw onboard`, which is an interactive step the openclaw role explicitly
+# does not perform, so declaring a role dependency would imply an ordering
+# Ansible cannot actually guarantee.
+dependencies: []

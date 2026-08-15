@@ -1,0 +1,27 @@
+---
+# Decision Crafters governed OpenClaw lab runtime.
+#
+# Two plays rather than one, because a manual step sits between them.
+# `roles/openclaw` installs and hardens the host but deliberately does not
+# configure OpenClaw or install its daemon — `openclaw onboard --install-daemon`
+# does both, interactively. Governance controls can only be merged into a config
+# that already exists, so play 2 is a separate invocation run after onboarding.
+#
+# Running this file end to end in one pass will stop at play 2 with a message
+# explaining exactly that. That is the intended behaviour, not a defect.
+
+- name: Install and harden the OpenClaw host
+  hosts: openclaw
+  become: true
+  roles:
+    - openclaw
+  tags:
+    - install
+
+- name: Apply Decision Crafters governance controls
+  hosts: openclaw
+  become: true
+  roles:
+    - dc-governed-config
+  tags:
+    - govern

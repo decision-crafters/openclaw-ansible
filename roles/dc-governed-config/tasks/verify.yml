@@ -1,0 +1,123 @@
+---
+# Post-apply verification. These assertions are the receipts TASK-217 criteria
+# 5, 6 and 7 require.
+#
+# The file is re-read from disk rather than asserted against `dc_config_merged`.
+# Asserting against the value we just computed would prove only that the
+# computation was self-consistent; re-reading proves the control reached the
+# file. That distinction is the whole difference between "we set it" and "it is
+# set".
+
+- name: Re-read the config from disk
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_verify_raw
+
+- name: Parse the config as written
+  ansible.builtin.set_fact:
+    dc_verify: "{{ dc_verify_raw.content | b64decode | from_json }}"
+
+- name: Assert sandbox is enabled for every agent
+  ansible.builtin.assert:
+    that:
+      - dc_verify.agents.defaults.sandbox.mode == dc_sandbox_mode
+    fail_msg: >-
+      Sandbox mode on disk is
+      '{{ dc_verify.agents.defaults.sandbox.mode | default("<unset>") }}',
+      expected '{{ dc_sandbox_mode }}'. Installing Docker does not enable the
+      sandbox; this key does.
+    success_msg: "sandbox.mode = {{ dc_sandbox_mode }}"
+
+- name: Assert workspace access is not writable
+  ansible.builtin.assert:
+    that:
+      - dc_verify.agents.defaults.sandbox.workspaceAccess == dc_sandbox_workspace_access
+      - dc_verify.agents.defaults.sandbox.workspaceAccess != 'rw'
+    fail_msg: >-
+      workspaceAccess on disk is
+      '{{ dc_verify.agents.defaults.sandbox.workspaceAccess | default("<unset>") }}',
+      expected '{{ dc_sandbox_workspace_access }}' and never 'rw'.
+    success_msg: "sandbox.workspaceAccess = {{ dc_sandbox_workspace_access }}"
+
+# Checked per tool rather than by list equality so a future OpenClaw release
+# adding a tool to the deny list does not fail this assertion, while a tool
+# going missing still does.
+- name: Assert every governed tool is denied
+  ansible.builtin.assert:
+    that:
+      - item in (dc_verify.tools.deny | default([]))
+    fail_msg: >-
+      '{{ item }}' is absent from tools.deny on disk. Deny always wins in
+      OpenClaw, so an absent entry is a permitted tool.
+    success_msg: "tools.deny contains {{ item }}"
+  loop: "{{ dc_tools_deny }}"
+
+# A leftover allow-list from onboarding would make the effective policy partly
+# ours and partly onboarding's. Asserted separately from the deny list because
+# the failure it catches is different: deny going missing permits a tool, while
+# allow surviving silently changes what every other tool is measured against.
+- name: Assert no ungoverned allow-list survived the merge
+  ansible.builtin.assert:
+    that:
+      - (dc_verify.tools.allow | default([])) == dc_tools_allow
+    fail_msg: >-
+      tools.allow on disk is
+      '{{ dc_verify.tools.allow | default("<unset>") }}', expected
+      '{{ dc_tools_allow }}'. A non-empty allow-list blocks everything not in
+      it, so a value this role did not set means the effective tool policy is
+      not the one declared here.
+    success_msg: "tools.allow = {{ dc_tools_allow }} (allow-list inactive; deny is the whole policy)"
+
+- name: Assert elevated execution is disabled
+  ansible.builtin.assert:
+    that:
+      - dc_verify.tools.elevated.enabled | bool == false
+    fail_msg: >-
+      tools.elevated.enabled is
+      '{{ dc_verify.tools.elevated.enabled | default("<unset>") }}', expected
+      false. Elevated affects exec, and exec is denied — both controls are set
+      independently so neither relies on the other.
+    success_msg: "tools.elevated.enabled = false"
+
+- name: Assert the gateway is bound to loopback or an approved address
+  ansible.builtin.assert:
+    that:
+      - dc_verify.gateway.bind == dc_gateway_bind
+      - dc_verify.gateway.bind != '0.0.0.0'
+    fail_msg: >-
+      gateway.bind on disk is
+      '{{ dc_verify.gateway.bind | default("<unset>") }}', expected
+      '{{ dc_gateway_bind }}'. A wildcard bind behind a firewall is defence in
+      depth, not this control.
+    success_msg: "gateway.bind = {{ dc_gateway_bind }}"
+
+- name: Assert the config is not group- or world-readable
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_config_path }}"
+  register: dc_verify_stat
+
+- name: Confirm config permissions
+  ansible.builtin.assert:
+    that:
+      - dc_verify_stat.stat.mode == '0600'
+      - dc_verify_stat.stat.pw_name == dc_openclaw_user
+    fail_msg: >-
+      {{ dc_openclaw_config_path }} is mode
+      {{ dc_verify_stat.stat.mode }} owned by {{ dc_verify_stat.stat.pw_name }},
+      expected 0600 owned by {{ dc_openclaw_user }}.
+    success_msg: "config is 0600 {{ dc_openclaw_user }}"
+
+# Emitted as a single structured line so the completion packet can quote a
+# receipt rather than a transcript.
+- name: Emit the governance receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-GOVERNED-CONFIG RECEIPT |
+      path={{ dc_openclaw_config_path }} |
+      sandbox.mode={{ dc_verify.agents.defaults.sandbox.mode }} |
+      workspaceAccess={{ dc_verify.agents.defaults.sandbox.workspaceAccess }} |
+      tools.deny={{ dc_verify.tools.deny | join(',') }} |
+      elevated={{ dc_verify.tools.elevated.enabled }} |
+      gateway.bind={{ dc_verify.gateway.bind }} |
+      mode={{ dc_verify_stat.stat.mode }} |
+      owner={{ dc_verify_stat.stat.pw_name }}

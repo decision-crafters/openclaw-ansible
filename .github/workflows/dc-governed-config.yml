@@ -1,0 +1,98 @@
+---
+# Decision Crafters additions, linted separately.
+#
+# Upstream's lint.yml names its targets by hand — `ansible-lint playbook.yml
+# tests/docker-group-security.yml` — and `playbook.yml` imports only
+# playbooks/install.yml. Anything added outside that path is silently unlinted,
+# which is how `playbooks/deploy.yml` currently escapes CI entirely.
+#
+# This file exists rather than an edit to lint.yml so that every upstream file
+# stays byte-identical in this fork. The diff against upstream is additive only,
+# and `git diff --diff-filter=M upstream/main` proves it in one command.
+
+name: DC Governed Config
+
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+
+jobs:
+  upstream-untouched:
+    name: Upstream files unmodified
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw-ansible.git
+          git fetch --quiet upstream main
+
+      # The claim this repo makes about itself: we run stock upstream plus a
+      # governance layer, never a modified upstream. An assertion is cheaper
+      # than the audit that would otherwise be needed to believe it.
+      - name: Assert no upstream file was modified or deleted
+        run: |
+          changed="$(git diff --name-only --diff-filter=MD upstream/main...HEAD)"
+          if [ -n "$changed" ]; then
+            echo "Modified or deleted upstream files:"
+            echo "$changed"
+            echo
+            echo "This fork must be additive. Governance belongs in"
+            echo "roles/dc-governed-config, not in edits to upstream files."
+            exit 1
+          fi
+          echo "No upstream file modified or deleted."
+
+      - name: Assert the upstream role is byte-identical
+        run: |
+          if ! git diff --quiet upstream/main...HEAD -- roles/openclaw/; then
+            echo "roles/openclaw/ differs from upstream:"
+            git diff --stat upstream/main...HEAD -- roles/openclaw/
+            exit 1
+          fi
+          echo "roles/openclaw/ is byte-identical to upstream."
+
+  lint:
+    name: Lint DC additions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-lint.txt
+
+      - name: Install Ansible collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Lint the governed playbook and role
+        run: ansible-lint playbooks/governed-lab.yml
+
+      - name: Syntax check
+        run: ansible-playbook playbooks/governed-lab.yml --syntax-check
+
+  merge-contract:
+    name: Governance overlay merge contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prove the overlay overrides permissive values and preserves the rest
+        run: python3 tests/dc_merge_contract.py

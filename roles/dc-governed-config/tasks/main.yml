@@ -1,0 +1,106 @@
+---
+# Merge the Decision Crafters governance controls into an existing OpenClaw
+# config.
+#
+# This role never creates ~/.openclaw/openclaw.json. `openclaw onboard` owns
+# that file and writes it during setup; a config created here beforehand would
+# be silently overwritten, leaving an operator believing controls were applied
+# when onboarding had replaced them. Refusing is the safer failure.
+
+- name: Confirm the governed config target exists
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_config_path }}"
+  register: dc_config_stat
+
+- name: Refuse to run before onboarding has written the config
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_config_path }} does not exist, so OpenClaw onboarding has
+      not run yet. This role merges governance controls into an existing config
+      and deliberately will not create one: `openclaw onboard` writes this file
+      and would overwrite anything staged here first, leaving the controls
+      absent while appearing applied. Run `openclaw onboard --install-daemon` as
+      {{ dc_openclaw_user }}, then re-run this role.
+  when:
+    - not dc_config_stat.stat.exists
+    - dc_fail_closed | bool
+
+- name: Read the current config
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_config_raw
+
+- name: Parse the current config
+  ansible.builtin.set_fact:
+    dc_config_current: "{{ dc_config_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse to merge into a config that could not be parsed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_config_path }} could not be parsed as JSON. OpenClaw reads
+      JSON5, which permits comments and trailing commas that strict JSON parsing
+      rejects, so a hand-edited config can be valid to OpenClaw and unreadable
+      here. Refusing rather than guessing: a merge built on a failed parse would
+      drop every key it could not see. Resolve by hand, then re-run.
+  when:
+    - dc_config_current is not defined
+    - dc_fail_closed | bool
+
+# Built as a fact rather than a template so the merge is a data operation with
+# one obvious precedence rule, instead of a rendering that has to reproduce
+# every key onboarding wrote.
+- name: Build the governance overlay
+  ansible.builtin.set_fact:
+    dc_governance_overlay:
+      agents:
+        defaults:
+          sandbox:
+            mode: "{{ dc_sandbox_mode }}"
+            workspaceAccess: "{{ dc_sandbox_workspace_access }}"
+      tools:
+        allow: "{{ dc_tools_allow }}"
+        deny: "{{ dc_tools_deny }}"
+        elevated:
+          enabled: "{{ dc_tools_elevated_enabled | bool }}"
+      gateway:
+        bind: "{{ dc_gateway_bind }}"
+
+# Governance wins. `combine(recursive=True)` with the overlay second means an
+# existing permissive value is replaced rather than preserved, which is the
+# whole point — this role exists to override whatever onboarding chose.
+- name: Compute the merged config
+  ansible.builtin.set_fact:
+    dc_config_merged: >-
+      {{ dc_config_current | combine(dc_governance_overlay, recursive=True) }}
+
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+# Taken before the write, not after, so rollback is possible even if the write
+# itself is what went wrong.
+- name: Back up the pre-merge config
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_date_time.iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Write the governed config
+  ansible.builtin.copy:
+    content: "{{ dc_config_merged | to_nice_json(indent=2) }}\n"
+    dest: "{{ dc_openclaw_config_path }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  notify: Restart openclaw gateway
+
+- name: Verify the applied controls
+  ansible.builtin.include_tasks: verify.yml
