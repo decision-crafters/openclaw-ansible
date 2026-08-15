@@ -296,5 +296,18 @@
     mode: '0600'
   notify: Restart openclaw gateway
 
+# Restart NOW rather than at the end of the play.
+#
+# Handlers normally fire after every task, which put the restart AFTER
+# verify.yml. That made the verification dishonest in a specific way: it asked
+# the runtime what it had loaded while the runtime was still the old process
+# holding the old config. The answer was about a state the play had already
+# replaced.
+#
+# Flushing here means verify.yml runs against the config that is actually
+# loaded, which is the only version of that question worth asking.
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
 - name: Verify the applied controls
   ansible.builtin.include_tasks: verify.yml
