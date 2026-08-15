@@ -1,11 +1,14 @@
 ---
-# Restore the most recent pre-merge config and bring the Gateway back.
+# Restore the newest backup OpenClaw would actually accept, and prove the
+# Gateway stays up.
 #
-# This exists because the first real rollback was three sudo commands pasted
-# from a chat transcript, with a placeholder in one of them. That is the
-# operator-memory step TASK-212 criterion 4 objects to, wearing a different hat:
-# a recovery procedure that lives only in someone's scrollback is not a tested
-# procedure, and the moment you need it is the worst moment to be improvising.
+# The first version restored "the most recent backup" and then reported success
+# over a dead service. It failed three ways at once on 2026-08-15, and each way
+# is now a task below rather than a comment:
+#
+#   most recent was poisoned  -> select by schema, newest-first
+#   mtime did not order them  -> order by the timestamp in the filename
+#   is-active caught a loop   -> compare NRestarts across a window
 #
 # Run: ansible-playbook playbooks/governed-rollback.yml
 
@@ -18,49 +21,85 @@
   ansible.builtin.set_fact:
     dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
 
-- name: Find the available backups
-  ansible.builtin.find:
-    paths: "{{ dc_openclaw_backup_dir }}"
-    patterns: "openclaw.json.*"
-    file_type: file
-  register: dc_backups
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_entrypoint_probe
+  changed_when: false
+  failed_when: false
+  when: dc_openclaw_entrypoint | length == 0
 
-- name: Refuse to roll back to nothing
-  ansible.builtin.fail:
-    msg: >-
-      No backup found in {{ dc_openclaw_backup_dir }}. There is nothing to
-      restore, and overwriting the current config with a guess would be worse
-      than leaving it. If the Gateway is down, read its journal rather than
-      reaching for this playbook.
-  when: dc_backups.matched | int == 0
-
-# Newest by mtime rather than by filename. The names are timestamped, so sorting
-# by name usually agrees -- but "usually" is doing load-bearing work in that
-# sentence and mtime is the fact we actually mean.
-- name: Select the most recent backup
+- name: Record the OpenClaw entrypoint
   ansible.builtin.set_fact:
-    dc_restore_from: >-
-      {{ (dc_backups.files | sort(attribute='mtime') | last).path }}
+    dc_openclaw_entrypoint: >-
+      {{ dc_openclaw_entrypoint if (dc_openclaw_entrypoint | length > 0)
+         else (dc_entrypoint_probe.stdout | default('') | trim) }}
 
-- name: Confirm the backup parses before trusting it
-  ansible.builtin.slurp:
-    src: "{{ dc_restore_from }}"
-  register: dc_restore_raw
-
-- name: Parse the backup
-  ansible.builtin.set_fact:
-    dc_restore_parsed: "{{ dc_restore_raw.content | b64decode | from_json }}"
+# Rollback needs the schema for the same reason apply does: without it, "known
+# good" means nothing beyond "recent", and recent is exactly what restored the
+# outage last time.
+- name: Obtain the live config schema from OpenClaw
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - /usr/bin/node
+      - "{{ dc_openclaw_entrypoint }}"
+      - config
+      - schema
+  register: dc_schema_raw
+  changed_when: false
   failed_when: false
 
-- name: Refuse to restore a backup that will not parse
+- name: Refuse to choose a backup without a schema to judge it by
   ansible.builtin.fail:
     msg: >-
-      {{ dc_restore_from }} could not be parsed as JSON, so restoring it would
-      replace one broken config with another. Inspect it by hand.
-  when: dc_restore_parsed is not defined
+      Could not obtain the config schema (rc={{ dc_schema_raw.rc | default('?') }}):
+      {{ dc_schema_raw.stderr | default('') | trim }}.
+      Without it this playbook can only pick the most recent backup, which is
+      what restored a broken config on 2026-08-15.
+  when:
+    - (dc_schema_raw.rc | default(1)) != 0 or (dc_schema_raw.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
 
-# Taken before the restore, so a rollback that turns out to be the wrong move is
-# itself reversible. Rolling back should not be a one-way door.
+- name: Select the newest backup the schema accepts
+  ansible.builtin.script:
+    cmd: "files/select_backup.py {{ dc_openclaw_backup_dir | quote }}"
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  args:
+    stdin: "{{ dc_schema_raw.stdout }}"
+  register: dc_selection
+  changed_when: false
+  failed_when: false
+
+- name: Refuse when no backup is loadable
+  ansible.builtin.fail:
+    msg: >-
+      No backup satisfies the schema on the keys this role writes.
+      {{ dc_selection.stderr | default('') | trim }}
+      Restoring any of them would restore the fault. Inspect them by hand.
+  when:
+    - (dc_selection.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Record the chosen backup
+  ansible.builtin.set_fact:
+    dc_restore_from: "{{ dc_selection.stdout | trim }}"
+
+# Surfaced rather than swallowed: which candidates were rejected, and why, is
+# the most useful thing this playbook learns.
+- name: Report the candidates that were rejected
+  ansible.builtin.debug:
+    msg: "{{ dc_selection.stderr | default('') | trim }}"
+  when: (dc_selection.stderr | default('') | trim | length) > 0
+
+# Taken before the restore, so rolling back is itself reversible. The filename
+# carries the timestamp because `copy` preserves mtime — the name is the only
+# ordering that survives.
 - name: Preserve the current config before overwriting it
   ansible.builtin.copy:
     src: "{{ dc_openclaw_config_path }}"
@@ -71,7 +110,7 @@
     mode: '0600'
   failed_when: false
 
-- name: Restore the backup
+- name: Restore the chosen backup
   ansible.builtin.copy:
     src: "{{ dc_restore_from }}"
     dest: "{{ dc_openclaw_config_path }}"
@@ -80,9 +119,6 @@
     group: "{{ dc_openclaw_user }}"
     mode: '0600'
 
-# systemd refuses to start a unit that has hit StartLimitBurst until the failure
-# state is cleared. Without this the restart below reports failure for a reason
-# unrelated to the config just restored.
 - name: Clear the failed state so systemd will start the unit again
   ansible.builtin.command:
     argv:
@@ -96,12 +132,9 @@
       - "--{{ dc_openclaw_service_scope }}"
       - reset-failed
       - "{{ dc_openclaw_service }}"
-  # Reported `changed: true` unconditionally while carrying failed_when: false,
-  # so a failure to clear the state was indistinguishable from success. It did
-  # exactly that on 2026-08-15. rc now decides.
+  register: dc_reset_failed
   changed_when: dc_reset_failed.rc == 0
   failed_when: false
-  register: dc_reset_failed
 
 - name: Start the gateway on the restored config
   ansible.builtin.command:
@@ -118,14 +151,19 @@
       - "{{ dc_openclaw_service }}"
   changed_when: true
 
-# A restart that returns cleanly is not evidence the process stayed up. This
-# unit died 2.3 seconds in, which a bare `state: restarted` would have reported
-# as success.
-- name: Give the gateway a moment to fail if it is going to
+- name: Let the gateway run long enough to fail twice if it is going to
   ansible.builtin.wait_for:
-    timeout: 15
+    timeout: 25
 
-- name: Read the unit state back
+# NRestarts, not is-active. The unit carries Restart=always with RestartSec=5,
+# so a process that dies after 2.3s is genuinely `active` for part of every
+# cycle — the previous check sampled once, caught an up-phase, and reported a
+# healthy service that was crash-looping toward StartLimitBurst.
+#
+# A restart counter cannot be fooled that way: if it moved during the window,
+# the unit restarted, and a unit that restarts is not stable however it looks
+# at the instant you ask.
+- name: Read the unit state and restart counter
   ansible.builtin.command:
     argv:
       - "{{ dc_runuser }}"
@@ -136,31 +174,67 @@
       - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
-      - is-active
+      - show
       - "{{ dc_openclaw_service }}"
-  register: dc_post_rollback
+      - --property=ActiveState,SubState,NRestarts,ExecMainStatus
+  register: dc_post_first
   changed_when: false
   failed_when: false
 
-- name: Confirm the gateway is actually running
+- name: Watch for a restart that a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 20
+
+- name: Read the unit state and restart counter again
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - show
+      - "{{ dc_openclaw_service }}"
+      - --property=ActiveState,SubState,NRestarts,ExecMainStatus
+  register: dc_post_second
+  changed_when: false
+  failed_when: false
+
+- name: Extract the two samples
+  ansible.builtin.set_fact:
+    dc_first: "{{ dict(dc_post_first.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_second: "{{ dict(dc_post_second.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway is running and stable
   ansible.builtin.assert:
     that:
-      - (dc_post_rollback.stdout | default('') | trim) == 'active'
+      - dc_second.ActiveState | default('') == 'active'
+      - dc_second.SubState | default('') == 'running'
+      - (dc_second.NRestarts | default(0) | int) == (dc_first.NRestarts | default(0) | int)
     fail_msg: >-
-      Restored {{ dc_restore_from }} but the unit is
-      '{{ dc_post_rollback.stdout | default('unknown') | trim }}' after 15
-      seconds. The config was not the only problem, or not the problem at all.
-      Read the journal:
-      `journalctl --{{ dc_openclaw_service_scope }} -u {{ dc_openclaw_service }} -n 40`
-      as {{ dc_openclaw_user }}.
-    success_msg: "gateway active on restored config"
+      Restored {{ dc_restore_from }} but the unit is not stable.
+      ActiveState={{ dc_second.ActiveState | default('?') }}
+      SubState={{ dc_second.SubState | default('?') }}
+      NRestarts {{ dc_first.NRestarts | default('?') }} -> {{ dc_second.NRestarts | default('?') }}
+      ExecMainStatus={{ dc_second.ExecMainStatus | default('?') }}.
+      A rising restart count means it is crash-looping, which reads as 'active'
+      for part of every cycle. Read the journal:
+      `journalctl --user -u {{ dc_openclaw_service }} -n 40` as {{ dc_openclaw_user }}.
+    success_msg: >-
+      gateway active and stable (NRestarts held at
+      {{ dc_second.NRestarts | default('0') }} across 20s)
 
 - name: Emit the rollback receipt
   ansible.builtin.debug:
     msg: >-
       DC-GOVERNED-CONFIG ROLLBACK RECEIPT |
       restored_from={{ dc_restore_from }} |
+      selected_by=schema-validated-newest-first |
       target={{ dc_openclaw_config_path }} |
       unit={{ dc_openclaw_service }} ({{ dc_openclaw_service_scope }} scope) |
-      state={{ dc_post_rollback.stdout | default('unknown') | trim }} |
-      backups_available={{ dc_backups.matched }}
+      ActiveState={{ dc_second.ActiveState | default('?') }} |
+      SubState={{ dc_second.SubState | default('?') }} |
+      NRestarts={{ dc_second.NRestarts | default('?') }} (stable across 20s)
