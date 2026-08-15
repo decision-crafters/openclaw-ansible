@@ -6,8 +6,9 @@
 # a deployment preference, so each is overridable but none is permissive by
 # default.
 #
-# Provenance: PRM-5 v0.4 (Notion, canonical). Do not edit these values to make a
-# deployment work — change PRM-5 first, then mirror it here.
+# Provenance: PRM-5 v0.5 (Notion, canonical), plus the founder Slack decision of
+# 2026-08-15 recorded there. Do not edit these values to make a deployment work
+# — change PRM-5 first, then mirror it here.
 
 # Where the governed config lives. Onboarding owns this file; this role merges
 # into it and never creates it. See tasks/main.yml for why.
@@ -77,6 +78,76 @@ dc_tools_elevated_enabled: false
 # Belt and braces on purpose: tools.deny lists exec by name, this denies the
 # mechanism, and neither relies on the other surviving a future rename.
 dc_tools_exec_mode: "deny"
+
+# --- Plugins -----------------------------------------------------------------
+# A separate layer from tools, and this is the finding that matters rather than
+# a note about it.
+#
+# Everything above operates on AGENT execution: the sandbox wraps the agent, the
+# deny list removes tools the agent can call, exec mode locks the mechanism the
+# agent would use. Plugins do not run there. OpenClaw documents that native
+# plugins run IN-PROCESS with the Gateway and are not sandboxed, that a plugin
+# may register tools, network handlers, hooks and services, and that "a
+# malicious native plugin is equivalent to arbitrary code execution inside the
+# OpenClaw process". Retrieved 2026-08-15.
+#
+# So `browser` appearing in dc_tools_deny while a browser plugin loads was never
+# a contradiction. Denying a tool removes something the agent can call; it does
+# nothing about code already running beside the Gateway. These keys are the only
+# controls in this role that reach that layer.
+#
+# Note the scope: plugin control is GATEWAY-WIDE. Verified against the live
+# schema — `agents.defaults` has no `plugins` key and neither do per-agent
+# entries. There is one plugin trust decision for the whole runtime, and a
+# per-agent profile inherits it without being able to narrow it.
+
+# Deny wins over allow and over per-plugin enablement, which makes it the
+# strongest statement available and the right home for a prohibition.
+#
+# firecrawl: denied because TASK-138's frozen prompt states "Do not browse,
+# retrieve additional sources", and source isolation is one of that task's
+# automatic stop conditions. A runtime that CAN retrieve weakens the guarantee
+# even when the agent's tool policy forbids it — the claim being made is about
+# the runtime, not about the agent's intentions.
+dc_plugins_deny:
+  - firecrawl
+
+# Left empty deliberately, and for a sharper reason than tools.allow.
+#
+# `plugins.allow` is an exclusive allowlist that gates BUNDLED plugins too, so a
+# populated list must enumerate all ~49 of them or silently drop whatever it
+# forgot. One of the things it would forget is `slack` — and per the founder
+# decision of 2026-08-15, Slack is the operator's only route to this Gateway
+# until Tailscale exists. An allowlist is therefore not merely awkward here; it
+# is a control whose most likely failure is locking Tosin out of his own runtime
+# without reporting anything.
+dc_plugins_allow: []
+
+# Plugins that must REMAIN LOADED. Not written to the config — nothing here
+# enables a plugin — this list exists to be checked against.
+#
+# Every other control in this role asserts that a restriction was applied. This
+# one asserts that a capability was NOT removed, which no existing check would
+# have caught. Founder decision, 2026-08-15:
+#
+#   "Slack is REQUIRED for baseline human <-> OpenClaw communication. Tosin must
+#    be able to reach OpenClaw from phone and computers even before Tailscale is
+#    configured."
+#
+#   TASK-217 "explicitly must not disable Slack just to simplify plugin
+#    security."
+#
+# slack:  the operator control channel. gateway.bind is loopback, correctly, and
+#         loopback plus no Slack equals a runtime reachable from nothing but the
+#         host's own shell.
+# ollama: the model provider. Without it there is no agent to govern.
+#
+# A restriction that removes operability is not a safe default. It is a
+# different failure, and one that gets reversed under pressure at the worst
+# possible moment — so it fails here instead.
+dc_plugins_required:
+  - slack
+  - ollama
 
 # --- Gateway -----------------------------------------------------------------
 # An ENUM, not an address. Verified against `openclaw config schema` on the

@@ -91,6 +91,91 @@
       depth, not this control.
     success_msg: "gateway.bind = {{ dc_gateway_bind }}"
 
+- name: Assert every prohibited plugin is denied
+  ansible.builtin.assert:
+    that:
+      - item in (dc_verify.plugins.deny | default([]))
+    fail_msg: >-
+      '{{ item }}' is absent from plugins.deny on disk. Plugins run in-process
+      with the Gateway and are not sandboxed, so an absent entry here is not a
+      permitted tool — it is unsandboxed code with the same trust as core.
+    success_msg: "plugins.deny contains {{ item }}"
+  loop: "{{ dc_plugins_deny }}"
+
+# The inverse assertion, and the one with no technical tell. Everything else in
+# this file fails when a restriction went missing. This fails when a capability
+# did.
+- name: Assert no required capability was denied
+  ansible.builtin.assert:
+    that:
+      - item not in (dc_verify.plugins.deny | default([]))
+      - (dc_verify.plugins.allow | default([])) | length == 0 or item in dc_verify.plugins.allow
+    fail_msg: >-
+      '{{ item }}' is denied on disk, or excluded by a non-empty plugins.allow.
+      It is listed in dc_plugins_required. For slack this means the Gateway is
+      bound to loopback with no channel reaching it — healthy by every other
+      check in this file and reachable only from the host's own shell.
+    success_msg: "{{ item }} is permitted (required capability preserved)"
+  loop: "{{ dc_plugins_required }}"
+
+# Config-level checks above prove what was ASKED FOR. This asks the runtime what
+# it actually LOADED, which is a different claim and the one that has been wrong
+# every time it mattered today.
+#
+# Best-effort by design. `openclaw plugins list` has not been run on this host —
+# the binary sits under a 0700 home and the subcommand surface is unconfirmed —
+# so an unrecognised output must read as "not proven", never as "fine". Guessing
+# a flag and treating a non-zero exit as absence would manufacture exactly the
+# false receipt this role exists to prevent.
+- name: Ask the runtime which plugins actually loaded
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - /usr/bin/node
+      - "{{ dc_openclaw_entrypoint }}"
+      - plugins
+      - list
+  register: dc_plugin_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record whether the runtime could be asked at all
+  ansible.builtin.set_fact:
+    dc_plugin_probe_usable: >-
+      {{ (dc_plugin_probe.rc | default(1)) == 0
+         and (dc_plugin_probe.stdout | default('') | length) > 0 }}
+
+- name: Confirm the loaded set matches the intended set
+  ansible.builtin.assert:
+    that:
+      - dc_plugins_required | reject('in', dc_plugin_probe.stdout) | list | length == 0
+      - dc_plugins_deny | select('in', dc_plugin_probe.stdout) | list | length == 0
+    fail_msg: >-
+      The runtime's loaded plugins disagree with the config.
+      Missing but required: {{ dc_plugins_required | reject('in', dc_plugin_probe.stdout) | list }}.
+      Present but denied: {{ dc_plugins_deny | select('in', dc_plugin_probe.stdout) | list }}.
+      The config is what was asked for; this is what happened. Where they differ,
+      this is the one that is true.
+    success_msg: >-
+      runtime confirms {{ dc_plugins_required | join(',') }} loaded and
+      {{ dc_plugins_deny | join(',') }} not loaded
+  when: dc_plugin_probe_usable | bool
+
+- name: Report that runtime load state could not be confirmed
+  ansible.builtin.debug:
+    msg: >-
+      LOAD STATE UNCONFIRMED — `plugins list` returned
+      rc={{ dc_plugin_probe.rc | default('?') }}
+      ({{ dc_plugin_probe.stderr | default('') | trim | truncate(160) }}).
+      The config assertions above still hold: they prove what was written. They
+      do not prove what the Gateway loaded, and those have differed twice today.
+      Treat the plugin criterion as INSUFFICIENT EVIDENCE until an operator runs
+      the inventory by hand. This is not a failure of the apply.
+  when: not (dc_plugin_probe_usable | bool)
+
 - name: Assert the config is not group- or world-readable
   ansible.builtin.stat:
     path: "{{ dc_openclaw_config_path }}"
@@ -119,5 +204,8 @@
       tools.deny={{ dc_verify.tools.deny | join(',') }} |
       elevated={{ dc_verify.tools.elevated.enabled }} |
       gateway.bind={{ dc_verify.gateway.bind }} |
+      plugins.deny={{ dc_verify.plugins.deny | default([]) | join(',') }} |
+      plugins.required={{ dc_plugins_required | join(',') }} (preserved) |
+      plugins.loadstate={{ 'confirmed-by-runtime' if dc_plugin_probe_usable | bool else 'UNCONFIRMED' }} |
       mode={{ dc_verify_stat.stat.mode }} |
       owner={{ dc_verify_stat.stat.pw_name }}

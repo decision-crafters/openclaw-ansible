@@ -42,6 +42,26 @@ GOVERNED_PATHS = [
     ("tools", "exec", "mode"),
 ]
 
+# Schema-validity is not the only way a backup can be bad, and this is the
+# second kind.
+#
+# `plugins.deny: ["slack"]` is legal config. It satisfies the schema, so the
+# check above would pass it, and it would be selected as known-good — restoring
+# a Gateway that is bound to loopback with no channel reaching it. Healthy by
+# every measure this script had, and unreachable.
+#
+# That is structurally the same failure as 2026-08-15, when the newest backup
+# was selected because nothing asked whether it was GOOD, only whether it was
+# RECENT. Adding schema-validity narrowed "good" without finishing the job:
+# valid and safe are still different questions.
+#
+# Founder decision 2026-08-15: Slack is the operator's only route to this
+# Gateway until Tailscale exists. A backup that removes it is not a restore
+# point, whatever the schema says about it.
+FORBIDDEN_LIST_MEMBERS = {
+    ("plugins", "deny"): ["slack", "ollama"],
+}
+
 STAMP = re.compile(r"(\d{8}T\d{6})")
 
 
@@ -97,6 +117,26 @@ def main() -> int:
     defs = schema.get("$defs") or schema.get("definitions") or {}
     enums = {p: enum_at(schema, defs, p) for p in GOVERNED_PATHS}
 
+    # Valid JSON of the wrong shape resolves no enums, which makes every check
+    # below vacuous and every backup "acceptable" — this script's own version of
+    # passing by asking nothing. Caught in testing on 2026-08-15 by piping the
+    # committed fixture in place of the schema: it selected a backup that
+    # severed operator access and exited 0.
+    #
+    # Every other guard in this role fails closed. This one failed open, which
+    # is worse than absent: it reports a validated selection it never made.
+    resolved = [p for p, values in enums.items() if values]
+    if not resolved:
+        print(
+            "stdin parsed as JSON but resolved none of the governed enums "
+            f"({', '.join('.'.join(p) for p in GOVERNED_PATHS)}). This is not "
+            "OpenClaw's config schema — check that `openclaw config schema` "
+            "output was piped in, not a fixture or an error page. Refusing "
+            "rather than validating every backup against nothing.",
+            file=sys.stderr,
+        )
+        return 2
+
     backups = sorted(Path(sys.argv[1]).glob("openclaw.json.*"), key=sort_key, reverse=True)
     if not backups:
         print("no backups found", file=sys.stderr)
@@ -117,6 +157,19 @@ def main() -> int:
                 continue
             if value not in allowed:
                 problems.append(f"{'.'.join(path)}={value!r} not in {allowed}")
+
+        # Legal but unrecoverable. Checked separately from the schema because
+        # the schema has nothing to say about it.
+        for path, forbidden in FORBIDDEN_LIST_MEMBERS.items():
+            value = value_at(config, path)
+            if not isinstance(value, list):
+                continue
+            severed = [entry for entry in forbidden if entry in value]
+            if severed:
+                problems.append(
+                    f"{'.'.join(path)} denies {severed}, which would restore a "
+                    "runtime the operator cannot reach"
+                )
 
         if problems:
             rejected.append(f"{candidate.name}: {'; '.join(problems)}")

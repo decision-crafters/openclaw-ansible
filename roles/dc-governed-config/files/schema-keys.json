@@ -57,6 +57,16 @@
       "exists": true,
       "type": "integer"
     },
+    "plugins.allow": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
+    "plugins.deny": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
     "tools.allow": {
       "enum": null,
       "exists": true,

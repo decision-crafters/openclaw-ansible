@@ -112,6 +112,46 @@
           enabled: "{{ dc_tools_elevated_enabled | bool }}"
       gateway:
         bind: "{{ dc_gateway_bind }}"
+      plugins:
+        allow: "{{ dc_plugins_allow }}"
+        deny: "{{ dc_plugins_deny }}"
+
+# Checked before the schema gate, because this failure is not a schema failure.
+# `plugins.deny: ["slack"]` is perfectly legal config — the schema would accept
+# it, the merge would apply it, every assertion in verify.yml would pass, and
+# the Gateway would come back up healthy and unreachable.
+#
+# There is no technical signal for this one. The only thing that makes it wrong
+# is a founder decision, so the decision is what gets enforced.
+- name: Refuse to sever a required capability
+  ansible.builtin.fail:
+    msg: >-
+      dc_plugins_deny contains {{ dc_plugins_deny | intersect(dc_plugins_required) }},
+      which is listed in dc_plugins_required. Founder decision 2026-08-15: Slack
+      is the operator's only route to this Gateway until Tailscale exists, and
+      TASK-217 must not disable it to simplify plugin security. Nothing has been
+      written. If this capability genuinely should go, change the decision in
+      PRM-5 first and remove it from dc_plugins_required deliberately — do not
+      route around this by editing the deny list.
+  when:
+    - dc_plugins_deny | intersect(dc_plugins_required) | length > 0
+    - dc_fail_closed | bool
+
+# The same failure by the other route. A populated plugins.allow is an exclusive
+# allowlist covering bundled plugins, so a required plugin missing from it is
+# denied by omission — the quiet version of the task above.
+- name: Refuse an allow-list that omits a required capability
+  ansible.builtin.fail:
+    msg: >-
+      plugins.allow is non-empty and omits
+      {{ dc_plugins_required | difference(dc_plugins_allow) }}.
+      An exclusive allowlist denies by omission, so this would sever operator
+      access while reporting success. Either list every required plugin or leave
+      dc_plugins_allow empty, which is the documented default for this role.
+  when:
+    - dc_plugins_allow | length > 0
+    - dc_plugins_required | difference(dc_plugins_allow) | length > 0
+    - dc_fail_closed | bool
 
 # Governance wins. `combine(recursive=True)` with the overlay second means an
 # existing permissive value is replaced rather than preserved, which is the

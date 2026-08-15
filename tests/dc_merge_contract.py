@@ -71,6 +71,7 @@ def load_defaults() -> dict[str, Any]:
         "dc_tools_deny", "dc_tools_allow", "dc_sandbox_mode",
         "dc_sandbox_workspace_access", "dc_gateway_bind",
         "dc_sandbox_scope", "dc_tools_exec_mode", "dc_sandbox_docker_network",
+        "dc_plugins_deny", "dc_plugins_allow", "dc_plugins_required",
     ]
     missing = [key for key in required if key not in defaults]
     if missing:
@@ -92,6 +93,9 @@ BIND = DEFAULTS["dc_gateway_bind"]
 SCOPE = DEFAULTS["dc_sandbox_scope"]
 EXEC_MODE = DEFAULTS["dc_tools_exec_mode"]
 DOCKER_NETWORK = DEFAULTS["dc_sandbox_docker_network"]
+PLUGINS_DENY = DEFAULTS["dc_plugins_deny"]
+PLUGINS_ALLOW = DEFAULTS["dc_plugins_allow"]
+PLUGINS_REQUIRED = DEFAULTS["dc_plugins_required"]
 
 # Deliberately the worst realistic starting point: everything this role cares
 # about is set to the permissive value. A merge tested against an already-safe
@@ -108,6 +112,15 @@ ONBOARDED: dict[str, Any] = {
     "gateway": {"bind": "0.0.0.0", "port": 18789},
     "channels": {"telegram": {"token": "KEEP-ME"}},
     "session": {"historyLimit": 50},
+    # Sibling keys under `plugins`, which the overlay now writes into. The exact
+    # location of Slack's credential on the real host is unconfirmed; what this
+    # models is the structural risk, which does not depend on knowing it. The
+    # overlay sets two keys under `plugins` and must not take the others with
+    # them — and one of the others is what lets the operator reach the Gateway.
+    "plugins": {
+        "entries": {"slack": {"botToken": "KEEP-ME-TOO", "appToken": "AND-ME"}},
+        "bundledDiscovery": True,
+    },
 }
 
 OVERLAY: dict[str, Any] = {
@@ -117,6 +130,7 @@ OVERLAY: dict[str, Any] = {
     "tools": {"allow": ALLOW, "deny": DENY, "exec": {"mode": EXEC_MODE},
               "elevated": {"enabled": False}},
     "gateway": {"bind": BIND},
+    "plugins": {"allow": PLUGINS_ALLOW, "deny": PLUGINS_DENY},
 }
 
 
@@ -146,6 +160,40 @@ def safety_floors() -> list[tuple[str, bool]]:
         # the effective policy something other than the declared deny list.
         ("FLOOR allow-list stays inactive", ALLOW == []),
         ("FLOOR fail-closed is on", DEFAULTS.get("dc_fail_closed") is True),
+    ] + availability_floors()
+
+
+def availability_floors() -> list[tuple[str, bool]]:
+    """Floors that fail when a capability is REMOVED, not when one is admitted.
+
+    Every other check in this file runs one direction: it fails if something
+    permissive survived. These run the other way, and nothing here had a check
+    of this shape before 2026-08-15.
+
+    The founder decision that day made Slack the operator's only route to a
+    loopback-bound Gateway until Tailscale exists, and stated that TASK-217 must
+    not disable it to simplify plugin security. Denying it would be legal
+    config, would pass the schema, would pass every assertion in verify.yml, and
+    would leave a healthy Gateway nobody could reach. There is no technical
+    signal for that failure — the only thing making it wrong is the decision, so
+    the decision is what gets pinned.
+
+    Note the last floor. Without it the one above is trivially satisfiable by
+    deleting `slack` from dc_plugins_required, which is the obvious move for
+    someone trying to get a red suite green and has no idea what it costs.
+    """
+    return [
+        ("FLOOR firecrawl is denied", "firecrawl" in PLUGINS_DENY),
+        # Deny wins over allow and over per-plugin enablement, so an entry here
+        # is final — including when it is the wrong entry.
+        ("FLOOR no required plugin is denied",
+         not set(PLUGINS_DENY) & set(PLUGINS_REQUIRED)),
+        # An exclusive allowlist gating ~49 bundled plugins denies by omission.
+        # Empty keeps deny as the whole policy; populated is a lockout waiting
+        # for someone to forget an entry.
+        ("FLOOR plugin allow-list stays inactive", PLUGINS_ALLOW == []),
+        ("FLOOR slack remains a required capability", "slack" in PLUGINS_REQUIRED),
+        ("FLOOR a model provider remains available", "ollama" in PLUGINS_REQUIRED),
     ]
 
 
@@ -183,6 +231,8 @@ def schema_floors() -> list[tuple[str, bool]]:
         # The regression this file exists to prevent recurring.
         ("SCHEMA an IP address is rejected for gateway.bind", not legal("gateway.bind", "127.0.0.1")),
         ("SCHEMA an invented key is rejected", not legal("gateway.totallyMadeUp", True)),
+        ("SCHEMA plugins.deny key exists", legal("plugins.deny", PLUGINS_DENY)),
+        ("SCHEMA plugins.allow key exists", legal("plugins.allow", PLUGINS_ALLOW)),
     ]
 
 
@@ -202,6 +252,21 @@ def main() -> int:
         ("every governed tool is denied", all(t in tools["deny"] for t in DENY)),
         # The defect this file was written to catch.
         ("no ungoverned allow-list survives", tools.get("allow", []) == ALLOW),
+        # Plugin layer. Separate from the tool checks above because it is a
+        # separate layer: plugins run in-process with the Gateway, outside the
+        # sandbox every other control here depends on.
+        ("firecrawl reaches plugins.deny", "firecrawl" in merged["plugins"]["deny"]),
+        ("no plugin allow-list survives", merged["plugins"].get("allow", []) == PLUGINS_ALLOW),
+        # The merge must not deny a required plugin by either route.
+        ("slack is not denied", "slack" not in merged["plugins"]["deny"]),
+        ("slack is not excluded by omission",
+         merged["plugins"].get("allow", []) == [] or "slack" in merged["plugins"]["allow"]),
+        # The credential the operator's own access depends on. `combine` merges
+        # dicts key by key, so this survives — but it survives by a property of
+        # the merge, and properties that hold by accident stop holding quietly.
+        ("slack credentials preserved",
+         merged["plugins"]["entries"]["slack"]["botToken"] == "KEEP-ME-TOO"),
+        ("unrelated plugin keys preserved", merged["plugins"]["bundledDiscovery"] is True),
         # Everything outside the governance surface is left alone.
         ("agent model preserved", merged["agents"]["defaults"]["model"] == "anthropic/claude-sonnet-4"),
         ("agent entries preserved", merged["agents"]["entries"][0]["id"] == "main"),
