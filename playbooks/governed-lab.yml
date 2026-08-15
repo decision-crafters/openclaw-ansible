@@ -11,7 +11,9 @@
 # explaining exactly that. That is the intended behaviour, not a defect.
 
 - name: Install and harden the OpenClaw host
-  hosts: openclaw
+  # localhost, matching upstream's playbooks/install.yml. This host IS the
+  # target; there is no control-node/target split to model.
+  hosts: localhost
   become: true
   roles:
     - openclaw
@@ -19,7 +21,7 @@
     - install
 
 - name: Apply Decision Crafters governance controls
-  hosts: openclaw
+  hosts: localhost
   become: true
   roles:
     - dc-governed-config
