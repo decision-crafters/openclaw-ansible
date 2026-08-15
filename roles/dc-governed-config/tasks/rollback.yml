@@ -64,7 +64,7 @@
 - name: Preserve the current config before overwriting it
   ansible.builtin.copy:
     src: "{{ dc_openclaw_config_path }}"
-    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-rollback.{{ ansible_date_time.iso8601_basic_short }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-rollback.{{ ansible_facts['date_time'].iso8601_basic_short }}"
     remote_src: true
     owner: "{{ dc_openclaw_user }}"
     group: "{{ dc_openclaw_user }}"
@@ -86,28 +86,33 @@
 - name: Clear the failed state so systemd will start the unit again
   ansible.builtin.command:
     argv:
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - reset-failed
       - "{{ dc_openclaw_service }}"
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
-    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
-  changed_when: true
+  # Reported `changed: true` unconditionally while carrying failed_when: false,
+  # so a failure to clear the state was indistinguishable from success. It did
+  # exactly that on 2026-08-15. rc now decides.
+  changed_when: dc_reset_failed.rc == 0
   failed_when: false
+  register: dc_reset_failed
 
 - name: Start the gateway on the restored config
-  ansible.builtin.systemd_service:
-    name: "{{ dc_openclaw_service }}"
-    scope: "{{ dc_openclaw_service_scope }}"
-    state: restarted
+  ansible.builtin.command:
+    argv:
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - restart
+      - "{{ dc_openclaw_service }}"
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
-    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
+  changed_when: true
 
 # A restart that returns cleanly is not evidence the process stayed up. This
 # unit died 2.3 seconds in, which a bare `state: restarted` would have reported
@@ -119,15 +124,14 @@
 - name: Read the unit state back
   ansible.builtin.command:
     argv:
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - is-active
       - "{{ dc_openclaw_service }}"
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
-    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
   register: dc_post_rollback
   changed_when: false
   failed_when: false

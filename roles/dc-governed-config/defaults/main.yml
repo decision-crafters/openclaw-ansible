@@ -23,8 +23,18 @@ dc_openclaw_backup_dir: "{{ dc_openclaw_home }}/.openclaw/dc-backups"
 # "all" sandboxes every agent, not just non-main ones. "ro" gives the sandbox a
 # read-only view of the workspace: enough to read a frozen source packet, not
 # enough to write one.
-dc_sandbox_mode: "all"            # off | non-main | all
+dc_sandbox_mode: "all"             # off | non-main | all
 dc_sandbox_workspace_access: "ro"  # none | ro | rw
+
+# PRM-5 v0.3 specified "session" and the overlay silently dropped it, inheriting
+# the "agent" default. A sandbox scoped per session is discarded more often, so
+# state cannot accumulate across unrelated runs.
+dc_sandbox_scope: "session"        # session | agent | shared
+
+# TASK-217 criterion 7 requires the sandbox network denied by default. OpenClaw
+# already defaults to "none", but an inherited default is not an applied
+# control — it is a default that could change under us without notice.
+dc_sandbox_docker_network: "none"
 
 # --- Tool policy -------------------------------------------------------------
 # Expressed as deny rather than allow deliberately. OpenClaw documents that
@@ -61,11 +71,20 @@ dc_tools_allow: []
 # the two controls do not depend on each other.
 dc_tools_elevated_enabled: false
 
+# A second, independent lock on exec. PRM-5 v0.3 specified this and my earlier
+# documentation review wrongly concluded the key did not exist; `openclaw config
+# schema` shows it does, as an enum of deny | allowlist | ask | auto | full.
+# Belt and braces on purpose: tools.deny lists exec by name, this denies the
+# mechanism, and neither relies on the other surviving a future rename.
+dc_tools_exec_mode: "deny"
+
 # --- Gateway -----------------------------------------------------------------
-# Loopback only. TASK-217 criterion 4 requires the Gateway bound to loopback or
-# an approved tailnet address — a firewall in front of a wildcard listener is
-# defence in depth, not this control.
-dc_gateway_bind: "127.0.0.1"
+# An ENUM, not an address. Verified against `openclaw config schema` on the
+# TASK-217 host: allowed values are auto | lan | loopback | custom | tailnet.
+# Setting "127.0.0.1" here is what took the Gateway down on 2026-08-15 — it
+# validated in this role, was rejected by OpenClaw, and crash-looped the daemon.
+# Use "custom" plus gateway.customBindHost if a literal address is ever needed.
+dc_gateway_bind: "loopback"
 
 # Systemd unit installed by `openclaw onboard --install-daemon`. Verified on the
 # TASK-217 host 2026-08-15: onboarding installs a **user** unit at
@@ -77,6 +96,13 @@ dc_openclaw_service: "openclaw-gateway.service"
 # Systemd scope for that unit. `user` because onboarding installs it under the
 # service account rather than into /etc/systemd/system.
 dc_openclaw_service_scope: "user"
+
+# Path to OpenClaw's entrypoint, used only to ask it for its config schema.
+# Left empty so it is DERIVED from the installed systemd unit's ExecStart rather
+# than pinned here — the real path embeds both a version and a content hash
+# (.../openclaw/2026.7.1-2/49f872a6.../dist/index.js), so any literal written
+# today is wrong after the next upgrade. Set it explicitly only to override.
+dc_openclaw_entrypoint: ""
 
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge

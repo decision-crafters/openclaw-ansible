@@ -22,6 +22,7 @@ Run: python3 tests/dc_merge_contract.py
 from __future__ import annotations
 
 import copy
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,7 @@ def load_defaults() -> dict[str, Any]:
     required = [
         "dc_tools_deny", "dc_tools_allow", "dc_sandbox_mode",
         "dc_sandbox_workspace_access", "dc_gateway_bind",
+        "dc_sandbox_scope", "dc_tools_exec_mode", "dc_sandbox_docker_network",
     ]
     missing = [key for key in required if key not in defaults]
     if missing:
@@ -87,6 +89,9 @@ ALLOW = DEFAULTS["dc_tools_allow"]
 SANDBOX_MODE = DEFAULTS["dc_sandbox_mode"]
 WORKSPACE = DEFAULTS["dc_sandbox_workspace_access"]
 BIND = DEFAULTS["dc_gateway_bind"]
+SCOPE = DEFAULTS["dc_sandbox_scope"]
+EXEC_MODE = DEFAULTS["dc_tools_exec_mode"]
+DOCKER_NETWORK = DEFAULTS["dc_sandbox_docker_network"]
 
 # Deliberately the worst realistic starting point: everything this role cares
 # about is set to the permissive value. A merge tested against an already-safe
@@ -106,8 +111,11 @@ ONBOARDED: dict[str, Any] = {
 }
 
 OVERLAY: dict[str, Any] = {
-    "agents": {"defaults": {"sandbox": {"mode": SANDBOX_MODE, "workspaceAccess": WORKSPACE}}},
-    "tools": {"allow": ALLOW, "deny": DENY, "elevated": {"enabled": False}},
+    "agents": {"defaults": {"sandbox": {
+        "mode": SANDBOX_MODE, "scope": SCOPE, "workspaceAccess": WORKSPACE,
+        "docker": {"network": DOCKER_NETWORK}}}},
+    "tools": {"allow": ALLOW, "deny": DENY, "exec": {"mode": EXEC_MODE},
+              "elevated": {"enabled": False}},
     "gateway": {"bind": BIND},
 }
 
@@ -141,12 +149,49 @@ def safety_floors() -> list[tuple[str, bool]]:
     ]
 
 
+def schema_floors() -> list[tuple[str, bool]]:
+    """Every value the overlay writes must satisfy OpenClaw's own schema.
+
+    The floors above are Decision Crafters policy: is this value safe. These are
+    a different question: is this value *legal*. `gateway.bind: "127.0.0.1"` was
+    perfectly safe and completely illegal — bind is an enum — and it passed
+    every check this file had until it crash-looped the daemon.
+
+    Checked against a fixture distilled from `openclaw config schema`, so CI can
+    run it without OpenClaw installed. The role itself re-checks against the
+    live schema at apply time; this is the earlier, cheaper tripwire.
+    """
+    fixture = json.loads((ROLE / "files" / "schema-keys.json").read_text())
+    paths = fixture["paths"]
+
+    def legal(dotted: str, value: object) -> bool:
+        spec = paths.get(dotted)
+        if spec is None or not spec.get("exists"):
+            return False
+        allowed = spec.get("enum")
+        return True if allowed is None else value in allowed
+
+    return [
+        ("SCHEMA gateway.bind is a legal enum value", legal("gateway.bind", BIND)),
+        ("SCHEMA sandbox.mode is a legal enum value", legal("agents.defaults.sandbox.mode", SANDBOX_MODE)),
+        ("SCHEMA sandbox.scope is a legal enum value", legal("agents.defaults.sandbox.scope", SCOPE)),
+        ("SCHEMA workspaceAccess is a legal enum value", legal("agents.defaults.sandbox.workspaceAccess", WORKSPACE)),
+        ("SCHEMA tools.exec.mode is a legal enum value", legal("tools.exec.mode", EXEC_MODE)),
+        ("SCHEMA docker.network key exists", legal("agents.defaults.sandbox.docker.network", DOCKER_NETWORK)),
+        ("SCHEMA tools.deny key exists", legal("tools.deny", DENY)),
+        ("SCHEMA tools.elevated.enabled key exists", legal("tools.elevated.enabled", False)),
+        # The regression this file exists to prevent recurring.
+        ("SCHEMA an IP address is rejected for gateway.bind", not legal("gateway.bind", "127.0.0.1")),
+        ("SCHEMA an invented key is rejected", not legal("gateway.totallyMadeUp", True)),
+    ]
+
+
 def main() -> int:
     merged = combine_recursive(ONBOARDED, OVERLAY)
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

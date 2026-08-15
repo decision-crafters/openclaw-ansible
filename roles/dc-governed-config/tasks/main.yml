@@ -19,6 +19,36 @@
   ansible.builtin.set_fact:
     dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
 
+# Read out of the unit that is actually installed, so an OpenClaw upgrade does
+# not silently point this at a path that no longer exists.
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_entrypoint_probe
+  changed_when: false
+  failed_when: false
+  when: dc_openclaw_entrypoint | length == 0
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_openclaw_entrypoint: >-
+      {{ dc_openclaw_entrypoint if (dc_openclaw_entrypoint | length > 0)
+         else (dc_entrypoint_probe.stdout | default('') | trim) }}
+
+- name: Refuse to continue without an entrypoint to ask for the schema
+  ansible.builtin.fail:
+    msg: >-
+      Could not derive the OpenClaw entrypoint from
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}.
+      Without it the schema cannot be fetched, and without the schema this role
+      would be writing a config nothing has checked. Set dc_openclaw_entrypoint
+      explicitly.
+  when:
+    - dc_openclaw_entrypoint | length == 0
+    - dc_fail_closed | bool
+
 - name: Confirm the governed config target exists
   ansible.builtin.stat:
     path: "{{ dc_openclaw_config_path }}"
@@ -69,10 +99,15 @@
         defaults:
           sandbox:
             mode: "{{ dc_sandbox_mode }}"
+            scope: "{{ dc_sandbox_scope }}"
             workspaceAccess: "{{ dc_sandbox_workspace_access }}"
+            docker:
+              network: "{{ dc_sandbox_docker_network }}"
       tools:
         allow: "{{ dc_tools_allow }}"
         deny: "{{ dc_tools_deny }}"
+        exec:
+          mode: "{{ dc_tools_exec_mode }}"
         elevated:
           enabled: "{{ dc_tools_elevated_enabled | bool }}"
       gateway:
@@ -85,6 +120,66 @@
   ansible.builtin.set_fact:
     dc_config_merged: >-
       {{ dc_config_current | combine(dc_governance_overlay, recursive=True) }}
+
+# The hard gate. Everything above this point verified that values reached the
+# merged structure; nothing verified that OpenClaw would accept it. Those are
+# different claims, and only the first was ever tested — which is how
+# `gateway.bind: "127.0.0.1"` passed every assertion in this role and then
+# crash-looped the daemon, because bind is an enum and not an address.
+#
+# `openclaw config schema` prints the live schema the runtime validates against.
+# Asking the binary beats reading the documentation: the documentation review
+# that followed the outage concluded gateway.bind did not exist at all, and
+# concluded the same about tools.exec.mode. The schema says both exist. Two
+# wrong answers from prose, one right answer from the program.
+- name: Obtain the live config schema from OpenClaw
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/node
+      - "{{ dc_openclaw_entrypoint }}"
+      - config
+      - schema
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  register: dc_schema_raw
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to write without a schema to check against
+  ansible.builtin.fail:
+    msg: >-
+      Could not obtain the config schema (rc={{ dc_schema_raw.rc | default('?') }}):
+      {{ dc_schema_raw.stderr | default('') | trim }}.
+      Refusing to write an unvalidated config. An ungated write is the state
+      that took the Gateway down, so failing here is the point rather than an
+      inconvenience. Set dc_openclaw_entrypoint if the install path has moved.
+  when:
+    - (dc_schema_raw.rc | default(1)) != 0 or (dc_schema_raw.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Check every governed key against the schema
+  ansible.builtin.script:
+    cmd: >-
+      files/validate_overlay.py
+      {{ dc_governance_overlay | to_json | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  args:
+    stdin: "{{ dc_schema_raw.stdout }}"
+  register: dc_schema_check
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to write a config the schema rejects
+  ansible.builtin.fail:
+    msg: >-
+      The governance overlay does not satisfy OpenClaw's own schema:
+      {{ dc_schema_check.stdout | default('') | trim }}
+      {{ dc_schema_check.stderr | default('') | trim }}
+      Nothing has been written and no backup was taken — the config on disk is
+      untouched.
+  when:
+    - (dc_schema_check.rc | default(1)) != 0
+    - dc_fail_closed | bool
 
 - name: Ensure the backup directory exists
   ansible.builtin.file:
@@ -99,7 +194,7 @@
 - name: Back up the pre-merge config
   ansible.builtin.copy:
     src: "{{ dc_openclaw_config_path }}"
-    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_date_time.iso8601_basic_short }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_facts['date_time'].iso8601_basic_short }}"
     remote_src: true
     owner: "{{ dc_openclaw_user }}"
     group: "{{ dc_openclaw_user }}"

@@ -15,6 +15,8 @@
 - name: Locate the onboarding-installed gateway unit
   ansible.builtin.command:
     argv:
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
       - systemctl
       - "--{{ dc_openclaw_service_scope }}"
       - list-unit-files
@@ -22,9 +24,6 @@
       - --no-legend
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
-    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
   register: dc_unit_lookup
   changed_when: false
   failed_when: false
@@ -95,13 +94,15 @@
   listen: Restart openclaw gateway
 
 - name: Restart the gateway so the governed config takes effect
-  ansible.builtin.systemd_service:
-    name: "{{ dc_openclaw_service }}"
-    scope: "{{ dc_openclaw_service_scope }}"
-    state: restarted
+  ansible.builtin.command:
+    argv:
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - restart
+      - "{{ dc_openclaw_service }}"
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
-    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
+  changed_when: true
   listen: Restart openclaw gateway
