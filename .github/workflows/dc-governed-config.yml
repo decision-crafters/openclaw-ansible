@@ -94,5 +94,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      # The test reads the role's defaults rather than restating them, so PyYAML
+      # is a hard requirement. It refuses to run without it rather than falling
+      # back to constants, which is why this step is not optional.
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
       - name: Prove the overlay overrides permissive values and preserves the rest
         run: python3 tests/dc_merge_contract.py

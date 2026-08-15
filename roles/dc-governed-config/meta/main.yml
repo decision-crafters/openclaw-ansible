@@ -8,11 +8,13 @@ galaxy_info:
     elevated execution disabled, gateway bound to loopback.
   license: MIT
   min_ansible_version: "2.15"
+  # `all` rather than named releases: ansible-lint validates this against a
+  # fixed Galaxy schema that rejects current Ubuntu codenames, and the role has
+  # no release-specific behaviour to declare anyway.
   platforms:
     - name: Ubuntu
       versions:
-        - noble
-        - resolute
+        - all
   galaxy_tags:
     - openclaw
     - security
