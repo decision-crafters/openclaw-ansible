@@ -24,24 +24,45 @@
   become_user: "{{ dc_openclaw_user }}"
   environment:
     XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
   register: dc_unit_lookup
   changed_when: false
   failed_when: false
   listen: Restart openclaw gateway
 
+# Two different failures used to produce one message. `systemctl` exiting
+# non-zero because it could not reach the user bus is not the same fact as the
+# unit being absent, and reporting the second when the first happened sends
+# whoever investigates looking for a unit that exists and is running. Ask me how
+# I know.
+- name: Refuse when systemd could not be reached at all
+  ansible.builtin.fail:
+    msg: >-
+      The governed config was written, but `systemctl
+      --{{ dc_openclaw_service_scope }}` could not be reached as
+      {{ dc_openclaw_user }} (rc={{ dc_unit_lookup.rc | default('?') }}):
+      {{ dc_unit_lookup.stderr | default('') | trim }}.
+      This says nothing about whether the unit exists — only that its state
+      could not be read, so the Gateway may still be running the previous
+      configuration. A user-scope systemctl needs both XDG_RUNTIME_DIR and
+      DBUS_SESSION_BUS_ADDRESS pointing at /run/user/{{ dc_openclaw_uid }}.
+  when:
+    - (dc_unit_lookup.rc | default(1)) != 0
+    - dc_fail_closed | bool
+  listen: Restart openclaw gateway
+
 - name: Refuse to leave the running config diverged from the file
   ansible.builtin.fail:
     msg: >-
-      The governed config was written but unit '{{ dc_openclaw_service }}' was
-      not found in the {{ dc_openclaw_service_scope }} scope, so the running
-      Gateway is still using the previous configuration. The file now shows
-      controls that are not in effect, which is more dangerous than not having
-      written it. Confirm the unit name and scope with
+      systemd was reachable and reported no unit named
+      '{{ dc_openclaw_service }}' in the {{ dc_openclaw_service_scope }} scope.
+      The governed config was written, so the file now shows controls that are
+      not in effect — more dangerous than not having written it. Confirm with
       `systemctl --{{ dc_openclaw_service_scope }} list-unit-files 'openclaw*'`
       run as {{ dc_openclaw_user }}, set dc_openclaw_service and
-      dc_openclaw_service_scope to match, then re-run. Restart by hand if the
-      daemon is managed another way.
+      dc_openclaw_service_scope to match, then re-run.
   when:
+    - (dc_unit_lookup.rc | default(1)) == 0
     - dc_unit_lookup.stdout | default('') | trim | length == 0
     - dc_fail_closed | bool
   listen: Restart openclaw gateway
@@ -82,4 +103,5 @@
   become_user: "{{ dc_openclaw_user }}"
   environment:
     XDG_RUNTIME_DIR: "/run/user/{{ dc_openclaw_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ dc_openclaw_uid }}/bus"
   listen: Restart openclaw gateway
