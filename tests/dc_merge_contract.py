@@ -74,6 +74,7 @@ def load_defaults() -> dict[str, Any]:
         "dc_plugins_deny", "dc_plugins_allow", "dc_plugins_required",
         "dc_agent_required_denies", "dc_agent_accept_list_risk",
         "dc_agent_profile_path", "dc_dry_run",
+        "dc_agent_preserve_default", "dc_agent_default_entry",
     ]
     missing = [key for key in required if key not in defaults]
     if missing:
@@ -251,6 +252,23 @@ def admission_floors() -> list[tuple[str, bool]]:
         ("FLOOR dry run is not the default", DEFAULTS.get("dc_dry_run") is False),
         ("FLOOR the profile lives outside this public fork",
          "dc-agent-profiles" in str(DEFAULTS.get("dc_agent_profile_path", ""))),
+        # `config patch` REPLACES arrays rather than merging them. A patch
+        # containing only dc-research therefore replaces agents.list entirely —
+        # and while the list is unset, the agent serving the founder's Slack is
+        # implicit and so is not in the list to survive. Every documented
+        # multi-agent example lists the default agent explicitly alongside the
+        # secondaries; none adds a secondary alone.
+        ("FLOOR the default agent is preserved when agents.list is created",
+         DEFAULTS.get("dc_agent_preserve_default") is True),
+        ("FLOOR the preserved entry is marked default",
+         (DEFAULTS.get("dc_agent_default_entry") or {}).get("default") is True),
+        ("FLOOR the preserved entry is main",
+         (DEFAULTS.get("dc_agent_default_entry") or {}).get("id") == "main"),
+        # Minimal on purpose: with no overrides it inherits agents.defaults,
+        # which is what the implicit main already runs on. Extra fields would
+        # invent a configuration it does not currently have.
+        ("FLOOR the preserved entry stays minimal",
+         set((DEFAULTS.get("dc_agent_default_entry") or {}).keys()) == {"id", "default"}),
     ]
 
 

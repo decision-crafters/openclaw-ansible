@@ -393,6 +393,33 @@ dc_agent_required_denies:
 # dc_confirm_stop: the awkwardness is the control.
 dc_agent_accept_list_risk: false
 
+# Preserve the default agent when agents.list is written for the first time.
+#
+# Every documented multi-agent example lists the default agent EXPLICITLY
+# alongside the secondaries — docs/concepts/multi-agent.md, retrieved
+# 2026-08-16:
+#
+#     agents: { entries: {
+#       main:   { default: true, workspace: "..." },
+#       coding: { workspace: "..." },
+#     }}
+#
+# Not one example adds a secondary agent on its own. `agentId` defaults to
+# `main`, and `agents.list[]` carries a `default` boolean. So writing a list
+# containing only dc-research would plausibly leave NO default agent, or make
+# dc-research the default by being the only entry — either of which takes the
+# founder's Slack agent away.
+#
+# When the list is currently unset, the play therefore prepends a minimal `main`
+# entry carrying nothing but its id and the default flag. Minimal on purpose:
+# with no overrides it inherits agents.defaults, which is exactly what the
+# implicit main is running on now. Adding fields would be inventing a
+# configuration it does not currently have.
+dc_agent_preserve_default: true
+dc_agent_default_entry:
+  id: main
+  default: true
+
 # Dry run only — patch is validated by the runtime and nothing is written.
 dc_dry_run: false
 

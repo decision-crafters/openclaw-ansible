@@ -34,6 +34,33 @@
   ansible.builtin.set_fact:
     dc_agent_entry: "{{ (dc_agent_profile.agents.list | default([]) | first) | default({}, true) }}"
 
+# Compose the patch, preserving the default agent when the list is being created.
+#
+# `config patch` replaces arrays wholesale rather than merging them, so a patch
+# containing only dc-research REPLACES agents.list entirely. When the list is
+# currently unset that is the same as declaring dc-research the only agent —
+# and the agent serving the founder's Slack is implicit, so it is not in the
+# list to survive.
+#
+# Prepending a minimal `main` entry makes the write additive in effect. It is
+# skipped when the list already exists, because then main's real entry is
+# already in it and inventing a second would be worse than doing nothing.
+- name: Compose the patch, preserving the default agent if the list is new
+  ansible.builtin.set_fact:
+    dc_agent_patch_body: >-
+      {{ {'agents': {'list': [dc_agent_default_entry] + (dc_agent_profile.agents.list | default([]))}}
+         if (dc_agent_list_unset | bool and dc_agent_preserve_default | bool)
+         else dc_agent_profile }}
+
+- name: Report what will be patched
+  ansible.builtin.debug:
+    msg: >-
+      patch contains {{ dc_agent_patch_body.agents.list | map(attribute='id') | list }}
+      {{ '(main prepended: agents.list is being created and the default agent is
+      implicit, so a patch containing only ' ~ dc_agent_id ~ ' would replace it)'
+         if (dc_agent_list_unset | bool and dc_agent_preserve_default | bool)
+         else '(agents.list already exists; patch applied as authored)' }}
+
 # Floors on the profile itself. The profile is the source of truth; these are
 # the minimums it has to clear. A profile that quietly dropped the seven session
 # tools from its deny list would reopen a gap that took a day to find, and
@@ -111,7 +138,7 @@
 - name: Ask the runtime to validate the patch without applying it
   ansible.builtin.command:
     argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
-    stdin: "{{ dc_agent_profile | to_json }}"
+    stdin: "{{ dc_agent_patch_body | to_json }}"
   register: dc_agent_dryrun
   changed_when: false
   failed_when: false
@@ -175,7 +202,7 @@
 - name: Apply the profile
   ansible.builtin.command:
     argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
-    stdin: "{{ dc_agent_profile | to_json }}"
+    stdin: "{{ dc_agent_patch_body | to_json }}"
   register: dc_agent_patch
   changed_when: dc_agent_patch.rc == 0
   failed_when: false
