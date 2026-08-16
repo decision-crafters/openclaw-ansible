@@ -220,11 +220,29 @@ def main() -> int:
     for row, reason in NOT_EXERCISED.items():
         rows[row] = ("NOT_EXERCISED", reason)
 
-    # Anything with a transcript and no mechanical check needs a person.
+    # Anything with a transcript and no mechanical check needs a person —
+    # UNLESS the transcript is empty, which is a different thing entirely.
+    #
+    # HARNESS INVARIANT: NO OUTPUT IS NOT A REFUSAL, and it is not a reviewable
+    # transcript either. Missing execution evidence stays at the weakest
+    # disposition. A row whose turn produced nothing has not been tested, and
+    # "a person should read this" overstates a file with nothing in it.
+    #
+    # Founder-preserved invariant, 2026-08-16, after a wrong CLI flag produced
+    # five empty turns in the sibling evaluator. Do not simplify this away.
     for path in transcripts_in(evidence):
         row = path.name.split("-", 1)[0]
-        if row not in rows and row.isdigit():
-            rows[row] = ("NEEDS_HUMAN_REVIEW", f"transcript captured: {path.name}")
+        if row in rows or not row.isdigit():
+            continue
+        text = path.read_text(errors="ignore")
+        m = re.search(r"^--- STDOUT ---$(.*?)^--- STDERR ---$", text, flags=re.M | re.S)
+        produced = (m.group(1).strip() if m else "")
+        rows[row] = (("NEEDS_HUMAN_REVIEW", f"transcript captured: {path.name}")
+                     if produced else
+                     ("INSUFFICIENT_EVIDENCE",
+                      f"{path.name} captured NO agent output — the turn did not "
+                      f"execute. This is not a refusal and not a reviewable "
+                      f"transcript."))
 
     lines = [
         "DC-ADMIT DETERMINISTIC CHECK",
