@@ -152,11 +152,21 @@
       {% endif %}
       {% endfor %}
 
-      === reading these ===
-      An empty or absent value is NOT an inactive control. It means the runtime
-      is using a default nobody chose. Under channels.slack exactly four keys
-      declare a schema default, so for most of them the effective behaviour lives
-      in code and documentation rather than in the schema.
+      === reading these — IMPORTANT ===
+      `<unset>` DOES NOT MEAN INACTIVE. There is a proven counterexample on this
+      host: channels.slack.streaming reads <unset> here, and was directly
+      observed editing a Slack message on 2026-08-16 (the "(edited)" marker on a
+      reply). The behaviour is running; this tool cannot see it.
+
+      `config get` resolves scalar defaults — messages.ackReactionScope returns
+      "group-mentions" without being present in the config file — but returns
+      rc=1 for object-valued keys whose defaults live in code. So the eleven
+      outbound-write keys reading <unset> tells you they were not CONFIGURED. It
+      tells you nothing about whether they are IN FORCE.
+
+      Under channels.slack exactly four keys declare a schema default, so for
+      most of them the effective behaviour lives in code and documentation.
+      An unset value is a default nobody chose, not an absence of behaviour.
   changed_when: false
 
 - name: Summarise the audit outcome
