@@ -30,6 +30,25 @@ Two failure classes are caught:
 
 The second is the one that bit us, and the one a plain "does this key exist"
 check would have missed.
+
+WHAT THIS FILE CANNOT DO, stated because a pre-filter mistaken for an authority
+is worse than no pre-filter.
+
+Cross-field constraints are invisible to it. On 2026-08-16 the runtime rejected
+a profile setting both `tools.exec.mode` and `tools.exec.security`:
+
+    tools.exec.mode cannot be combined with tools.exec.security or tools.exec.ask
+
+Both keys exist, both values are legal enum members, and this file passes that
+profile — verified by feeding the rejected version back. The walk below descends
+overlay and schema together key by key, testing existence and enum membership
+per key. "These two are mutually exclusive" is a relationship BETWEEN keys, and
+there is nowhere in that walk to put it.
+
+So: this is a cheap early filter for invented keys and illegal values.
+`openclaw config patch --dry-run` is the authority — it runs the runtime's own
+validator, including cross-field rules that appear nowhere in the JSON Schema
+and could not be enumerated from it. Where the two disagree, the runtime wins.
 """
 
 from __future__ import annotations
