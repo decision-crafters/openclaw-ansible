@@ -70,6 +70,21 @@
   tags:
     - admit
 
+# Test 12c, runnable alone. Founder direction 2026-08-16: this precedes the
+# admission receipt, because a receipt frozen while an authority-input weakness
+# is untested would have to be re-cut.
+- name: Test whether message text can inject authority (12c)
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the authority-injection variants
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: authority_injection
+  tags:
+    - authority-injection
+
 - name: Remove an agent profile
   hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
