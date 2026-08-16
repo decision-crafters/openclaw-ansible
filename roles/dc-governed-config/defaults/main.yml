@@ -203,6 +203,44 @@ dc_runuser: "/usr/sbin/runuser"
 # schema is ~1.9MB — large enough that a module argument is the wrong carrier.
 dc_schema_staging_path: "/root/.dc-openclaw-schema.json"
 
+# --- Lifecycle ----------------------------------------------------------------
+# The systemctl prefix every lifecycle and verification task needs. Defined once
+# because getting it wrong is the single most repeated mistake on this host, and
+# it fails in a way that points at the wrong cause:
+#
+#   runuser, not become  -- the playbook is invoked with -e ansible_become=false
+#                           to avoid a sudo password prompt, and that flag also
+#                           disables become_user, so tasks meant to run as the
+#                           service account silently ran as root
+#   XDG_RUNTIME_DIR      -- root cannot reach another user's systemd session bus
+#                           without it; the error is "Operation not permitted",
+#                           which reads as a sudo problem and is not
+#
+# dc_life_uid is set by tasks/lifecycle.yml before this is used.
+dc_life_systemctl:
+  - "{{ dc_runuser }}"
+  - -u
+  - "{{ dc_openclaw_user }}"
+  - --
+  - env
+  - "XDG_RUNTIME_DIR=/run/user/{{ dc_life_uid | default('') }}"
+  - systemctl
+  - "--{{ dc_openclaw_service_scope }}"
+
+# Properties worth having in every health sample. NRestarts is the load-bearing
+# one: it is the only field that distinguishes a healthy unit from a crash loop,
+# because a crash-looping unit is genuinely `active` for part of every cycle.
+dc_life_show:
+  - show
+  - "{{ dc_openclaw_service }}"
+  - --property=ActiveState,SubState,NRestarts,ExecMainStatus
+
+dc_life_log_lines: 60
+
+# Stopping the Gateway drops Slack, which is the only route to this host until
+# Tailscale exists. Never stop by default — see the guard in tasks/lifecycle.yml.
+dc_confirm_stop: false
+
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge
 # that silently creates a file would be clobbered by the next onboarding run,
