@@ -1,0 +1,316 @@
+---
+# Install an agent's governance files into its workspace.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags agent-workspace -e ansible_become=false
+#
+# WHY THIS EXISTS
+#
+# dc-research was deployed on 2026-08-16 and its tool policy verified by asking
+# the running agent to enumerate itself: exactly `read` and `image`, with exec
+# and all seven session tools gone. Every mechanical control held.
+#
+# Then it was asked for its identity coordinate and answered
+# `agent:dc-research:main`. Asked for its authority class, it described sandbox
+# mechanics. IDENTITY.md says Decision Crafters; AGENTS.md §2 says Observe and
+# Prepare only. Neither file was in its workspace, because nothing ever put them
+# there — the profile named a workspace directory and the directory was empty.
+#
+# So the agent was BOUNDED BUT UNGOVERNED: every configured control enforced,
+# every stated one absent. That is the specific failure this play closes, and it
+# is worth naming precisely because it looks like success from the config side.
+# `config get agents.list` returns a perfect answer either way.
+#
+# WHAT ACTUALLY ENFORCES WHAT — read before trusting the modes below.
+#
+# The binding controls on this agent are its `tools.deny` and its
+# `sandbox.workspaceAccess: ro`. They are configuration, they are verified, and
+# they are why the agent cannot write here.
+#
+# The file modes this play sets are NOT that. They are defence in depth against
+# accident and a way to make tampering visible. Stated plainly so nobody reads
+# 0444 as a guarantee: a process owning the containing directory can unlink and
+# replace a read-only file, because deletion is governed by the DIRECTORY's
+# permissions, not the file's. So the layout below is chosen with that in mind:
+#
+#   workspace root   openclaw:openclaw  1755   runtime may write session
+#                                              artifacts here; the sticky bit
+#                                              stops it deleting files it does
+#                                              not own
+#   governance files root:root          0444   cannot be modified, and cannot be
+#                                              deleted either, because of the
+#                                              sticky bit above
+#   skills/, packet/ root:root          0555   root-owned directories; nothing
+#                                              may be created or removed inside
+#
+# Root can still update all of it, which is what makes re-running this play the
+# supported way to change an agent's governance — the control binds the agent,
+# not the operator.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without an agent id and a profile to install
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id | length > 0
+      - dc_agent_profile_path | length > 0
+    fail_msg: >-
+      dc_agent_id and dc_agent_profile_path must both be set. They carry no
+      default in this public repository — the bindings live in a private
+      inventory's host_vars. Nothing has been changed.
+    success_msg: "installing workspace for {{ dc_agent_id }}"
+
+- name: Locate the profile directory
+  ansible.builtin.set_fact:
+    dc_ws_src: "{{ dc_agent_profile_path | dirname }}"
+
+- name: Read the profile that will be deployed
+  ansible.builtin.slurp:
+    src: "{{ dc_agent_profile_path }}"
+  register: dc_ws_profile_raw
+  delegate_to: localhost
+  become: false
+
+# The workspace path is taken from the PROFILE, not from a separate variable.
+#
+# A variable would be a second place to say the same thing, and the two would
+# eventually disagree — files installed in one directory while the agent reads
+# another, with every task in this play reporting success. The profile is what
+# the runtime is configured from, so it is what the files follow.
+- name: Extract the workspace the profile declares
+  ansible.builtin.set_fact:
+    dc_ws_dir: >-
+      {{ ((dc_ws_profile_raw.content | b64decode | from_json).agents.list
+          | selectattr('id', 'equalto', dc_agent_id) | list | first
+          | default({})).workspace | default('') }}
+
+- name: Refuse when the profile declares no workspace
+  ansible.builtin.fail:
+    msg: >-
+      The profile at {{ dc_agent_profile_path }} declares no `workspace` for
+      agent {{ dc_agent_id }}. Without it OpenClaw uses its own default
+      directory, which is not this one — the files would be installed somewhere
+      the agent never reads, and every check here would still pass.
+      Nothing has been changed.
+  when:
+    - dc_ws_dir | length == 0
+    - dc_fail_closed | bool
+
+# Path containment. The play chowns files to root and sets modes; pointing it at
+# a directory outside the service account's home would do that somewhere it has
+# no business being. `realpath` first so a symlinked workspace cannot slip the
+# check.
+- name: Resolve the workspace path as the filesystem sees it
+  ansible.builtin.command:
+    argv: [realpath, '-m', "{{ dc_ws_dir }}"]
+  register: dc_ws_real
+  changed_when: false
+
+- name: Refuse a workspace outside the service account home
+  ansible.builtin.assert:
+    that:
+      - dc_ws_real.stdout | trim is match(dc_openclaw_home ~ '/')
+      - (dc_ws_real.stdout | trim) != dc_openclaw_home
+      - (dc_ws_real.stdout | trim) != (dc_openclaw_home ~ '/.openclaw')
+    fail_msg: >-
+      Workspace {{ dc_ws_real.stdout | trim }} is not inside
+      {{ dc_openclaw_home }}, or IS the home or config directory itself. This
+      play chowns its contents to root and makes them read-only; doing that to
+      a home directory or to ~/.openclaw would break the runtime it governs.
+      Nothing has been changed.
+    success_msg: "workspace {{ dc_ws_real.stdout | trim }} is contained"
+
+# If the agent is already deployed, the live config is a third opinion on where
+# the workspace is. It must agree with the profile — a mismatch means the
+# profile has been edited since deployment, so the files would land where the
+# NEXT deploy will read them and not where the runtime reads them now.
+- name: Read the deployed workspace from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_ws_live
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Compare the deployed workspace with the profile
+  ansible.builtin.set_fact:
+    dc_ws_live_dir: >-
+      {{ ((dc_ws_live.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_agent_id) | list | first
+          | default({})).workspace | default('') }}
+  failed_when: false
+
+- name: Refuse when the runtime and the profile disagree about the workspace
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_id }} is deployed with workspace
+      '{{ dc_ws_live_dir }}' but the profile declares '{{ dc_ws_dir }}'.
+      Installing to the profile's path would put the governance files where the
+      running agent does not read them. Re-deploy the profile first
+      (--tags agent-profile), or reconcile the two. Nothing has been changed.
+  when:
+    - dc_ws_live_dir | length > 0
+    - dc_ws_live_dir != dc_ws_dir
+    - dc_fail_closed | bool
+
+# The install set is an EXPLICIT LIST, not a glob of the profile directory.
+#
+# `dc-agent-profiles/dc-research/` also holds `admission/`, which contains
+# synthetic-tests.md — the questions this agent is about to be tested with, and
+# their expected answers. A glob would install the answer key into the workspace
+# of the agent being tested, and the admission suite would pass for a reason
+# that has nothing to do with governance working.
+#
+# It also holds openclaw.json (applied through `config patch`, not read from
+# disk by the agent) and SCHEMA-RECONCILIATION.md (an operator note). Neither
+# belongs in a workspace that is injected into the model's context.
+- name: Confirm every required bootstrap file is present in the profile
+  ansible.builtin.stat:
+    path: "{{ dc_ws_src }}/{{ item }}"
+  register: dc_ws_src_stat
+  loop: "{{ dc_agent_workspace_files }}"
+  delegate_to: localhost
+  become: false
+
+- name: Refuse an incomplete profile
+  ansible.builtin.assert:
+    that:
+      - dc_ws_src_stat.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Missing from {{ dc_ws_src }}:
+      {{ dc_ws_src_stat.results | rejectattr('stat.exists')
+         | map(attribute='item') | list }}.
+      AGENTS.md carries the run gate and TOOLS.md is the only other file a
+      sub-agent session receives, so a partial install produces an agent that is
+      governed in some sessions and not others. Nothing has been changed.
+    success_msg: "all {{ dc_agent_workspace_files | length }} bootstrap files present"
+
+- name: Confirm nothing excluded is about to be installed
+  ansible.builtin.assert:
+    that:
+      - dc_agent_workspace_files | select('search', item) | list | length == 0
+    fail_msg: >-
+      '{{ item }}' appears in the install list. It is excluded deliberately —
+      see the comment above. Nothing has been changed.
+    success_msg: "'{{ item }}' correctly excluded"
+  loop: "{{ dc_agent_workspace_excluded }}"
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "agent workspace for {{ dc_agent_id }} (--tags agent-workspace)"
+    dc_apply_overlay:
+      workspace: "{{ dc_ws_real.stdout | trim }}"
+      files: "{{ dc_agent_workspace_files }}"
+      excluded: "{{ dc_agent_workspace_excluded }}"
+
+# Parent first, and only if absent. /home/openclaw/workspace may already hold
+# other agents' directories with ownership this play has no opinion about;
+# asserting a mode on it would change something nobody asked to change.
+- name: Check whether the workspace parent exists
+  ansible.builtin.stat:
+    path: "{{ dc_ws_real.stdout | trim | dirname }}"
+  register: dc_ws_parent
+
+- name: Create the workspace parent
+  ansible.builtin.file:
+    path: "{{ dc_ws_real.stdout | trim | dirname }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0755'
+  when: not dc_ws_parent.stat.exists
+
+# Sticky bit, and it is doing real work: it stops the service account deleting
+# the root-owned governance files below. Without it, `workspaceAccess: ro` and
+# mode 0444 would both be true and the files would still be removable by the
+# uid that owns this directory.
+- name: Create the agent workspace
+  ansible.builtin.file:
+    path: "{{ dc_ws_real.stdout | trim }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '1755'
+
+- name: Install the governance files read-only
+  ansible.builtin.copy:
+    src: "{{ dc_ws_src }}/{{ item }}"
+    dest: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
+    owner: root
+    group: root
+    mode: '0444'
+    directory_mode: '0555'
+  loop: "{{ dc_agent_workspace_files }}"
+  register: dc_ws_installed
+
+# `copy` creates intermediate directories with directory_mode but does not
+# revisit them, so skills/ and packet/ are pinned explicitly. Root-owned and
+# non-writable: nothing may be added to or removed from them at runtime, which
+# is what stops an agent that finds a write path from installing a skill.
+- name: Pin the subdirectory modes
+  ansible.builtin.file:
+    path: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0555'
+  loop: "{{ dc_agent_workspace_files | map('dirname') | reject('equalto', '')
+            | unique | list }}"
+
+# --- verification ------------------------------------------------------------
+#
+# Read back from the filesystem rather than trusting the module results. `copy`
+# reporting ok means it believes it wrote; this asks the host.
+
+- name: Read back what is actually in the workspace
+  ansible.builtin.find:
+    paths: "{{ dc_ws_real.stdout | trim }}"
+    recurse: true
+    file_type: file
+    hidden: true
+  register: dc_ws_found
+
+- name: Confirm every governance file landed, owned by root and read-only
+  ansible.builtin.assert:
+    that:
+      - (dc_ws_found.files | selectattr('path', 'equalto', dc_ws_real.stdout | trim ~ '/' ~ item)
+         | list | first | default({})).mode | default('') == '0444'
+      - (dc_ws_found.files | selectattr('path', 'equalto', dc_ws_real.stdout | trim ~ '/' ~ item)
+         | list | first | default({})).uid | default(-1) == 0
+    fail_msg: "{{ item }} is missing, writable, or not root-owned in {{ dc_ws_real.stdout | trim }}"
+    success_msg: "{{ item }} installed 0444 root"
+  loop: "{{ dc_agent_workspace_files }}"
+
+# The exclusion is verified on the HOST, not just in the variable. The assert
+# above proves the list was clean; this proves the directory is — they are
+# different claims, and the one that matters is the one about the machine an
+# admission test will run against.
+- name: Confirm no excluded material reached the workspace
+  ansible.builtin.assert:
+    that:
+      - dc_ws_found.files | map(attribute='path')
+        | select('search', item) | list | length == 0
+    fail_msg: >-
+      '{{ item }}' is present in {{ dc_ws_real.stdout | trim }}. If that is
+      admission/, the agent can now read the synthetic tests it is about to be
+      given, and any pass would be meaningless. Remove it before testing.
+    success_msg: "no '{{ item }}' in the workspace"
+  loop: "{{ dc_agent_workspace_excluded }}"
+
+- name: Emit the workspace receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-AGENT-WORKSPACE RECEIPT |
+      agent={{ dc_agent_id }} |
+      workspace={{ dc_ws_real.stdout | trim }} (1755 {{ dc_openclaw_user }}) |
+      installed={{ dc_agent_workspace_files | length }} files 0444 root |
+      excluded_verified={{ dc_agent_workspace_excluded | join(',') }} |
+      gateway NOT restarted — bootstrap files are read when a SESSION starts,
+      not when the daemon does |
+      NOT YET PROVEN: that the agent reads them. Files on disk is not governance
+      in context. Confirm with `openclaw agent --agent {{ dc_agent_id }}` in a
+      NEW session, asking for its identity coordinate and authority class — it
+      must answer Decision Crafters and Observe/Prepare. Before this play it
+      answered `agent:{{ dc_agent_id }}:main` and described sandbox mechanics.

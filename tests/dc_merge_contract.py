@@ -347,6 +347,89 @@ def target_floors() -> list[tuple[str, bool]]:
     ]
 
 
+def _task_mode(text: str, task_name: str) -> str | None:
+    """Return the `mode:` a named task sets, or None if the task has none.
+
+    Scoped to one task rather than searching the file, so a mode set somewhere
+    else cannot satisfy an assertion about this one.
+    """
+    import re
+
+    block = re.split(r"^- name: ", text, flags=re.M)
+    for chunk in block:
+        if chunk.startswith(task_name):
+            m = re.search(r"^\s+mode:\s*'([0-7]{4})'", chunk, flags=re.M)
+            return m.group(1) if m else None
+    return None
+
+
+def workspace_floors() -> list[tuple[str, bool]]:
+    """Floors on what reaches an agent's workspace, and what never may.
+
+    dc-research ran for a day with every configured control enforced and every
+    stated one absent — bounded but ungoverned — because its workspace was
+    empty. tasks/agent_workspace.yml fills it. These pin the two ways that play
+    could quietly stop being worth running.
+
+    First: AGENTS.md and TOOLS.md are the ONLY files a sub-agent session
+    receives. Drop either from the install list and the agent is governed in a
+    main session and ungoverned in a spawned one, which is the failure mode that
+    is hardest to notice because the common path still looks right.
+
+    Second, and the one that would actually fool us: `admission/` holds the
+    synthetic tests and their expected answers. Installing it puts the answer
+    key in the workspace of the agent under test. The suite would pass, and the
+    pass would mean nothing. A glob over the profile directory does exactly
+    this, which is why the install list is explicit — and why the exclusion is
+    asserted here rather than only in a comment.
+    """
+    d = load_defaults()
+    files = d.get("dc_agent_workspace_files", [])
+    excluded = d.get("dc_agent_workspace_excluded", [])
+
+    # An excluded name must not appear anywhere in an installed path — not as a
+    # basename, not as a parent directory.
+    leaks = [f for f in files for x in excluded if x in f]
+
+    ws = ROLE / "tasks" / "agent_workspace.yml"
+    ws_text = ws.read_text(errors="ignore") if ws.is_file() else ""
+
+    return [
+        ("WORKSPACE the install play exists", ws.is_file()),
+        ("WORKSPACE AGENTS.md is installed (sub-agent sessions get only this and TOOLS.md)",
+         "AGENTS.md" in files),
+        ("WORKSPACE TOOLS.md is installed", "TOOLS.md" in files),
+        ("WORKSPACE IDENTITY.md is installed", "IDENTITY.md" in files),
+        ("WORKSPACE SOUL.md is installed", "SOUL.md" in files),
+        ("WORKSPACE admission material is excluded", "admission" in excluded),
+        (f"WORKSPACE nothing excluded appears in the install list"
+         + (f" — leaked {leaks}" if leaks else ""), not leaks),
+        # The install list is a list, not a directory listing. If this file ever
+        # starts globbing, the exclusion above becomes decorative.
+        ("WORKSPACE the play does not glob the profile directory",
+         "with_fileglob" not in ws_text and "fileglob" not in ws_text),
+        # Root-owned and read-only, and the sticky bit that makes 0444 mean
+        # something in a directory the service account owns.
+        ("WORKSPACE governance files are installed 0444 root",
+         "mode: '0444'" in ws_text and "owner: root" in ws_text),
+        # Named tasks rather than a substring search of the file. The first
+        # version of this check tested whether "1755" appeared ANYWHERE, and
+        # passed while a bad restore had also made the shared parent directory
+        # sticky — a change nobody asked for, invisible to the test that was
+        # supposed to be watching that mode. A check that a stray match
+        # satisfies is not watching anything.
+        ("WORKSPACE the agent workspace root is sticky (1755)",
+         _task_mode(ws_text, "Create the agent workspace") == "1755"),
+        ("WORKSPACE the shared parent is left plain (0755)",
+         _task_mode(ws_text, "Create the workspace parent") == "0755"),
+        # Verification reads the host, not the module results.
+        ("WORKSPACE the exclusion is verified on the host after install",
+         "dc_ws_found" in ws_text and "dc_agent_workspace_excluded" in ws_text),
+        ("WORKSPACE the write is gated by apply_gate",
+         "apply_gate.yml" in ws_text),
+    ]
+
+
 def admission_floors() -> list[tuple[str, bool]]:
     """Floors on deploying an agent profile to a live, in-use runtime.
 
@@ -527,7 +610,7 @@ def main() -> int:
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + workspace_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

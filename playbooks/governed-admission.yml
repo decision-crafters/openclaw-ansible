@@ -37,6 +37,23 @@
   tags:
     - agent-profile
 
+# Separate from agent-profile, and runnable in either order, because they fail
+# differently. Deploying a profile changes what the runtime enforces and
+# restarts the Gateway; installing a workspace changes what the agent is told
+# and restarts nothing. Binding them together would mean a governance-text edit
+# could only ship by restarting a daemon the founder is talking to.
+- name: Install an agent's governance files into its workspace
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Provision the agent workspace
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_workspace
+  tags:
+    - agent-workspace
+
 - name: Remove an agent profile
   hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true

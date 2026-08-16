@@ -432,6 +432,46 @@ dc_agent_default_entry:
   id: main
   default: true
 
+# --- Agent workspace ----------------------------------------------------------
+# What gets installed into an agent's workspace directory, relative to the
+# directory holding its profile. See tasks/agent_workspace.yml.
+#
+# An EXPLICIT LIST rather than a glob, and that is the whole design.
+#
+# Ordered the way OpenClaw treats them, which is not alphabetical and matters:
+# AGENTS.md and TOOLS.md are the only two files a SUB-AGENT session receives —
+# the Skills section is dropped there entirely — so anything that must bind
+# unconditionally lives in AGENTS.md. IDENTITY.md and SOUL.md are injected in
+# full in a main session. skills/ reaches the model as a compact index of name,
+# description and path, with bodies read on demand.
+dc_agent_workspace_files:
+  - AGENTS.md
+  - TOOLS.md
+  - IDENTITY.md
+  - SOUL.md
+  - skills/dc-task-selection/SKILL.md
+  - packet/tasks-research.json
+  - packet/MANIFEST.md
+
+# Material that sits beside the profile and must NEVER be installed.
+#
+# `admission/` holds the synthetic tests this agent is about to be given,
+# together with their expected answers. Installing it would put the answer key
+# in the workspace of the agent under test, and the suite would pass for a
+# reason unrelated to governance working — the purest form of a check that
+# confirms its own assumption.
+#
+# `openclaw.json` is applied through `config patch`; the agent never reads it
+# from disk, and a copy in the workspace is a second version of the truth.
+# SCHEMA-RECONCILIATION.md is an operator note about schema drift.
+#
+# Checked twice by the play: once against the install list, once against the
+# workspace as it exists on the host afterwards. Those are different claims.
+dc_agent_workspace_excluded:
+  - admission
+  - openclaw.json
+  - SCHEMA-RECONCILIATION
+
 # Every play that writes defaults to a DRY RUN. See tasks/apply_gate.yml.
 #
 # The host is under active development, so plays get invoked for reasons other
