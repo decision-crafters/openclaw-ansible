@@ -917,3 +917,16 @@ dc_hooks_declared: []
 # the play still succeeds, because a monitoring command that exits non-zero on
 # a finding stops being run. Set true to use this as a CI gate instead.
 dc_hooks_fail_on_undeclared: false
+
+# --- Hook verification ---------------------------------------------------------
+# See tasks/hook_verify.yml. Read-only, one hook at a time.
+#
+# One hook per run, deliberately. A report covering several invites the reader
+# to generalise from one to the others, and a declaration must never mean that:
+# founder direction 2026-08-16 is that declaring a hook means "THIS exact
+# bundled hook, with THIS exact trigger and write scope, is an accepted
+# baseline" — never that hooks as a class are authorized.
+dc_hook_verify: ""
+dc_hook_verify_report: >-
+  /tmp/openclaw-hook-{{ dc_hook_verify | default('unnamed') }}-{{
+  ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt

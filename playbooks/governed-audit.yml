@@ -57,3 +57,18 @@
         tasks_from: hooks_audit
   tags:
     - hooks-audit
+
+# Read-only, one named hook. Separate from hooks-audit because enumerating and
+# verifying are different jobs: the audit answers "what is enabled and was it
+# declared", this answers "what does this specific one actually do".
+- name: Verify one hook before it is declared
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Gather bounded read-only evidence about a single hook
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: hook_verify
+  tags:
+    - hook-verify
