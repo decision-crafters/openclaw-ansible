@@ -22,6 +22,14 @@
   ansible.builtin.set_fact:
     dc_audit_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
     dc_life_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+    # The shared restart handler reads dc_openclaw_uid. Omitting it here made
+    # the handler fail with "'dc_openclaw_uid' is undefined" AFTER the config
+    # had been patched and validated — leaving the file changed and the running
+    # process on the previous config, which is the exact divergence the handler
+    # comment at the top of handlers/main.yml calls the worst outcome this role
+    # can produce. Three names for one uid is redundant; renaming them is a
+    # separate change and not one to make while a host is half-applied.
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
 
 - name: Locate the OpenClaw entrypoint from the installed unit
   ansible.builtin.shell:

@@ -34,37 +34,54 @@
   ansible.builtin.set_fact:
     dc_agent_entry: "{{ (dc_agent_profile.agents.list | default([]) | first) | default({}, true) }}"
 
-# Compose the patch, preserving the default agent when the list is being created.
+# Compose the patch as an UPSERT, not a replacement.
 #
 # `config patch` replaces arrays wholesale rather than merging them, so a patch
-# containing only dc-research REPLACES agents.list entirely. When the list is
-# currently unset that is the same as declaring dc-research the only agent —
-# and the agent serving the founder's Slack is implicit, so it is not in the
-# list to survive.
+# body containing only this agent REPLACES agents.list — dropping every other
+# entry in it. That matters twice over:
 #
-# Prepending a minimal `main` entry makes the write additive in effect. It is
-# skipped when the list already exists, because then main's real entry is
-# already in it and inventing a second would be worse than doing nothing.
-- name: Compose the patch, preserving the default agent if the list is new
+#   First run, list unset: the founder's Slack agent is implicit and therefore
+#   not in the list to survive. A minimal `main` entry is prepended so the write
+#   is additive in effect. Every documented multi-agent example lists the
+#   default agent explicitly alongside the secondaries; none adds one alone.
+#
+#   SECOND run, list now set: without this, the compose would skip the prepend
+#   (the list exists) and patch with the profile as authored — writing
+#   [dc-research] over [main, dc-research] and removing main. The re-run would
+#   do precisely what the first run was built to prevent. Found on 2026-08-16
+#   when a handler failure forced a re-run.
+#
+# So: keep every existing entry that is not this agent, add this agent, and
+# prepend the default only when there is nothing to keep.
+- name: Read the existing agent list, if any
   ansible.builtin.set_fact:
-    dc_agent_patch_body: >-
-      {{ {'agents': {'list': [dc_agent_default_entry] + (dc_agent_profile.agents.list | default([]))}}
-         if (dc_agent_list_unset | bool and dc_agent_preserve_default | bool)
-         else dc_agent_profile }}
+    dc_agent_existing: >-
+      {{ (dc_agent_list_before.stdout | default('[]') | from_json)
+         if not (dc_agent_list_unset | bool) else [] }}
+
+- name: Keep every entry that is not the agent being deployed
+  ansible.builtin.set_fact:
+    dc_agent_kept: "{{ dc_agent_existing | rejectattr('id', 'equalto', dc_agent_id) | list }}"
+
+- name: Compose the patch
+  ansible.builtin.set_fact:
+    dc_agent_patch_body:
+      agents:
+        list: >-
+          {{ (dc_agent_kept if (dc_agent_kept | length > 0)
+              else ([dc_agent_default_entry] if (dc_agent_preserve_default | bool) else []))
+             + [dc_agent_entry] }}
 
 - name: Report what will be patched
   ansible.builtin.debug:
     msg: >-
-      patch contains {{ dc_agent_patch_body.agents.list | map(attribute='id') | list }}
-      {{ '(main prepended: agents.list is being created and the default agent is
-      implicit, so a patch containing only ' ~ dc_agent_id ~ ' would replace it)'
-         if (dc_agent_list_unset | bool and dc_agent_preserve_default | bool)
-         else '(agents.list already exists; patch applied as authored)' }}
+      patch contains {{ dc_agent_patch_body.agents.list | map(attribute='id') | list }} —
+      kept {{ dc_agent_kept | map(attribute='id') | list }},
+      {{ 'prepended the default agent because there was nothing to keep'
+         if (dc_agent_kept | length == 0) and (dc_agent_preserve_default | bool)
+         else 'no prepend needed' }}.
+      config patch REPLACES arrays, so anything absent from this list is removed.
 
-# Floors on the profile itself. The profile is the source of truth; these are
-# the minimums it has to clear. A profile that quietly dropped the seven session
-# tools from its deny list would reopen a gap that took a day to find, and
-# nothing else in this play would notice.
 - name: Confirm the profile clears the admission floors
   ansible.builtin.assert:
     that:
