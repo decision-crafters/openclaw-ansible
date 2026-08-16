@@ -14,22 +14,33 @@
 #
 #   hooks :: { "internal": { "entries": { "session-memory": { "enabled": true } } } }
 #
-# An event mechanism, already running, in no inventory, no deny list and no
-# governance record. It had been invisible for one reason: nothing enumerated
-# hooks. The value was there the whole time and no check asked for it.
+# Something enabled, in no inventory, no deny list and no governance record. It
+# had been invisible for one reason: nothing enumerated hooks. The value was
+# there the whole time and no check asked for it.
 #
 # That is the same shape as the seven session tools and `heartbeat_respond`.
 # The pattern is not "we keep getting unlucky" — it is that a surface nobody
 # enumerates is a surface nobody has decided about, and this file exists so
 # hooks stop being one.
 #
-# WHY IT MATTERS MORE THAN A TIMED JOB
+# WHAT IT TURNED OUT TO BE, AND THE MISTAKE IN BETWEEN
 #
-# TASK-229 names EVENT_TRIGGER as one of three mechanisms and Decision Memory
-# lists "event-driven hooks/webhooks" among the separately reviewable capability
-# bindings. An event hook has no cadence to inspect and no next-run time: it
-# fires when something external happens, which means "is it running?" cannot be
-# answered by waiting and watching. It has to be enumerated.
+# `openclaw hooks info session-memory` answered: "Save session context to memory
+# when /new or /reset command is issued", Source: openclaw-bundled. A bundled
+# LIFECYCLE hook, fired inside a session — not an external event path.
+#
+# It was reported as the latter for several minutes, because this file printed
+# one number for two different surfaces. `hooks.enabled` and
+# `hooks.allowedAgentIds` both read <unset>, and those govern the HTTP webhook
+# ingress, which is the EVENT_TRIGGER mechanism TASK-229 names. The two are
+# separated below so the report cannot make that error again.
+#
+# WHY ENUMERATION IS THE ONLY METHOD HERE
+#
+# An event hook has no cadence and no next-run time. "Is it running?" cannot be
+# answered by waiting and watching, the way a timed job can. It has to be
+# listed. That is true of the bundled lifecycle hooks as much as the ingress —
+# the difference is what each one can reach, not whether it is visible.
 
 - name: Establish the CLI and confirm its verbs
   ansible.builtin.include_tasks: agent_common.yml
@@ -124,6 +135,37 @@
     dc_hooks_missing: >-
       {{ dc_hooks_declared | difference(dc_hooks_enabled | default([])) }}
 
+# TWO SURFACES, AND CONFLATING THEM IS AN ERROR THIS FILE ALREADY MADE.
+#
+# `hooks.internal.entries` are BUNDLED LIFECYCLE hooks — shipped by upstream,
+# fired by something happening inside a session. `session-memory` is one:
+# "Save session context to memory when /new or /reset command is issued",
+# Source: openclaw-bundled.
+#
+# `hooks.enabled` + `hooks.mappings` + `hooks.allowedAgentIds` are the HTTP
+# WEBHOOK INGRESS — an external caller reaching in over the network. That is
+# TASK-229's EVENT_TRIGGER mechanism and the one a scheduling grant governs.
+#
+# On 2026-08-16 this audit reported the first and it was read as the second,
+# which turned a bundled lifecycle hook into "a live external event path". The
+# risk is not the same and the report must not let them share a line.
+- name: Separate the internal lifecycle hooks from the webhook ingress
+  ansible.builtin.set_fact:
+    dc_hooks_ingress_state: >-
+      {{ 'CONFIGURED — external callers can reach this runtime; treat as EVENT_TRIGGER'
+         if (dc_hooks_config.stdout | default('{}') | from_json).get('enabled') | default(false)
+         else 'not configured — no external HTTP ingress reported' }}
+  failed_when: false
+
+- name: Report the two hook surfaces separately
+  ansible.builtin.debug:
+    msg: >-
+      DC-HOOKS SURFACES |
+      internal_lifecycle={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }}
+      (bundled, fired inside a session — NOT the EVENT_TRIGGER mechanism) |
+      webhook_ingress={{ dc_hooks_ingress_state }} |
+      allowedAgentIds={{ dc_hooks_agents.stdout | default('') | trim | default('<unset>', true) }}
+
 # Both directions, because they are different failures. An UNDECLARED hook is
 # capability nobody chose. A DECLARED-but-absent hook is a control someone
 # believes is in place and is not — the quieter of the two, and the one an
@@ -159,7 +201,8 @@
       hooks_config_rc={{ dc_hooks_config.rc | default('?') }} |
       hooks_list_rc={{ dc_hooks_list.rc | default('?') }} |
       hooks_check_rc={{ dc_hooks_check.rc | default('?') }} |
-      enabled={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }} |
+      internal_lifecycle={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }} |
+      webhook_ingress={{ dc_hooks_ingress_state | default('UNKNOWN') }} |
       allowedAgentIds={{ dc_hooks_agents.stdout | default('') | trim | default('<unset>', true) }} |
       undeclared={{ dc_hooks_undeclared | join(', ') | default('none', true) }} |
       `hooks.allowedAgentIds` UNSET DOES NOT MEAN NO AGENT IS REACHABLE. It
