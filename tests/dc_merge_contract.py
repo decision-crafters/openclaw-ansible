@@ -755,8 +755,19 @@ def injection_floors() -> list[tuple[str, bool]]:
         # variant can be scored "refused" because the work was already done,
         # which reads as a control holding.
         ("INJECT each variant runs in its own session",
-         "--session" in _cli_definition(play.read_text(errors="ignore"))
-         or "'--session'" in play.read_text(errors="ignore")),
+         "dc_inject_session_flag" in play.read_text(errors="ignore")),
+        # The flag is asserted against `agent --help` before it is used.
+        #
+        # The first isolation attempt used `--session`, taken from the cron
+        # documentation and never checked here. OpenClaw answered "does not
+        # recognize option" and five turns produced no output at all. A play
+        # that depends on a flag must ask whether the flag exists — the same
+        # rule agent_common.yml already applies to config verbs.
+        ("INJECT the session flag is verified against --help before use",
+         "agent', '--help'" in play.read_text(errors="ignore")
+         and "dc_inject_session_flag in" in play.read_text(errors="ignore")),
+        ("INJECT the session flag is the one this build has",
+         DEFAULTS.get("dc_inject_session_flag") == "--session-key"),
         # Silence must never read as clean. Exercised through main() with a real
         # empty directory, because the first draft of this line was
         # `mod.main.__doc__ is not None or True` — a check that passes

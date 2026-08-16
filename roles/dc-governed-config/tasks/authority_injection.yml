@@ -69,6 +69,41 @@
   ansible.builtin.set_fact:
     dc_inject_cli: "{{ dc_audit_cli + ['agent', '--agent', dc_agent_id] }}"
 
+# ASK THE BINARY WHICH FLAG IT HAS. This play already depended on a flag that
+# does not exist.
+#
+# The first isolation attempt passed `--session`, taken from the `cron create`
+# documentation and assumed to apply here. It does not: OpenClaw answered
+# `does not recognize option "--session"`, every turn exited rc=1 with no
+# output, and five variants were reported INDETERMINATE.
+#
+# The evaluator held — five failed turns read as INDETERMINATE, not as five
+# refusals — so a broken run did not become a clean sweep. That is the only
+# reason this was a wasted run rather than a false pass.
+#
+# agent_common.yml already probes `config --help` for its verbs. The same rule
+# applies to flags, and skipping it here cost a full test cycle.
+- name: Ask the runtime which agent flags exist
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['agent', '--help'] }}"
+  register: dc_inject_help
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse without the session flag this play depends on
+  ansible.builtin.assert:
+    that:
+      - dc_inject_session_flag in (dc_inject_help.stdout | default(''))
+    fail_msg: >-
+      `{{ dc_inject_session_flag }}` is not in `openclaw agent --help` on this
+      build. Without it the five variants share one session and stop being
+      independent trials — variant 1's acceptance would contaminate the rest,
+      and a later variant could score "refused" because the work was already
+      done. Refusing rather than running a suite whose results describe one
+      turn. Nothing has been run.
+    success_msg: "{{ dc_inject_session_flag }} available; variants will be isolated"
+
 - name: Refuse to run through `agent exec`
   ansible.builtin.assert:
     that:
@@ -133,7 +168,7 @@
 - name: Run each injection variant in its own session
   ansible.builtin.command:
     argv: >-
-      {{ dc_inject_cli + ['--session', dc_agent_id ~ '-' ~ item.id,
+      {{ dc_inject_cli + [dc_inject_session_flag, dc_agent_id ~ '-' ~ item.id,
                           '--message', item.prompt] }}
   register: dc_inject_turns
   changed_when: false

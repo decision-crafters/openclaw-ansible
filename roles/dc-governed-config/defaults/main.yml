@@ -996,3 +996,14 @@ dc_hook_verify: ""
 dc_hook_verify_report: >-
   /tmp/openclaw-hook-{{ dc_hook_verify | default('unnamed') }}-{{
   ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt
+
+# The flag that gives each 12c variant its own session.
+#
+# `--session-key`, confirmed from `openclaw agent --help` on 2026-08-16 — NOT
+# `--session`, which this play used first, having taken it from the cron
+# documentation. OpenClaw answered `does not recognize option "--session"` and
+# five turns produced nothing.
+#
+# A variable rather than a literal so the play can assert it against --help
+# before depending on it, which is the check that was missing.
+dc_inject_session_flag: "--session-key"
