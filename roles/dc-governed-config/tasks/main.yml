@@ -268,6 +268,83 @@
     - (dc_schema_check.rc | default(1)) != 0
     - dc_fail_closed | bool
 
+# --- preflight: can this control actually RUN here? ---------------------------
+# Added after the failure it would have caught. On 2026-08-15 this role wrote
+# `sandbox.mode: all` to a host whose service account could not reach any
+# container runtime. Everything downstream passed: the config verified from
+# disk, the Gateway came back active and stable across two NRestarts samples,
+# and the receipt was clean. Meanwhile every agent run failed with
+# "permission denied while trying to connect to the docker API", and the
+# founder found out from Slack.
+#
+# Nothing lied. Every check passed and the system was down.
+#
+# The gap is structural rather than unlucky. The merge contract's floors ask two
+# questions — is this value SAFE, is this value LEGAL — and both were satisfied.
+# Neither asks whether the value can be HONOURED on this host. `sandbox.mode`
+# is the first control in this role that depends on something outside the
+# config file existing, and it silently became a promise the runtime could not
+# keep.
+#
+# Two things are checked, because either alone produces the same symptom:
+# a reachable daemon with no image fails identically to no daemon at all, and
+# the error names neither.
+- name: Locate the sandbox runtime socket
+  ansible.builtin.stat:
+    path: "{{ dc_sandbox_docker_host_path }}"
+  register: dc_sandbox_socket
+  when: dc_sandbox_mode != 'off'
+
+- name: Ask the container runtime whether the service account can reach it
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - "DOCKER_HOST=unix://{{ dc_sandbox_docker_host_path }}"
+      - /usr/bin/docker
+      - images
+      - -q
+      - "{{ dc_sandbox_image }}"
+  register: dc_sandbox_probe
+  changed_when: false
+  failed_when: false
+  when:
+    - dc_sandbox_mode != 'off'
+    - dc_sandbox_socket.stat.exists | default(false)
+
+- name: Refuse to enable a sandbox this host cannot run
+  ansible.builtin.fail:
+    msg: >-
+      sandbox.mode is '{{ dc_sandbox_mode }}' but the sandbox cannot start here,
+      so writing it would produce a governed config over a runtime that cannot
+      execute anything — which is exactly what happened on 2026-08-15, with a
+      clean receipt over a dead agent.
+      {% if not (dc_sandbox_socket.stat.exists | default(false)) %}
+      No container runtime socket at {{ dc_sandbox_docker_host_path }}.
+      The upstream role deliberately removes {{ dc_openclaw_user }} from the
+      `docker` group because the rootful socket is host-root-equivalent, so the
+      fix is NOT to add it back — that would grant host root and undo
+      roles/openclaw/tasks/docker-security.yml.
+      {% else %}
+      The runtime is reachable but the image {{ dc_sandbox_image }} is absent.
+      OpenClaw refuses to substitute a stock debian image.
+      {% endif %}
+      Run this first:
+        sudo ansible-playbook playbooks/governed-rootless-sandbox.yml -e ansible_become=false
+      Or set dc_sandbox_mode: "off" as a RECORDED governance decision — the
+      merge-contract floors will refuse it until the profile is changed
+      deliberately, which is the point.
+      Nothing has been written and no backup was taken.
+  when:
+    - dc_sandbox_mode != 'off'
+    - not (dc_sandbox_socket.stat.exists | default(false))
+      or (dc_sandbox_probe.stdout | default('') | trim) | length == 0
+    - dc_fail_closed | bool
+
 - name: Ensure the backup directory exists
   ansible.builtin.file:
     path: "{{ dc_openclaw_backup_dir }}"

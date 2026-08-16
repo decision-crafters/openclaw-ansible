@@ -37,6 +37,23 @@ dc_sandbox_scope: "session"        # session | agent | shared
 # control — it is a default that could change under us without notice.
 dc_sandbox_docker_network: "none"
 
+# Preflight inputs. `sandbox.mode` is the only control in this role that depends
+# on something outside the config file existing, which is why it is the only one
+# with a preflight — and why it is the one that produced a clean receipt over a
+# runtime that could not execute anything.
+#
+# The socket is the service account's ROOTLESS daemon, not /var/run/docker.sock.
+# The rootful socket is host-root-equivalent and the upstream role deliberately
+# removes this account from the `docker` group; roles/dc-rootless-sandbox
+# provides the rootless one. Checking the rootful path here would report a
+# working sandbox that the service account cannot actually use.
+dc_sandbox_docker_host_path: "/run/user/{{ dc_openclaw_uid | default('') }}/docker.sock"
+
+# OpenClaw refuses to substitute a stock debian image: the default carries
+# python3 for the sandbox write/edit helpers. A reachable daemon with no image
+# fails identically to no daemon at all, so both are checked.
+dc_sandbox_image: "openclaw-sandbox:bookworm-slim"
+
 # --- Tool policy -------------------------------------------------------------
 # Expressed as deny rather than allow deliberately. OpenClaw documents that
 # "deny always wins", so a capability added to a future OpenClaw release cannot
