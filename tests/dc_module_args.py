@@ -91,6 +91,48 @@ def parse_tasks(text: str) -> list[tuple[int, str, list[str]]]:
     return tasks
 
 
+def check_include_role_apply(root: Path) -> list[str]:
+    """Reject `apply:` on a dynamic include that also carries tags.
+
+    `apply.tags` does not gate the included tasks — it ADDS those tags to every
+    one of them. On governed-lifecycle.yml, applying the tag union meant
+    `--tags status` matched the stop guard, the stop, the logs and the start
+    tasks alike: a read-only status check died on "Refuse to stop the gateway",
+    and with -e dc_confirm_stop=true it would have stopped the Gateway and
+    dropped the founder's only route to the host.
+
+    Nothing static caught it. ansible-lint passed on the production profile,
+    --syntax-check passed, and --list-tasks does not expand a dynamic include so
+    the inner tasks were invisible. It was found by executing both variants
+    against a mock role.
+
+    Tag the include itself to gate whether it runs; let each included task's own
+    tags decide whether it executes.
+    """
+    problems: list[str] = []
+    for path in sorted(root.glob("*.yml")):
+        lines = path.read_text().splitlines()
+        for index, line in enumerate(lines):
+            if "include_role" not in line and "include_tasks" not in line:
+                continue
+            # Look ahead within the same task block for an `apply:` carrying tags.
+            window = lines[index : index + 12]
+            has_apply = any(w.strip().startswith("apply:") for w in window)
+            has_tags_under_apply = False
+            if has_apply:
+                start = next(i for i, w in enumerate(window) if w.strip().startswith("apply:"))
+                has_tags_under_apply = any(
+                    w.strip().startswith("tags:") for w in window[start : start + 4]
+                )
+            if has_apply and has_tags_under_apply:
+                problems.append(
+                    f"{path.name}:{index + 1}  dynamic include uses `apply:` with tags — "
+                    "this ADDS the tags to every included task rather than gating them. "
+                    "Tag the include itself instead."
+                )
+    return problems
+
+
 def main() -> int:
     problems: list[str] = []
     checked = 0
@@ -103,6 +145,8 @@ def main() -> int:
                     problems.append(
                         f"{path.name}:{line_no}  {module} given '{bad}' — {reason}"
                     )
+
+    problems.extend(check_include_role_apply(ROLE.parents[1] / "playbooks"))
 
     for problem in problems:
         print(f"  FAIL  {problem}")
