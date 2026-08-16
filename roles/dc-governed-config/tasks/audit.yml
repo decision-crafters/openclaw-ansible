@@ -139,15 +139,38 @@
 # rc != 0 is NOT "no jobs". It is "this build did not answer", which is an
 # UNKNOWN and must read as one — an empty list and an unanswered question look
 # identical in a report unless the report says which it is.
+#
+# Emptiness is NOT how you detect "no jobs", and the first version of this got
+# it wrong in a way worth keeping written down. It treated any non-empty stdout
+# as jobs present. But every `openclaw` invocation prints a config-warning
+# preamble, and the runtime answers an empty scheduler with the PROSE
+# "No cron jobs." — so stdout is never empty and the audit reported
+# "SCHEDULED JOBS PRESENT" against a scheduler holding none.
+#
+# It failed safe, which is the right direction and not good enough. A check that
+# cries wolf on the normal case teaches the reader to skim past it, and the run
+# where it is right is the run they skim.
+#
+# So: strip our own preamble, then look for the runtime's own phrasing. Anything
+# neither recognised as empty nor recognised as a job list is UNRECOGNISED —
+# a third state, not folded into either of the first two.
+- name: Isolate the scheduler's own answer from the CLI preamble
+  ansible.builtin.set_fact:
+    dc_audit_cron_body: >-
+      {{ (dc_audit_cron.stdout | default('')).split('\n')
+         | reject('search', '^\\s*(Config warnings:|-\\s|OpenClaw [0-9]|$)')
+         | join(' ') | trim }}
+
 - name: Classify what the scheduler answered
   ansible.builtin.set_fact:
     dc_audit_cron_state: >-
       {{ 'UNKNOWN — `cron list` returned rc=' ~ (dc_audit_cron.rc | default('?'))
             ~ '; this is NOT evidence that no job exists'
          if (dc_audit_cron.rc | default(1)) != 0
-         else ('no scheduled jobs reported'
-               if (dc_audit_cron.stdout | default('') | trim | length) == 0
-               else 'SCHEDULED JOBS PRESENT — read them against the accepted grants') }}
+         else ('NO SCHEDULED JOBS — the runtime reported none'
+               if (dc_audit_cron_body | length == 0)
+                  or (dc_audit_cron_body is search('(?i)no cron jobs|no jobs|none found'))
+               else 'SCHEDULED JOBS MAY BE PRESENT — read the list below against the accepted grants') }}
 
 # --- report -------------------------------------------------------------------
 # Redacted by value SHAPE, not by key name. None of dc_audit_paths should return
