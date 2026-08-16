@@ -35,6 +35,7 @@ check would have missed.
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 
@@ -64,6 +65,61 @@ def allowed_values(node: dict, defs: dict) -> list | None:
     return values or None
 
 
+def child_schema(key: str, schema: dict, defs: dict):
+    """Schema for `key`, or None when the schema genuinely has no place for it.
+
+    Three ways a key can be legitimate, and the first version only knew one:
+
+      properties           a closed, named set — an unknown key here is invented
+      patternProperties    keys matching a regex
+      additionalProperties a free-form map; the value is the schema for entries,
+                           or True for anything
+
+    `channels.slack.channels` is the third kind. It is keyed by Slack channel ID
+    (`C0EXAMPLE01`, or `team:T...:channel:C...` on Enterprise Grid), so the
+    schema cannot enumerate its keys and declares none. The first version read
+    every one of those as an invented key and refused a correct config with
+    "no such key in the schema. Available at this level: []" — the empty list
+    being the tell that this node never had named properties to begin with.
+
+    A false rejection is not a safe failure. It teaches the operator that the
+    gate cries wolf, and the next real rejection gets argued with rather than
+    read. Being precise matters in both directions.
+    """
+    props = schema.get("properties") or {}
+    if key in props:
+        return deref(props[key], defs)
+
+    for pattern, subschema in (schema.get("patternProperties") or {}).items():
+        try:
+            if re.search(pattern, key):
+                return deref(subschema, defs)
+        except re.error:
+            continue
+
+    additional = schema.get("additionalProperties")
+    if isinstance(additional, dict):
+        return deref(additional, defs)
+    if additional is True:
+        return {}
+
+    # Nothing declared at this level at all — no properties, no patterns, no
+    # additionalProperties. The schema describes no shape here, so there is
+    # nothing to check the key against and no basis for calling it invalid.
+    # This also covers the empty schema `{}`, which JSON Schema defines as
+    # "anything", and which is what a free-form map's entries resolve to.
+    #
+    # The distinction that keeps this honest: a node that HAS a named property
+    # set and does not list the key is still an error. That is the case which
+    # catches an invented key, and it is untouched.
+    if not props and not schema.get("patternProperties"):
+        if schema.get("additionalProperties") is False:
+            return None
+        return {}
+
+    return None
+
+
 def walk(overlay, schema: dict, defs: dict, path: list[str], errors: list[str]) -> None:
     """Descend the overlay and the schema together, recording disagreements."""
     schema = deref(schema, defs)
@@ -73,14 +129,13 @@ def walk(overlay, schema: dict, defs: dict, path: list[str], errors: list[str]) 
         here = path + [key]
         dotted = ".".join(here)
 
-        if key not in props:
+        child = child_schema(key, schema, defs)
+        if child is None:
             errors.append(
                 f"{dotted}: no such key in the schema. "
                 f"Available at this level: {sorted(props)[:12]}"
             )
             continue
-
-        child = deref(props[key], defs)
 
         if isinstance(value, dict):
             walk(value, child, defs, here, errors)

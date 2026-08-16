@@ -258,12 +258,62 @@ def schema_floors() -> list[tuple[str, bool]]:
     ]
 
 
+def validator_floors() -> list[tuple[str, bool]]:
+    """The overlay validator must reject invented keys AND accept dynamic maps.
+
+    It failed the second half on 2026-08-16: `channels.slack.channels` is keyed
+    by Slack channel ID, so the schema declares no named properties for it, and
+    the validator read every ID as an invented key. It refused a correct config
+    with "no such key in the schema. Available at this level: []".
+
+    A false rejection is not a safe failure. It teaches the operator that the
+    gate cries wolf, and the next genuine rejection gets argued with instead of
+    read. Both directions are pinned here because fixing one by loosening the
+    other would be worse than the original bug.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "validate_overlay", ROLE / "files" / "validate_overlay.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    schema = {
+        "properties": {
+            "gateway": {"properties": {"bind": {"enum": ["auto", "loopback"]}}},
+            "channels": {"properties": {"slack": {"properties": {
+                "groupPolicy": {"enum": ["open", "disabled", "allowlist"]},
+                "channels": {"type": "object"},
+            }}}},
+        }
+    }
+
+    def check(overlay) -> int:
+        errors: list[str] = []
+        module.walk(overlay, schema, {}, [], errors)
+        return len(errors)
+
+    return [
+        ("VALIDATOR accepts dynamic map keys",
+         check({"channels": {"slack": {"channels": {"C0EXAMPLE01": {"requireMention": True}}}}}) == 0),
+        ("VALIDATOR accepts enterprise-qualified map keys",
+         check({"channels": {"slack": {"channels": {"team:T0A:channel:C0B": {"enabled": True}}}}}) == 0),
+        ("VALIDATOR still rejects an invented key in a closed set",
+         check({"gateway": {"totallyMadeUp": True}}) == 1),
+        ("VALIDATOR still rejects an illegal enum value",
+         check({"gateway": {"bind": "127.0.0.1"}}) == 1),
+        ("VALIDATOR still rejects an invented key beside a map",
+         check({"channels": {"slack": {"nopeNotAKey": 1}}}) == 1),
+    ]
+
+
 def main() -> int:
     merged = combine_recursive(ONBOARDED, OVERLAY)
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),
