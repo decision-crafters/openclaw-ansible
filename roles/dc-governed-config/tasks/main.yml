@@ -345,6 +345,12 @@
       or (dc_sandbox_probe.stdout | default('') | trim) | length == 0
     - dc_fail_closed | bool
 
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "governance overlay (--tags govern)"
+    dc_apply_overlay: "{{ dc_governance_overlay }}"
+
 - name: Ensure the backup directory exists
   ansible.builtin.file:
     path: "{{ dc_openclaw_backup_dir }}"

@@ -2,7 +2,7 @@
 # Deploy an agent profile as an `agents.list` entry.
 #
 #   sudo ansible-playbook playbooks/governed-admission.yml \
-#     --tags agent-profile -e ansible_become=false -e dc_dry_run=true
+#     --tags agent-profile -e ansible_become=false
 #
 # Run the dry run FIRST and read its output. This writes to a runtime the
 # founder is actively using from Slack.
@@ -136,7 +136,8 @@
       (`main`) is implicit. Writing a list containing only '{{ dc_agent_id }}'
       may add alongside it — or may replace the implicit default and remove the
       founder's working agent. That is not established either way.
-      Run with -e dc_dry_run=true first and read what the runtime reports.
+      Run it once with no flag first — plays dry-run by default — and read
+      what the runtime reports.
       Then, if you accept the risk, re-run with
       -e dc_agent_accept_list_risk=true.
       Recovery if it goes wrong: --tags remove-agent, or
@@ -144,7 +145,7 @@
   when:
     - dc_agent_list_unset | bool
     - not (dc_agent_accept_list_risk | bool)
-    - not (dc_dry_run | bool)
+    - dc_apply | bool
     - dc_fail_closed | bool
 
 # --- the runtime's own gate ---------------------------------------------------
@@ -192,9 +193,11 @@
       nothing further should be trusted from this play.
     success_msg: "dry run left agents.list unchanged"
 
-- name: Stop here when only a dry run was requested
-  ansible.builtin.meta: end_play
-  when: dc_dry_run | bool
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "agent profile deploy (--tags agent-profile)"
+    dc_apply_overlay: "{{ dc_agent_patch_body }}"
 
 # --- write --------------------------------------------------------------------
 # `config patch` does not take a backup. Ours, before the write, so rollback is

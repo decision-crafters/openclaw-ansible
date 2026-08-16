@@ -84,9 +84,11 @@
     - (dc_remove_dryrun.rc | default(1)) != 0
     - dc_fail_closed | bool
 
-- name: Stop here when only a dry run was requested
-  ansible.builtin.meta: end_play
-  when: dc_dry_run | bool
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "agent removal (--tags remove-agent)"
+    dc_apply_overlay: "{{ {'agents': {'list': None}} }}"
 
 - name: Back up the config before removing the profile
   ansible.builtin.copy:

@@ -73,7 +73,7 @@ def load_defaults() -> dict[str, Any]:
         "dc_sandbox_scope", "dc_tools_exec_mode", "dc_sandbox_docker_network",
         "dc_plugins_deny", "dc_plugins_allow", "dc_plugins_required",
         "dc_agent_required_denies", "dc_agent_accept_list_risk",
-        "dc_agent_profile_path", "dc_dry_run",
+        "dc_agent_profile_path", "dc_apply",
         "dc_agent_preserve_default", "dc_agent_default_entry",
     ]
     missing = [key for key in required if key not in defaults]
@@ -316,7 +316,11 @@ def admission_floors() -> list[tuple[str, bool]]:
          all(t in required for t in session_tools)),
         ("FLOOR deploying into an unset agents.list is not accepted by default",
          DEFAULTS.get("dc_agent_accept_list_risk") is False),
-        ("FLOOR dry run is not the default", DEFAULTS.get("dc_dry_run") is False),
+        # Inverted deliberately on 2026-08-16. The host is under active
+        # development, so plays get invoked for reasons other than "deploy now".
+        # Making the safe case the default means every accidental run is free
+        # and only the deliberate one costs a flag.
+        ("FLOOR writes require an explicit flag", DEFAULTS.get("dc_apply") is False),
         # Unset is correct: an agent profile records a specific deployment's
         # identity and belongs in a private repository beside its inventory. The
         # play refuses when it is not supplied.

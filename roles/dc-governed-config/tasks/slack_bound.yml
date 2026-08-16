@@ -226,6 +226,12 @@
     - dc_fail_closed | bool
 
 # --- write --------------------------------------------------------------------
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "Slack boundary (--tags slack-bound)"
+    dc_apply_overlay: "{{ dc_slack_overlay }}"
+
 - name: Back up the pre-Slack-boundary config
   ansible.builtin.copy:
     src: "{{ dc_openclaw_config_path }}"

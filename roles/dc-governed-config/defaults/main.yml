@@ -432,8 +432,14 @@ dc_agent_default_entry:
   id: main
   default: true
 
-# Dry run only — patch is validated by the runtime and nothing is written.
-dc_dry_run: false
+# Every play that writes defaults to a DRY RUN. See tasks/apply_gate.yml.
+#
+# The host is under active development, so plays get invoked for reasons other
+# than "deploy now" — checking a variable resolved, confirming a guard fires,
+# re-running after an edit. Those should cost nothing. Making the safe case the
+# default means every accidental run is free and only the deliberate one has a
+# price, which is one flag.
+dc_apply: false
 
 dc_admission_report_dir: "/tmp"
 
