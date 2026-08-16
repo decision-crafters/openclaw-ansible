@@ -89,38 +89,88 @@
       first (`openclaw agent --agent {{ dc_agent_id }}`), then re-run this audit.
   when: dc_sb_names | length == 0
 
+# `{{json .Mounts}}`, not a delimiter-joined template.
+#
+# The first version emitted pipe-separated fields joined by '\n' and split on
+# newline. The separator reached Go's template engine as the two literal
+# characters backslash and n, so nothing ever split, the mount list came back as
+# one long string, and the derived mount point was EMPTY — while the mounts
+# themselves were perfectly correct and visible in the debug output one task
+# earlier.
+#
+# Asking for JSON removes the entire class: no separator to escape, no quoting
+# to get right across YAML, Jinja and Go, and `from_json` fails loudly instead
+# of yielding a plausible empty list.
 - name: Inspect the mounts of each sandbox container
   ansible.builtin.command:
-    argv: "{{ dc_docker_env + ['inspect', item, '--format',
-                               '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}' ~ '\n' ~ '{{end}}'] }}"
+    argv: "{{ dc_docker_env + ['inspect', item, '--format', '{{json .Mounts}}'] }}"
   register: dc_sb_mounts
   changed_when: false
   failed_when: false
   timeout: 60
   loop: "{{ dc_sb_names }}"
 
+- name: Collect every mount the runtime reports
+  ansible.builtin.set_fact:
+    dc_sb_all_mounts: >-
+      {{ dc_sb_mounts.results | default([]) | map(attribute='stdout')
+         | map('default', '[]', true) | map('from_json') | flatten | list }}
+
 - name: Report the mounts as the runtime describes them
   ansible.builtin.debug:
     msg: >-
-      {{ item.item }} mounts:
-      {{ (item.stdout | default('')).split('\n') | select | list }}
-  loop: "{{ dc_sb_mounts.results | default([]) }}"
+      {{ item.Source }} -> {{ item.Destination }}
+      (type={{ item.Type }}, writable={{ item.RW }})
+  loop: "{{ dc_sb_all_mounts }}"
   loop_control:
-    label: "{{ item.item }}"
+    label: "{{ item.Destination }}"
 
-# The destination the WORKSPACE landed on, discovered rather than assumed.
-# Matched by source path, because the container also carries tmpfs mounts for
-# /tmp, /var/tmp and /run that have nothing to do with the workspace.
-- name: Derive the workspace mount point inside each container
+# The destination the WORKSPACE landed on, discovered rather than assumed, and
+# matched by EXACT source path taken from the deployed profile.
+#
+# Matching on a prefix would also match the sandbox's own scratch directory
+# under ~/.openclaw/sandboxes, which is mounted at /workspace on the same
+# container. That is precisely the mount the agent was probing when it reported
+# its workspace unreachable — it exists, it is simply not ours.
+- name: Read the deployed workspace path from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_sb_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Derive the workspace mount point inside the container
+  ansible.builtin.set_fact:
+    dc_sb_ws_source: >-
+      {{ ((dc_sb_agents.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_agent_id) | list | first
+          | default({})).workspace | default('') }}
+
+- name: Match the profile's workspace against the reported mounts
   ansible.builtin.set_fact:
     dc_sb_mountpoints: >-
-      {{ dc_sb_mounts.results | default([])
-         | map(attribute='stdout') | map('default', '', true)
-         | map('split', '\n') | flatten | select
-         | map('split', '|') | selectattr(1, 'search', dc_agent_workspace_root | default('/'))
-         | map(attribute=2) | unique | list }}
-  vars:
-    dc_agent_workspace_root: "{{ dc_openclaw_home }}/workspace"
+      {{ dc_sb_all_mounts | selectattr('Source', 'equalto', dc_sb_ws_source)
+         | map(attribute='Destination') | unique | list }}
+    dc_sb_ws_writable: >-
+      {{ dc_sb_all_mounts | selectattr('Source', 'equalto', dc_sb_ws_source)
+         | map(attribute='RW') | unique | list }}
+
+# Containers exist but no mount matched: that is a real finding and must not
+# become a silent skip. The first version let the read tasks skip on an empty
+# list and the assert then crashed on index [0] of that same empty list —
+# the failure arrived as a templating error rather than as the finding.
+- name: Refuse when the profile's workspace is not mounted at all
+  ansible.builtin.fail:
+    msg: >-
+      No mount in {{ dc_sb_names | join(', ') }} has source
+      '{{ dc_sb_ws_source }}', the workspace the deployed profile declares.
+      Mounts present: {{ dc_sb_all_mounts | map(attribute='Source') | list }}.
+      The agent cannot be reading the installed files, wherever else they are.
+  when:
+    - dc_sb_names | length > 0
+    - dc_sb_mountpoints | length == 0
+    - dc_fail_closed | bool
 
 - name: Compare the observed mount point with the documented one
   ansible.builtin.set_fact:
@@ -159,7 +209,8 @@
       - (item.rc | default(1)) == 0
     fail_msg: >-
       {{ item.item }} is NOT readable at
-      {{ dc_sb_mountpoints[0] }}/{{ item.item }} inside {{ dc_sb_names[0] }},
+      {{ dc_sb_mountpoints | first | default('<no mount>') }}/{{ item.item }}
+      inside {{ dc_sb_names | first | default('<no container>') }},
       rc={{ item.rc | default('?') }}: {{ item.stderr | default('') | trim }}.
       The file is present and correct on the HOST — that is what
       --tags agent-workspace verifies, and it is not the same claim.
@@ -189,8 +240,9 @@
 - name: Refuse to report a read-only mount that accepted a write
   ansible.builtin.fail:
     msg: >-
-      A write to {{ dc_sb_mountpoints[0] }}/.dc-write-probe SUCCEEDED inside
-      {{ dc_sb_names[0] }} while workspaceAccess is 'ro'. The read-only
+      A write to {{ dc_sb_mountpoints | first | default('?') }}/.dc-write-probe
+      SUCCEEDED inside {{ dc_sb_names | first | default('?') }}
+      while workspaceAccess is 'ro'. The read-only
       guarantee this profile depends on is not in force. The probe file has been
       left in place deliberately as evidence; remove it by hand after recording
       the finding.
