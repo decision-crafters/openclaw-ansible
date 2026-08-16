@@ -42,3 +42,18 @@
         tasks_from: sandbox_audit
   tags:
     - sandbox-audit
+
+# Read-only. Hooks are the EVENT-DRIVEN half of persistent operation, and the
+# half that cannot be caught by watching: an event hook has no cadence and no
+# next-run time, so "is it running?" is answerable only by enumerating it.
+- name: Audit the event-driven hook surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Enumerate hooks and compare against what was declared
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: hooks_audit
+  tags:
+    - hooks-audit

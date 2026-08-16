@@ -888,3 +888,32 @@ dc_scheduler_accept: false
 # Named for --tags scheduler-disable. Unset so the reversal refuses to guess
 # which job an operator meant.
 dc_scheduler_job_id: ""
+
+# --- Hooks audit ---------------------------------------------------------------
+# See tasks/hooks_audit.yml. Read-only.
+#
+# Hooks are the EVENT-DRIVEN half of persistent operation. TASK-229 names
+# EVENT_TRIGGER as one of the three mechanisms, and Decision Memory lists
+# "event-driven hooks/webhooks" among the separately reviewable capability
+# bindings. Everything the scheduler work built for timed jobs applies here.
+#
+# The audit found `hooks.internal.entries.session-memory.enabled: true` on
+# 2026-08-16 — an event mechanism already running, in no inventory, no deny
+# list and no governance record. It was invisible because nothing enumerated
+# hooks; `config get hooks` was added to the audit that same day and the value
+# appeared immediately.
+
+# Hooks this deployment has DECLARED. Anything enabled and absent from here is
+# reported as drift.
+#
+# Empty by default, and that is the useful default rather than a placeholder:
+# an empty declaration means every enabled hook is undeclared, which is the
+# honest starting position for a surface nobody had enumerated. Filling it in
+# is a governance act — you are saying "this one is known and accepted" — so it
+# belongs in the private inventory beside the other bindings, never here.
+dc_hooks_declared: []
+
+# Audits observe; they do not gate. An undeclared hook is reported loudly and
+# the play still succeeds, because a monitoring command that exits non-zero on
+# a finding stops being run. Set true to use this as a CI gate instead.
+dc_hooks_fail_on_undeclared: false

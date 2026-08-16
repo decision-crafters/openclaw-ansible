@@ -1,0 +1,170 @@
+---
+# What event-driven surface is running, and did anyone choose it?
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags hooks-audit -e ansible_become=false
+#
+# Read-only. Lists, inspects and checks hooks. Enables nothing, disables
+# nothing, installs nothing, writes no config.
+#
+# WHY THIS EXISTS
+#
+# On 2026-08-16 the audit gained `hooks` as an audited path and immediately
+# returned:
+#
+#   hooks :: { "internal": { "entries": { "session-memory": { "enabled": true } } } }
+#
+# An event mechanism, already running, in no inventory, no deny list and no
+# governance record. It had been invisible for one reason: nothing enumerated
+# hooks. The value was there the whole time and no check asked for it.
+#
+# That is the same shape as the seven session tools and `heartbeat_respond`.
+# The pattern is not "we keep getting unlucky" — it is that a surface nobody
+# enumerates is a surface nobody has decided about, and this file exists so
+# hooks stop being one.
+#
+# WHY IT MATTERS MORE THAN A TIMED JOB
+#
+# TASK-229 names EVENT_TRIGGER as one of three mechanisms and Decision Memory
+# lists "event-driven hooks/webhooks" among the separately reviewable capability
+# bindings. An event hook has no cadence to inspect and no next-run time: it
+# fires when something external happens, which means "is it running?" cannot be
+# answered by waiting and watching. It has to be enumerated.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# --- what the config declares -------------------------------------------------
+- name: Read the hooks configuration
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'hooks'] }}"
+  register: dc_hooks_config
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Read which agents hooks may reach
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'hooks.allowedAgentIds'] }}"
+  register: dc_hooks_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# --- what the runtime reports --------------------------------------------------
+#
+# Config and runtime are different questions, and this role has been caught by
+# the gap before: `plugins.deny` was observed by absence from the RUNNING set,
+# not by reading it back from config. Ask both.
+- name: List the hooks the runtime has loaded
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['hooks', 'list'] }}"
+  register: dc_hooks_list
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Ask the runtime to check its own hooks
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['hooks', 'check'] }}"
+  register: dc_hooks_check
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# Enabled entries under hooks.internal, taken from CONFIG rather than parsed out
+# of CLI prose. `hooks list` output shape is unknown on this build; a dict from
+# `config get` is not.
+- name: Extract the enabled internal hooks from config
+  ansible.builtin.set_fact:
+    dc_hooks_enabled: >-
+      {{ (dc_hooks_config.stdout | default('{}') | from_json)
+         .get('internal', {}).get('entries', {})
+         | dict2items
+         | selectattr('value.enabled', 'defined')
+         | selectattr('value.enabled')
+         | map(attribute='key') | list }}
+  failed_when: false
+
+- name: Report what could not be parsed
+  ansible.builtin.debug:
+    msg: >-
+      DC-HOOKS | `config get hooks` returned rc={{ dc_hooks_config.rc | default('?') }}
+      and its value could not be parsed as JSON. The enabled set below is
+      UNKNOWN, not empty — those are different answers and only one of them is
+      reassuring.
+  when: dc_hooks_enabled is not defined
+
+- name: Inspect each enabled hook
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['hooks', 'info', item] }}"
+  register: dc_hooks_info
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  loop: "{{ dc_hooks_enabled | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Report what each enabled hook says about itself
+  ansible.builtin.debug:
+    msg: >-
+      HOOK {{ item.item }} (rc={{ item.rc | default('?') }}):
+      {{ (item.stdout | default('') | trim) | truncate(600) }}
+      {{ (item.stderr | default('') | trim) | truncate(200) }}
+  loop: "{{ dc_hooks_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('?') }}"
+
+# --- the governance question ---------------------------------------------------
+- name: Compare what is enabled against what was declared
+  ansible.builtin.set_fact:
+    dc_hooks_undeclared: >-
+      {{ (dc_hooks_enabled | default([])) | difference(dc_hooks_declared) }}
+    dc_hooks_missing: >-
+      {{ dc_hooks_declared | difference(dc_hooks_enabled | default([])) }}
+
+# Both directions, because they are different failures. An UNDECLARED hook is
+# capability nobody chose. A DECLARED-but-absent hook is a control someone
+# believes is in place and is not — the quieter of the two, and the one an
+# inventory alone would never surface.
+- name: Report the drift
+  ansible.builtin.debug:
+    msg: >-
+      DC-HOOKS DRIFT |
+      enabled={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }} |
+      declared={{ dc_hooks_declared | join(', ') | default('none', true) }} |
+      UNDECLARED={{ dc_hooks_undeclared | join(', ') | default('none', true) }}
+      {{ '<- running, and nobody decided it' if dc_hooks_undeclared | length > 0 else '' }} |
+      DECLARED-BUT-ABSENT={{ dc_hooks_missing | join(', ') | default('none', true) }}
+      {{ '<- believed present, is not' if dc_hooks_missing | length > 0 else '' }}
+
+# Audits observe; they do not gate. A monitoring command that exits non-zero on
+# a finding stops being run, and then the finding stops being seen. Opt in with
+# dc_hooks_fail_on_undeclared when using this as a CI gate.
+- name: Fail on undeclared hooks when asked to
+  ansible.builtin.fail:
+    msg: >-
+      Undeclared hooks are enabled: {{ dc_hooks_undeclared | join(', ') }}.
+      An event mechanism with no governance record fires on an external event,
+      not a cadence, so it cannot be caught by watching.
+  when:
+    - dc_hooks_fail_on_undeclared | bool
+    - (dc_hooks_undeclared | default([])) | length > 0
+
+- name: Emit the hooks audit receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-HOOKS AUDIT RECEIPT |
+      hooks_config_rc={{ dc_hooks_config.rc | default('?') }} |
+      hooks_list_rc={{ dc_hooks_list.rc | default('?') }} |
+      hooks_check_rc={{ dc_hooks_check.rc | default('?') }} |
+      enabled={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }} |
+      allowedAgentIds={{ dc_hooks_agents.stdout | default('') | trim | default('<unset>', true) }} |
+      undeclared={{ dc_hooks_undeclared | join(', ') | default('none', true) }} |
+      `hooks.allowedAgentIds` UNSET DOES NOT MEAN NO AGENT IS REACHABLE. It
+      means the narrowing was never configured, and on this runtime an unset
+      key is a default nobody chose rather than an absence of behaviour. Which
+      agents an enabled hook can actually reach is UNKNOWN until that key is set
+      or the runtime is asked directly. |
+      Nothing was enabled, disabled, installed or written.
