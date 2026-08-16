@@ -236,22 +236,23 @@
     group: "{{ dc_openclaw_user }}"
     mode: '1755'
 
-- name: Install the governance files read-only
-  ansible.builtin.copy:
-    src: "{{ dc_ws_src }}/{{ item }}"
-    dest: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
-    owner: root
-    group: root
-    mode: '0444'
-    directory_mode: '0555'
-  loop: "{{ dc_agent_workspace_files }}"
-  register: dc_ws_installed
-
-# `copy` creates intermediate directories with directory_mode but does not
-# revisit them, so skills/ and packet/ are pinned explicitly. Root-owned and
-# non-writable: nothing may be added to or removed from them at runtime, which
-# is what stops an agent that finds a write path from installing a skill.
-- name: Pin the subdirectory modes
+# Subdirectories FIRST, and this ordering is the fix for a real failure.
+#
+# `ansible.builtin.copy` does NOT create a missing destination directory. The
+# first version of this play created them afterwards, on the belief — written
+# into a comment as if it were established — that `directory_mode` made `copy`
+# do it. It does not; `directory_mode` applies when copying a directory tree,
+# not when a single file's parent is absent.
+#
+# The apply therefore half-succeeded: AGENTS.md, TOOLS.md, IDENTITY.md and
+# SOUL.md landed, skills/ and packet/ did not, and the agent came back with a
+# correct-sounding answer about its coordinate and authority because those four
+# were exactly the files it needed to answer. The failure was in the recap and
+# nowhere in the reply.
+#
+# `file` creates parents, so `skills/` is made implicitly by its child. It is
+# pinned explicitly afterwards rather than left at whatever umask produced.
+- name: Create the workspace subdirectories before installing into them
   ansible.builtin.file:
     path: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
     state: directory
@@ -259,7 +260,37 @@
     group: root
     mode: '0555'
   loop: "{{ dc_agent_workspace_files | map('dirname') | reject('equalto', '')
-            | unique | list }}"
+            | unique | sort }}"
+
+- name: Install the governance files read-only
+  ansible.builtin.copy:
+    src: "{{ dc_ws_src }}/{{ item }}"
+    dest: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
+    owner: root
+    group: root
+    mode: '0444'
+  loop: "{{ dc_agent_workspace_files }}"
+  register: dc_ws_installed
+
+# Root-owned and non-writable: nothing may be created in or removed from these
+# at runtime, which is what stops an agent that finds a write path from
+# installing a skill of its own. Runs again after the copy to catch any
+# directory `file` created implicitly as a parent — `skills/` is one.
+- name: Pin every workspace subdirectory, including implicit parents
+  ansible.builtin.find:
+    paths: "{{ dc_ws_real.stdout | trim }}"
+    recurse: true
+    file_type: directory
+  register: dc_ws_subdirs
+
+- name: Apply the subdirectory modes
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0555'
+  loop: "{{ dc_ws_subdirs.files | map(attribute='path') | list }}"
 
 # --- verification ------------------------------------------------------------
 #

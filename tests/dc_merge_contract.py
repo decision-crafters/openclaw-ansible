@@ -363,6 +363,16 @@ def _task_mode(text: str, task_name: str) -> str | None:
     return None
 
 
+def _task_index(text: str, task_name_prefix: str) -> int:
+    """Character offset of a named task, or a large sentinel if absent.
+
+    The sentinel is large rather than -1 so a MISSING task fails an ordering
+    assertion instead of trivially satisfying it.
+    """
+    marker = f"- name: {task_name_prefix}"
+    return text.index(marker) if marker in text else 10**9
+
+
 def workspace_floors() -> list[tuple[str, bool]]:
     """Floors on what reaches an agent's workspace, and what never may.
 
@@ -427,6 +437,16 @@ def workspace_floors() -> list[tuple[str, bool]]:
          "dc_ws_found" in ws_text and "dc_agent_workspace_excluded" in ws_text),
         ("WORKSPACE the write is gated by apply_gate",
          "apply_gate.yml" in ws_text),
+        # Ordering, because `copy` does not create a missing destination
+        # directory. The first apply half-succeeded on exactly this: the four
+        # top-level bootstrap files landed, skills/ and packet/ did not, and the
+        # agent still answered its coordinate and authority correctly because
+        # those four were all it needed to. The failure was in the recap and
+        # nowhere in the reply — so this asserts the order rather than trusting
+        # anyone to remember why it matters.
+        ("WORKSPACE subdirectories are created before files are copied into them",
+         _task_index(ws_text, "Create the workspace subdirectories")
+         < _task_index(ws_text, "Install the governance files")),
     ]
 
 
