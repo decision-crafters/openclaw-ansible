@@ -35,12 +35,23 @@
       change the host. Refusing rather than guessing which you meant.
   when: dc_dry_run is defined
 
+# `target` is per-caller. It was hardcoded to the config path when every caller
+# happened to write the config, and stayed hardcoded when agent_workspace.yml —
+# which writes a workspace DIRECTORY and never touches openclaw.json — became a
+# caller. Its first dry run reported `target=/home/openclaw/.openclaw/
+# openclaw.json`, naming a file it does not open.
+#
+# Nothing was at risk: the play is correct and the overlay beside it said
+# exactly what would happen. But this line is the last thing an operator reads
+# before typing -e dc_apply=true, and a gate that misreports its target teaches
+# people not to read it — which costs on the run where the target is the thing
+# that is wrong.
 - name: Report what this run would change
   ansible.builtin.debug:
     msg: >-
       {{ 'APPLYING' if (dc_apply | bool) else 'DRY RUN — nothing will be written' }} |
       play={{ dc_apply_what | default('governed config') }} |
-      target={{ dc_openclaw_config_path }} |
+      target={{ dc_apply_target | default(dc_openclaw_config_path) }} |
       overlay={{ (dc_apply_overlay | default({})) | to_json | truncate(600) }}
 
 - name: Stop before writing unless the change was asked for

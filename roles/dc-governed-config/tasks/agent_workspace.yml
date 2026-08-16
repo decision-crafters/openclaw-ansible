@@ -200,6 +200,8 @@
   ansible.builtin.include_tasks: apply_gate.yml
   vars:
     dc_apply_what: "agent workspace for {{ dc_agent_id }} (--tags agent-workspace)"
+    # This play writes files into a DIRECTORY and never opens openclaw.json.
+    dc_apply_target: "{{ dc_ws_real.stdout | trim }}"
     dc_apply_overlay:
       workspace: "{{ dc_ws_real.stdout | trim }}"
       files: "{{ dc_agent_workspace_files }}"
