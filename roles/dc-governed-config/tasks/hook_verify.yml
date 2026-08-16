@@ -63,20 +63,74 @@
 
 # --- the control that governs it ----------------------------------------------
 #
-# The founder asked for the EXACT live-schema key. Reading it from the schema
-# rather than from documentation, because this workstream has twice been wrong
-# about a key that documentation described correctly for a different build.
-- name: Extract the hooks section of the live schema
-  ansible.builtin.shell:
-    cmd: >-
-      set -o pipefail;
-      {{ dc_audit_cli | map('quote') | join(' ') }} config schema 2>/dev/null
-      | python3 -c 'import json,sys; s=json.load(sys.stdin);
-        h=s.get("properties",{}).get("hooks",{}); print(json.dumps(h, indent=2)[:8000])'
-  register: dc_hv_schema
+# The founder asked for the EXACT live-schema key. Read from the schema rather
+# than from documentation, because this workstream has twice been wrong about a
+# key that documentation described correctly for a DIFFERENT build.
+#
+# Two steps, not a pipeline.
+#
+# The first version rebuilt dc_audit_cli into a shell string and piped it into
+# python. It returned rc=1 and an empty schema section, so the one field the
+# founder asked for by name — the exact live-schema key — came back unanswered.
+#
+# dc_audit_cli is an ARGV LIST for a reason: it goes through runuser and env,
+# and reconstructing it as a shell string re-introduces exactly the quoting the
+# list form exists to avoid. The role already has a working pattern for this —
+# capture with `command`, stage the output, then read the file — and it is used
+# here rather than a cleverer one-liner.
+- name: Capture the live schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'schema'] }}"
+  register: dc_hv_schema_raw
   changed_when: false
   failed_when: false
   timeout: 180
+
+- name: Stage the schema where it can be parsed
+  ansible.builtin.copy:
+    content: "{{ dc_hv_schema_raw.stdout | default('{}') }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+  when: (dc_hv_schema_raw.rc | default(1)) == 0
+
+- name: Extract every hooks-related key the schema declares
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json, sys
+        try:
+            s = json.load(open(sys.argv[1]))
+        except Exception as e:
+            print(f"schema unreadable: {e}"); raise SystemExit(0)
+        def walk(node, path=""):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    p = f"{path}.{k}" if path else k
+                    if "hook" in k.lower():
+                        d = v.get("description", "") if isinstance(v, dict) else ""
+                        print(f"{p}  {str(d)[:200]}")
+                    walk(v, p)
+            elif isinstance(node, list):
+                for i in node:
+                    walk(i, path)
+        walk(s)
+      - "{{ dc_schema_staging_path }}"
+  register: dc_hv_schema
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  when: (dc_hv_schema_raw.rc | default(1)) == 0
+
+- name: Unstage the schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
 
 - name: Read the memory-related configuration
   ansible.builtin.command:
@@ -112,15 +166,23 @@
   failed_when: false
   timeout: 120
 
-# Context around the match, not the whole file. Enough to see the trigger, the
-# write target and the scoping; not so much that the report becomes a code dump
-# nobody reads.
-- name: Extract the surrounding implementation
+# Grep for what the handler DOES, not for its own name.
+#
+# The first version matched lines containing the hook name and returned four
+# lines, none of which said where anything is written. That is the field the
+# whole verification exists to answer — a hook called `session-memory` reads
+# identically whether it writes per-session, to a shared index, or into another
+# agent's memory.
+#
+# So: search for write and path construction instead. Still bounded — capped
+# output, timeout, and only the files already located.
+- name: Extract what the implementation writes and where
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail;
-      timeout 60 grep -h -o -E '.{0,240}{{ dc_hook_verify }}.{0,600}'
-      {{ item | quote }} 2>/dev/null | head -c 4000
+      timeout 60 grep -h -o -E
+      '(writeFile|mkdir|appendFile|createWriteStream|join\(|resolve\(|workspace|memoryDir|sessionKey|agentId)[^;]{0,200}'
+      {{ item | quote }} 2>/dev/null | sort -u | head -c 6000
   register: dc_hv_source
   changed_when: false
   failed_when: false
@@ -155,8 +217,9 @@
       === hooks list (rc={{ dc_hv_list.rc | default('?') }}) ===
       {{ dc_hv_list.stdout | default('') }}
 
-      === live schema: properties.hooks (rc={{ dc_hv_schema.rc | default('?') }}) ===
-      {{ dc_hv_schema.stdout | default('<schema not readable>') }}
+      === live schema: every hook-related key (rc={{ dc_hv_schema.rc | default('skipped') }}) ===
+      schema capture rc={{ dc_hv_schema_raw.rc | default('?') }}
+      {{ dc_hv_schema.stdout | default('<schema not captured — the key below is from CONFIG, not schema>') }}
 
       === memory-related configuration ===
       {% for r in dc_hv_memory.results | default([]) %}
@@ -164,7 +227,7 @@
       {{ r.stdout | default('') | trim | default('<unset, or path not present>', true) }}
       {% endfor %}
 
-      === bundled implementation ===
+      === bundled implementation — write paths and scoping ===
       files matched: {{ (dc_hv_files.stdout | default('')).split('\n') | select | list }}
       {% for r in dc_hv_source.results | default([]) %}
       --- {{ r.item }} ---

@@ -157,12 +157,34 @@
          else 'not configured — no external HTTP ingress reported' }}
   failed_when: false
 
+# READY is not ENABLED, and the audit reported only one of them.
+#
+# `hooks list` on 2026-08-16 returned "Hooks (5/5 ready)" — boot-md,
+# bootstrap-extra-files, command-logger, compaction-notifier, session-memory —
+# while `hooks.internal.entries` carried exactly one entry with enabled:true.
+#
+# So four bundled hooks are present with their requirements satisfied and are
+# not enabled, and this play was reporting `enabled=session-memory` with no
+# mention of the other four. Both numbers are true and neither is the whole
+# answer: READY says what could be turned on without installing anything, and
+# two of those four are worth knowing about — `boot-md` runs BOOT.md at gateway
+# startup and `bootstrap-extra-files` injects workspace bootstrap files by glob,
+# which is the same surface the agent governance files live on.
+- name: Count what the runtime reports as ready
+  ansible.builtin.set_fact:
+    dc_hooks_ready_line: >-
+      {{ (dc_hooks_list.stdout | default('')
+          | regex_search('Hooks \\(([0-9]+/[0-9]+) ready\\)', '\\1')
+          | first) | default('unreported', true) }}
+
 - name: Report the two hook surfaces separately
   ansible.builtin.debug:
     msg: >-
       DC-HOOKS SURFACES |
-      internal_lifecycle={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }}
+      internal_lifecycle_ENABLED={{ dc_hooks_enabled | default(['UNKNOWN']) | join(', ') | default('none', true) }}
       (bundled, fired inside a session — NOT the EVENT_TRIGGER mechanism) |
+      runtime_READY={{ dc_hooks_ready_line | default('unreported') }}
+      (ready means requirements met and available to enable, NOT running) |
       webhook_ingress={{ dc_hooks_ingress_state }} |
       allowedAgentIds={{ dc_hooks_agents.stdout | default('') | trim | default('<unset>', true) }}
 
