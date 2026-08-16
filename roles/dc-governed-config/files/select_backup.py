@@ -68,14 +68,18 @@ FORBIDDEN_LIST_MEMBERS = {
     ("plugins", "deny"): ["slack", "ollama"],
 }
 
-# Conversations the operator reaches this host through. A backup that does not
-# admit these is schema-valid and would otherwise be selected as known-good,
-# restoring a runtime that runs correctly and answers nobody.
+# Conversations the operator reaches this host through, supplied at call time.
 #
-# C0EXAMPLE01 = #all-decision-crafters. D0EXAMPLE01 = the founder's DM, resolved
-# 2026-08-16, and the route that works from a phone.
-REQUIRED_CHANNELS = ["C0EXAMPLE01"]
-REQUIRED_DMS = ["D0EXAMPLE01"]
+# These were module constants holding real Slack ids. That put a channel id and
+# a person's DM id in a PUBLIC repository — no credential, but identifying, and
+# exactly the class of fact this project's own rules say must not be published.
+# Passed in now, so the mechanism is public and the bindings are not.
+#
+# A backup that does not admit these is schema-valid and would otherwise be
+# selected as known-good, restoring a runtime that runs correctly and answers
+# nobody.
+REQUIRED_CHANNELS: list[str] = []
+REQUIRED_DMS: list[str] = []
 
 
 def slack_lockout_reasons(config: dict) -> list[str]:
@@ -176,9 +180,29 @@ def sort_key(path: Path) -> str:
 
 
 def main() -> int:
+    global REQUIRED_CHANNELS, REQUIRED_DMS
+
     if len(sys.argv) < 2:
-        print("usage: select_backup.py <backup-dir> [schema-path]", file=sys.stderr)
+        print(
+            "usage: select_backup.py <backup-dir> [schema-path] "
+            "[--required-channels C1,C2] [--required-dms D1,D2]",
+            file=sys.stderr,
+        )
         return 2
+
+    # Parsed off the tail so the positional interface is unchanged for callers
+    # that do not need conversation preservation.
+    argv = list(sys.argv[1:])
+    for flag, target in (("--required-channels", "channels"), ("--required-dms", "dms")):
+        if flag in argv:
+            index = argv.index(flag)
+            values = [v for v in argv[index + 1].split(",") if v] if index + 1 < len(argv) else []
+            if target == "channels":
+                REQUIRED_CHANNELS = values
+            else:
+                REQUIRED_DMS = values
+            del argv[index:index + 2]
+    sys.argv = [sys.argv[0]] + argv
 
     if len(sys.argv) > 2:
         try:

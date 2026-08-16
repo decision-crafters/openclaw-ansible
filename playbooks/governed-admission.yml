@@ -6,7 +6,7 @@
 #   --tags admit           the synthetic admission evidence harness
 #   --tags receipt         the requested-versus-observed admission receipt
 #
-#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-admission.yml \
+#   sudo ansible-playbook playbooks/governed-admission.yml \
 #     --tags agent-profile -e ansible_become=false -e dc_dry_run=true
 #
 # RUN THE DRY RUN FIRST. These plays write to a runtime the founder is actively

@@ -1,7 +1,7 @@
 ---
 # Read-only OpenClaw configuration audit.
 #
-#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-audit.yml \
+#   sudo ansible-playbook playbooks/governed-audit.yml \
 #     -e ansible_become=false
 #
 # Writes nothing but its own report. No config change, no restart, no plugin

@@ -5,7 +5,7 @@
 # it must never merge, write or restart as a side effect of asking a question —
 # `--tags status` reads and asserts, and touches nothing.
 #
-#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-lifecycle.yml \
+#   sudo ansible-playbook playbooks/governed-lifecycle.yml \
 #     --tags status -e ansible_become=false
 #
 #   --tags status    is it up, and is it STABLE (two NRestarts samples)

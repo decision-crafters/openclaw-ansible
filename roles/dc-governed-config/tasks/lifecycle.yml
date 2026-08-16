@@ -15,7 +15,7 @@
 # Four failed attempts on 2026-08-15 were all this. It is now a file.
 #
 # Run:
-#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-lifecycle.yml \
+#   sudo ansible-playbook playbooks/governed-lifecycle.yml \
 #     --tags status -e ansible_become=false
 #
 # Tags: status (default) | start | restart | stop | logs

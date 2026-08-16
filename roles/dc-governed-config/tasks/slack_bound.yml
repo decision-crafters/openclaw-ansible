@@ -1,7 +1,7 @@
 ---
 # Bound the Slack human-access path. TASK-217's remaining criterion.
 #
-# Run: sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-lab.yml \
+# Run: sudo ansible-playbook playbooks/governed-lab.yml \
 #        --tags slack-bound -e ansible_become=false
 #
 # Deliberately a separate tag from `govern`. The governance posture is applied
@@ -124,10 +124,9 @@
       posture: {{ dc_sb_unreachable }}.
       C-prefixed entries must appear in dc_slack_channels; D-prefixed entries
       are DMs and require dmPolicy to admit them.
-      D0EXAMPLE01 is the founder's DM and the phone route to this host — the
-      founder confirmed on 2026-08-16 that the access path is channel AND DM.
-      Dropping it would sever the capability this whole decision exists to
-      protect. Nothing has been written.
+      On a loopback-bound gateway with no VPN these conversations are the only
+      route to the host, so dropping one severs operator access entirely while
+      leaving a runtime that looks healthy. Nothing has been written.
   vars:
     dc_sb_unreachable: >-
       {{ dc_slack_required_conversations

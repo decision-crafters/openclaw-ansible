@@ -222,6 +222,73 @@ def availability_floors() -> list[tuple[str, bool]]:
     ] + admission_floors()
 
 
+def no_deployment_identifiers() -> list[tuple[str, bool]]:
+    """No deployment-specific identifier may ship in this repository.
+
+    This repository is PUBLIC. Slack workspace, channel, user and DM ids are not
+    credentials, but they identify a workspace and the people in it, and this
+    project's own rules say that class must not be published. The rule was
+    stated for one record and then broken here — real ids sat in defaults,
+    select_backup.py, a task message and a script for several days, across two
+    commits.
+
+    A rule nobody can check is a rule that gets broken by whoever is moving
+    fastest, which was me. So it is checked: every tracked file is scanned for
+    Slack id shapes and for an operator home path. Placeholders are exempt by
+    being obviously fake — EXAMPLE, 0123456789 — because a check that forbids
+    documenting the format would push people to omit the format instead.
+    """
+    import re
+    import subprocess
+
+    root = ROLE.parents[1]
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True, text=True, check=True).stdout.split()
+    except Exception:
+        return [("IDENTIFIERS scan could not run (git unavailable)", False)]
+
+    # Only files this fork ADDS. Upstream's own changelogs mention
+    # /home/linuxbrew, which is a Homebrew path and not an operator identity —
+    # and upstream content is not ours to rewrite. The fork is additive by
+    # construction and CI asserts it, so "files matching our prefixes" is an
+    # accurate stand-in for "files we added" without needing the upstream remote
+    # to be fetched.
+    ours = ("roles/dc-", "roles/openclaw-governed", "playbooks/governed-",
+            "tests/dc_", "scripts/dc-", "docs/DECISION-CRAFTERS")
+    files = [f for f in tracked if f.startswith(ours)]
+
+    # Slack ids: a type letter then 8+ uppercase alnum. Placeholder forms are
+    # excluded so the docs can still show the shape.
+    slack_id = re.compile(r"\b([CDUTBG])0(?!123456789|EXAMPLE)[A-Z0-9]{8,}\b")
+    # Service and container accounts are legitimate in a deployment tool; an
+    # OPERATOR's home is what leaks who runs it. Named rather than pattern-
+    # matched, so adding one is a deliberate act.
+    service_homes = ("openclaw", "sandbox", "linuxbrew", "runner", "root", "ubuntu")
+    home_path = re.compile(
+        r"/home/(?!(?:" + "|".join(service_homes) + r")\b)[a-z][a-z0-9_-]*")
+
+    hits: list[str] = []
+    for rel in files:
+        path = root / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for pattern, label in ((slack_id, "slack-id"), (home_path, "operator-home")):
+            for match in pattern.findall(text):
+                hits.append(f"{rel}: {label} {match if isinstance(match, str) else ''}")
+
+    return [
+        (f"IDENTIFIERS no deployment ids in tracked files"
+         + (f" — found {len(hits)}: {hits[:4]}" if hits else ""),
+         not hits),
+    ]
+
+
 def admission_floors() -> list[tuple[str, bool]]:
     """Floors on deploying an agent profile to a live, in-use runtime.
 
@@ -250,8 +317,15 @@ def admission_floors() -> list[tuple[str, bool]]:
         ("FLOOR deploying into an unset agents.list is not accepted by default",
          DEFAULTS.get("dc_agent_accept_list_risk") is False),
         ("FLOOR dry run is not the default", DEFAULTS.get("dc_dry_run") is False),
-        ("FLOOR the profile lives outside this public fork",
-         "dc-agent-profiles" in str(DEFAULTS.get("dc_agent_profile_path", ""))),
+        # Unset is correct: an agent profile records a specific deployment's
+        # identity and belongs in a private repository beside its inventory. The
+        # play refuses when it is not supplied.
+        ("FLOOR the profile path is not baked into this public repo",
+         "openclaw-ansible" not in str(DEFAULTS.get("dc_agent_profile_path", ""))),
+        ("FLOOR deployment-specific bindings are not shipped as defaults",
+         DEFAULTS.get("dc_slack_channels") == {}
+         and DEFAULTS.get("dc_slack_allow_from") == []
+         and DEFAULTS.get("dc_slack_required_conversations") == []),
         # `config patch` REPLACES arrays rather than merging them. A patch
         # containing only dc-research therefore replaces agents.list entirely —
         # and while the list is unset, the agent serving the founder's Slack is
@@ -391,7 +465,7 @@ def main() -> int:
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

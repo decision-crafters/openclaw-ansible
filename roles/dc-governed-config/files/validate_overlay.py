@@ -95,7 +95,7 @@ def child_schema(key: str, schema: dict, defs: dict):
                            or True for anything
 
     `channels.slack.channels` is the third kind. It is keyed by Slack channel ID
-    (`C0EXAMPLE01`, or `team:T...:channel:C...` on Enterprise Grid), so the
+    (`C0123456789`, or `team:T...:channel:C...` on Enterprise Grid), so the
     schema cannot enumerate its keys and declares none. The first version read
     every one of those as an invented key and refused a correct config with
     "no such key in the schema. Available at this level: []" — the empty list

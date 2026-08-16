@@ -1,7 +1,7 @@
 ---
 # Give the OpenClaw service account a rootless Docker daemon.
 #
-# Run: sudo /home/operator/.local/bin/ansible-playbook \
+# Run: sudo ansible-playbook \
 #        playbooks/governed-rootless-sandbox.yml -e ansible_become=false
 
 - name: Resolve the service account uid

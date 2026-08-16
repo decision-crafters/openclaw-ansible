@@ -9,11 +9,11 @@
 # granting root, and this playbook refuses to run if the group membership has
 # been restored as a shortcut.
 #
-#   sudo /home/operator/.local/bin/ansible-playbook \
+#   sudo ansible-playbook \
 #     playbooks/governed-rootless-sandbox.yml -e ansible_become=false
 #
 # Then confirm the gateway is healthy:
-#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-lifecycle.yml \
+#   sudo ansible-playbook playbooks/governed-lifecycle.yml \
 #     --tags status -e ansible_become=false
 
 - name: Provide a rootless container runtime for the OpenClaw sandbox

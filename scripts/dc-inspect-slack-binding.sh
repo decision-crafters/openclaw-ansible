@@ -106,8 +106,8 @@ for top in ("channels", "plugins", "integrations", "connectors"):
 if not found:
     print("  No 'slack' key under channels/plugins/integrations/connectors.")
     print("  Slack may be configured by environment variable instead — see 2b.")
-    print("  Do NOT read this as 'Slack is not connected'; the founder confirmed")
-    print("  working Slack communication on 2026-08-15.")
+    print("  Do NOT read this as 'Slack is not connected' — absence from the")
+    print("  expected key is not absence of the binding. Check 2b and 3.")
 
 print()
 print("  --- plugin policy as written ---")
@@ -489,11 +489,11 @@ print(f\"{u.get('name','?')}[{tag}]\")
     echo "  $dm ->$names"
   done
   echo
-  echo "  The founder's DM is the one containing U0EXAMPLE01 (tosin.akinosho)."
+  echo "  The operator's DM is the one containing the operator's own user id."
   echo "  That conversation MUST appear in dc_slack_required_conversations."
-  echo "  Founder confirmed 2026-08-16 that the access path is channel AND DM,"
-  echo "  device-dependent — so excluding DMs as a class would sever the phone"
-  echo "  path this whole governance decision exists to protect."
+  echo "  Where the access path is channel AND DM — commonly, since a phone"
+  echo "  reaches a DM more readily — excluding DMs as a class severs the route"
+  echo "  the gateway's loopback bind otherwise leaves no alternative to."
 else
   echo "  Skipped — no token. UNKNOWN."
 fi

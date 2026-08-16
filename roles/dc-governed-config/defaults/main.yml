@@ -247,27 +247,27 @@ dc_slack_group_policy: "allowlist"   # open | disabled | allowlist
 #    name-based key will never route successfully and all messages in that
 #    channel will be silently blocked."
 #
-# Silently. A name here would produce a bot that looks configured and answers
-# nobody, with no error anywhere.
+# Silently. A name here produces a bot that looks configured and answers nobody,
+# with no error anywhere. The role validates the key shape before writing.
 #
-# C0EXAMPLE01 = #all-decision-crafters. #social (C0EXAMPLE02) is deliberately
-# ABSENT: founder decision 2026-08-16 scopes access to one channel, so the bot
-# stops responding there. That is the intended consequence, not an oversight.
+# EMPTY BY DEFAULT, and safely so: the guard in tasks/slack_bound.yml refuses
+# groupPolicy "allowlist" with an empty channel map, because an empty allowlist
+# blocks every channel. Set this per deployment in inventory, never here — this
+# repository is public and a channel id identifies a workspace.
 #
-# users: the per-channel sender allowlist. This is what stops Claude, ChatGPT
-# and any other workspace member driving the agent — they are present in the
-# channel and are not U0EXAMPLE01. It also closes the bot-sender question
-# without relying on `allowBots`, whose schema shape is a bare enum this role
-# has not confirmed. Restricting by sender is the control we understand.
+# Shape:
+#   openclaw_slack_channels:
+#     C0123456789:
+#       enabled: true
+#       requireMention: true
+#       users: [U0123456789]
 #
-# requireMention: founder preference, stated 2026-08-15. The bot answers when
-# addressed and ignores unrelated channel traffic.
-dc_slack_channels:
-  C0EXAMPLE01:
-    enabled: true
-    requireMention: true
-    users:
-      - U0EXAMPLE01
+# `users` is the per-channel sender allowlist and is what stops other members —
+# including other bots — driving the agent. It also closes the bot-sender
+# question without relying on `allowBots`, whose schema shape is a bare enum
+# this role has not confirmed. Restricting by sender is the control we
+# understand.
+dc_slack_channels: {}
 
 # DM access. `pairing` is the schema default and is what this host runs today
 # with dmPolicy unset — which is why the founder's DM already works.
@@ -276,25 +276,34 @@ dc_slack_channels:
 # the same page marks legacy. Raw uppercase Slack user IDs are a documented
 # accepted form; lowercase or short lookalikes fail at startup.
 dc_slack_dm_policy: "allowlist"
-dc_slack_allow_from:
-  - U0EXAMPLE01                      # tosin.akinosho, the only permitted sender
+
+# The canonical DM allowlist per docs/channels/slack.md — not dm.allowFrom,
+# which the same page marks legacy. Raw uppercase Slack user IDs are accepted;
+# names, slugs, display names and emails FAIL AT STARTUP, and so do lowercase
+# lookalikes. A failed startup here means no Slack, which on a loopback-bound
+# gateway means no route to the host at all.
+#
+# EMPTY BY DEFAULT. The guard refuses dmPolicy "allowlist" with no senders,
+# because that admits nobody. Set per deployment in inventory.
+dc_slack_allow_from: []
 
 # Conversations that MUST remain reachable — checked against, never written.
+#
 # The mirror of dc_plugins_required, and it exists for the same reason: every
 # other control here fails when a restriction goes missing, and nothing would
-# catch a capability being removed.
+# catch a capability being REMOVED.
 #
-# D0EXAMPLE01 is the founder's DM (resolved 2026-08-16: U0EXAMPLE01 +
-# U0EXAMPLE02). Founder confirmed the access path is channel AND DM, device
-# dependent — so a posture that dropped DMs would sever the phone route this
-# whole decision exists to protect.
+# On a loopback-bound gateway with no VPN, the operator's channel and DM are the
+# only route to the host. A posture that drops them is legal config, passes the
+# schema, passes every assertion in the role, and leaves a runtime that is
+# healthy by every measure and unreachable.
 #
-# PRESERVATION, NOT EXPANSION. Decision Memory records that the Slack baseline
-# revision "does not authorize private-channel/DM expansion". Naming a DM that
-# already exists is preservation; creating one would not be permitted.
-dc_slack_required_conversations:
-  - C0EXAMPLE01
-  - D0EXAMPLE01
+# PRESERVATION, NOT EXPANSION: list conversations that already exist. Creating
+# one is a different act with different authority.
+#
+# EMPTY BY DEFAULT. Set per deployment in inventory — a DM id identifies a
+# person, and this repository is public.
+dc_slack_required_conversations: []
 
 # Loop and dedup protection — a named baseline requirement that had no key until
 # the schema was dumped. Enabled explicitly rather than left to the default,
@@ -357,11 +366,14 @@ dc_confirm_stop: false
 # Deploying an agent profile writes to a runtime the founder is actively using
 # from Slack. Everything here is shaped by that.
 
-# The profile to deploy. Lives in the PRIVATE dc-agent-profiles repo, not this
-# public fork: it records exact Slack workspace, channel and sender identity,
-# and TASK-223 is Internal Only.
-dc_agent_profile_path: "/home/operator/workspace/dc-agent-profiles/dc-research/openclaw.json"
-dc_agent_id: "dc-research"
+# The profile to deploy, and the agent it declares.
+#
+# UNSET BY DEFAULT. An agent profile records the runtime identity and channel
+# bindings of a specific deployment, so it belongs in a private repository
+# alongside the inventory — not here. The play refuses when these are unset
+# rather than deploying something it had to guess at.
+dc_agent_profile_path: ""
+dc_agent_id: ""
 
 # Tools that MUST be denied on the deployed profile. Checked against, not
 # written — the profile is the source of truth and this is the floor it has to
