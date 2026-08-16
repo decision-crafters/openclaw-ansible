@@ -474,6 +474,52 @@ dc_agent_workspace_files:
   - packet/tasks-research.json
   - packet/MANIFEST.md
 
+# Runtime STATE directories inside the agent workspace.
+#
+# A different class from the governance files above, needing the OPPOSITE
+# permissions, and conflating the two breaks something quietly.
+#
+# Governance files are root:root 0444 under root:root 0555 directories: the
+# agent must never modify its own rules. Runtime state is written by the GATEWAY
+# as the service account, from OUTSIDE the sandbox. Pre-creating `memory/` with
+# the governance pattern would leave a root-owned unwritable directory and the
+# Gateway would fail to write into it — "we created the folder" while breaking
+# the thing the folder exists for.
+#
+# WHY CREATE IT AT ALL, since the hook does `mkdir(memoryDir, {recursive: true})`
+# and would make its own: so the MODE is ours rather than whatever the Gateway's
+# umask produces. An inherited mode on a directory holding session transcripts
+# is another default nobody chose, which is the failure this workstream keeps
+# finding.
+#
+# Discovered 2026-08-16 by reading the bundled session-memory handler:
+#   memoryDir = path.join(workspaceDir, "memory")
+#   mkdir(memoryDir, { recursive: true })
+#   (memoryDir).write(filename, entry, { encoding: "utf-8" })
+dc_agent_workspace_state_dirs:
+  - memory
+
+# 0700: the Gateway writes, the AGENT CANNOT READ.
+#
+# This is a governance choice with a consequence, so it is a variable rather
+# than a constant.
+#
+# The workspace is mounted read-only into the sandbox, so anything world-
+# readable here is readable by the agent in EVERY LATER SESSION. `dc-research`
+# runs `sandbox.scope: session` and TASK-223's test 11 was accepted partly on
+# that basis — no cross-session recall. But session scope discards the
+# CONTAINER, not the workspace: a transcript persisted here by a hook running
+# outside the sandbox would survive it and be readable next run.
+#
+# 0700 keeps that closed. The Gateway still writes (it owns the directory); the
+# agent simply cannot read it back.
+#
+# Setting 0755 GRANTS the agent cross-session recall of its own persisted
+# sessions. That may well be desirable — it is what session memory is for — but
+# it widens a control TASK-223 already claimed, so it belongs to the founder and
+# not to a default.
+dc_agent_memory_mode: '0700'
+
 # Material that sits beside the profile and must NEVER be installed.
 #
 # `admission/` holds the synthetic tests this agent is about to be given,

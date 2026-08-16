@@ -292,6 +292,53 @@
     mode: '0555'
   loop: "{{ dc_ws_subdirs.files | map(attribute='path') | list }}"
 
+# --- runtime state directories -------------------------------------------------
+#
+# Created AFTER the governance files and with deliberately different ownership.
+# The two classes are adjacent in the same workspace and want opposite things:
+#
+#   governance   root:root 0444 in root:root 0555   agent must not modify
+#   state        openclaw-owned, writable            GATEWAY writes, from
+#                                                    OUTSIDE the sandbox
+#
+# Applying the governance pattern here would leave a root-owned unwritable
+# directory that the Gateway silently fails to write into — the folder would
+# exist and the feature would be broken, which reads as success from the host.
+- name: Create the runtime state directories
+  ansible.builtin.file:
+    path: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: "{{ dc_agent_memory_mode }}"
+  loop: "{{ dc_agent_workspace_state_dirs }}"
+
+# The mode is the control, so it is asserted rather than assumed. A state
+# directory that arrives root-owned is not a cosmetic difference: the Gateway
+# cannot write it, and nothing else in this play would notice.
+- name: Confirm the state directories are writable by the service account
+  ansible.builtin.stat:
+    path: "{{ dc_ws_real.stdout | trim }}/{{ item }}"
+  register: dc_ws_state_stat
+  loop: "{{ dc_agent_workspace_state_dirs }}"
+
+- name: Refuse a state directory the Gateway cannot write
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.pw_name == dc_openclaw_user
+    fail_msg: >-
+      {{ item.item }} is not owned by {{ dc_openclaw_user }}
+      (owner={{ item.stat.pw_name | default('missing') }}). The Gateway writes
+      this directory from outside the sandbox and would fail silently. This is
+      the governance-file pattern applied to a state directory, which is the
+      one mistake this section exists to prevent.
+    success_msg: "{{ item.item }} writable by {{ dc_openclaw_user }} ({{ dc_agent_memory_mode }})"
+  loop: "{{ dc_ws_state_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('?') }}"
+  when: dc_fail_closed | bool
+
 # --- verification ------------------------------------------------------------
 #
 # Read back from the filesystem rather than trusting the module results. `copy`
@@ -339,6 +386,9 @@
       agent={{ dc_agent_id }} |
       workspace={{ dc_ws_real.stdout | trim }} (1755 {{ dc_openclaw_user }}) |
       installed={{ dc_agent_workspace_files | length }} files 0444 root |
+      state_dirs={{ dc_agent_workspace_state_dirs | join(', ') }}
+      ({{ dc_agent_memory_mode }} {{ dc_openclaw_user }} — Gateway writes these,
+      the agent does not) |
       excluded_verified={{ dc_agent_workspace_excluded | join(',') }} |
       gateway NOT restarted — bootstrap files are read when a SESSION starts,
       not when the daemon does |

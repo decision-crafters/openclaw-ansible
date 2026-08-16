@@ -347,6 +347,24 @@ def target_floors() -> list[tuple[str, bool]]:
     ]
 
 
+def _task_field(text: str, task_name: str, field: str) -> str | None:
+    """Return a named field from a NAMED task, or None.
+
+    Scoped to one task deliberately. A whole-file substring search for
+    `owner: "{{ dc_openclaw_user }}"` passes whenever ANY task sets it — which
+    it did, letting a mutation that made the state directories root-owned go
+    green. That is the third time in this file a substring check has passed a
+    mutation it was written to catch.
+    """
+    import re
+
+    for chunk in re.split(r"^- name: ", text, flags=re.M):
+        if chunk.startswith(task_name):
+            m = re.search(rf"^\s+{re.escape(field)}:\s*(\S.*?)\s*$", chunk, flags=re.M)
+            return m.group(1) if m else None
+    return None
+
+
 def _task_mode(text: str, task_name: str) -> str | None:
     """Return the `mode:` a named task sets, or None if the task has none.
 
@@ -437,6 +455,34 @@ def workspace_floors() -> list[tuple[str, bool]]:
          "dc_ws_found" in ws_text and "dc_agent_workspace_excluded" in ws_text),
         ("WORKSPACE the write is gated by apply_gate",
          "apply_gate.yml" in ws_text),
+        # Runtime state is a DIFFERENT class from governance files and wants the
+        # opposite permissions. Governance is root:root 0444 under root:root
+        # 0555 so the agent cannot rewrite its own rules; state is written by
+        # the GATEWAY as the service account from outside the sandbox.
+        #
+        # Applying the governance pattern to a state directory leaves it
+        # root-owned and unwritable, the Gateway fails to write silently, and
+        # the host looks correct. That is the one mistake worth a floor here.
+        ("WORKSPACE runtime state dirs are declared",
+         len(d.get("dc_agent_workspace_state_dirs") or []) > 0),
+        ("WORKSPACE state dirs are owned by the service account, not root",
+         _task_field(ws_text, "Create the runtime state directories", "owner")
+         == '"{{ dc_openclaw_user }}"'),
+        ("WORKSPACE state dirs use the declared memory mode",
+         _task_field(ws_text, "Create the runtime state directories", "mode")
+         == '"{{ dc_agent_memory_mode }}"'),
+        ("WORKSPACE state dir ownership is asserted, not assumed",
+         "pw_name" in ws_text),
+        # The workspace is mounted read-only into the sandbox, so a
+        # world-readable state dir is readable by the agent in EVERY later
+        # session. dc-research runs sandbox.scope: session and TASK-223's test
+        # 11 was accepted partly on "no cross-session recall". Session scope
+        # discards the container, not the workspace.
+        #
+        # 0700 keeps that closed by default. Widening it is a founder decision,
+        # so this floor fails rather than letting a default grant it.
+        ("WORKSPACE memory is not agent-readable by default (cross-session recall)",
+         str(d.get("dc_agent_memory_mode", "")).endswith("00")),
         # Ordering, because `copy` does not create a missing destination
         # directory. The first apply half-succeeded on exactly this: the four
         # top-level bootstrap files landed, skills/ and packet/ did not, and the
