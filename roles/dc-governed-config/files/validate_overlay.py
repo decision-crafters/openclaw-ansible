@@ -141,17 +141,33 @@ def walk(overlay, schema: dict, defs: dict, path: list[str], errors: list[str]) 
             walk(value, child, defs, here, errors)
             continue
 
-        # Lists are checked for membership per item where the item type is
-        # enum-constrained; tools.deny is a free-form array, so absence of an
-        # enum here is expected rather than suspicious.
+        # Lists take two forms and the first version only handled one.
+        #
+        # Enum-constrained items are checked for membership; `tools.deny` is a
+        # free-form array, so absence of an enum there is expected rather than
+        # suspicious.
+        #
+        # Arrays of OBJECTS are descended. `agents.list` is one, and the first
+        # version walked straight past it — reporting "overlay validated against
+        # the live schema" for a per-agent entry containing an invented key and
+        # an illegal enum value, because it never looked inside the array.
+        #
+        # That is this file's own failure mode arriving from a new direction: a
+        # check that passes by asking nothing. It is worse than an absent check,
+        # because the absent one does not print the word "validated".
         if isinstance(value, list):
-            item_enum = allowed_values(deref(child.get("items", {}), defs), defs)
+            items_schema = deref(child.get("items", {}), defs)
+            item_enum = allowed_values(items_schema, defs)
             if item_enum:
                 for item in value:
                     if item not in item_enum:
                         errors.append(
                             f"{dotted}[]: {item!r} is not allowed. Allowed: {item_enum}"
                         )
+                continue
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    walk(item, items_schema, defs, here + [f"[{index}]"], errors)
             continue
 
         enum = allowed_values(child, defs)

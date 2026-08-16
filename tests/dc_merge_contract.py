@@ -294,6 +294,20 @@ def validator_floors() -> list[tuple[str, bool]]:
         module.walk(overlay, schema, {}, [], errors)
         return len(errors)
 
+    # agents.list mirrors the live shape: an array whose items are objects.
+    arr_schema = {"properties": {"agents": {"properties": {"list": {
+        "type": "array",
+        "items": {"properties": {
+            "id": {"type": "string"},
+            "sandbox": {"properties": {"mode": {"enum": ["off", "non-main", "all"]}}},
+        }},
+    }}}}}
+
+    def check_arr(overlay) -> int:
+        errors: list[str] = []
+        module.walk(overlay, arr_schema, {}, [], errors)
+        return len(errors)
+
     return [
         ("VALIDATOR accepts dynamic map keys",
          check({"channels": {"slack": {"channels": {"C0EXAMPLE01": {"requireMention": True}}}}}) == 0),
@@ -305,6 +319,17 @@ def validator_floors() -> list[tuple[str, bool]]:
          check({"gateway": {"bind": "127.0.0.1"}}) == 1),
         ("VALIDATOR still rejects an invented key beside a map",
          check({"channels": {"slack": {"nopeNotAKey": 1}}}) == 1),
+        # agents.list is an array of objects. The validator walked straight past
+        # it and printed "overlay validated against the live schema" for an
+        # entry containing an invented key and an illegal enum, because it never
+        # looked inside. A check that passes by asking nothing is worse than an
+        # absent check: the absent one does not print the word "validated".
+        ("VALIDATOR descends into arrays of objects",
+         check_arr({"agents": {"list": [{"id": "x", "nopeNotAKey": 1}]}}) == 1),
+        ("VALIDATOR catches an illegal enum inside an array item",
+         check_arr({"agents": {"list": [{"id": "x", "sandbox": {"mode": "banana"}}]}}) == 1),
+        ("VALIDATOR accepts a legal array item",
+         check_arr({"agents": {"list": [{"id": "x", "sandbox": {"mode": "all"}}]}}) == 0),
     ]
 
 
