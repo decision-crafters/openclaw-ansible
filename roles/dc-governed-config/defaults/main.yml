@@ -356,20 +356,34 @@ dc_confirm_stop: false
 # --- Audit --------------------------------------------------------------------
 # Read-only evidence capture. See tasks/audit.yml.
 #
-# The CLI invocation. `openclaw` resolves on the service account's PATH via a
-# login shell; the entrypoint is not hardcoded because the real path embeds a
-# version and a content hash and changes on upgrade.
+# The CLI invocation.
+#
+# NOT `bash -lc openclaw`. Two things go wrong with that and they compound:
+#
+#   `bash -lc <cmd>` takes the FIRST argument as the whole command string and
+#   binds the rest to $0, $1... So appending ['config','--help'] to an argv
+#   ending in `bash -lc openclaw` runs bare `openclaw` with $0=config. The extra
+#   arguments are silently discarded rather than passed.
+#
+#   `openclaw` is installed under the service account's pnpm store and is put on
+#   PATH by an interactive shell profile. A non-interactive login shell does not
+#   necessarily have it, which returns rc=127 — command not found — and looks
+#   like the CLI is missing rather than unreachable.
+#
+# Both produced a single confusing failure on 2026-08-16. The role already had a
+# proven pattern for this in tasks/main.yml, used for `config schema`: derive
+# the entrypoint from the installed systemd unit and call node with it. Reused
+# here rather than reinvented.
 dc_audit_cli:
   - "{{ dc_runuser }}"
   - -u
   - "{{ dc_openclaw_user }}"
   - --
-  - /usr/bin/env
+  - env
   - "XDG_RUNTIME_DIR=/run/user/{{ dc_audit_uid | default('') }}"
   - "HOME={{ dc_openclaw_home }}"
-  - bash
-  - -lc
-  - openclaw
+  - /usr/bin/node
+  - "{{ dc_audit_entrypoint | default('') }}"
 
 # Paths read with `openclaw config get`, which returns the EFFECTIVE value —
 # after merge and after defaults. That is the only question about the running

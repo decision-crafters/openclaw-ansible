@@ -30,6 +30,33 @@
   ansible.builtin.set_fact:
     dc_audit_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
 
+# Derived from the installed unit rather than trusting PATH. The real path
+# embeds a version and a content hash, so any literal is wrong after the next
+# upgrade — and PATH for a non-interactive login shell does not necessarily
+# include it, which returns rc=127 and reads as "the CLI is missing".
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_audit_entry_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_audit_entrypoint: "{{ dc_audit_entry_probe.stdout | default('') | trim }}"
+
+- name: Refuse to audit without an entrypoint to invoke
+  ansible.builtin.fail:
+    msg: >-
+      Could not derive the OpenClaw entrypoint from
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}.
+      Set dc_audit_entrypoint explicitly if the install path has moved.
+  when:
+    - dc_audit_entrypoint | length == 0
+    - dc_fail_closed | bool
+
 # Verb existence is checked, not assumed. `plugins list` was assumed to exist,
 # was not a real subcommand, and hung on stdin rather than erroring — costing a
 # debugging session and leaving a criterion UNCONFIRMED. One --help would have
