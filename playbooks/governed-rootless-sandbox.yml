@@ -16,8 +16,11 @@
 #   sudo ansible-playbook playbooks/governed-lifecycle.yml \
 #     --tags status -e ansible_become=false
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Provide a rootless container runtime for the OpenClaw sandbox
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   gather_facts: true
   roles:

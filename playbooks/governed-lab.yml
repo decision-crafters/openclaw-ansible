@@ -10,10 +10,16 @@
 # Running this file end to end in one pass will stop at play 2 with a message
 # explaining exactly that. That is the intended behaviour, not a defect.
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Install and harden the OpenClaw host
-  # localhost, matching upstream's playbooks/install.yml. This host IS the
-  # target; there is no control-node/target split to model.
-  hosts: localhost
+  # An inventory GROUP, not `localhost`. These plays do run on the host they
+  # govern — upstream's install.yml targets localhost for that reason and is
+  # right to — but `localhost` is the implicit host, and host_vars are keyed to
+  # inventory hosts. Targeting it meant the private inventory's bindings were
+  # loaded by nothing at all. See governed-preflight-target.yml.
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   roles:
     - openclaw
@@ -21,7 +27,7 @@
     - install
 
 - name: Apply Decision Crafters governance controls
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   roles:
     - dc-governed-config
@@ -33,7 +39,7 @@
 # forcing a rollback of both. It also has a distinct failure mode — it can lock
 # the founder out of the only route to this host that works from a phone.
 - name: Bound the Slack human-access path
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   tasks:
     - name: Apply the Slack boundary

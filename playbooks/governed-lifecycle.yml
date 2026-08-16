@@ -23,8 +23,11 @@
 # passwordless sudo. The role switches to the service account with `runuser`
 # rather than become_user precisely because that flag disables become_user.
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Manage the governed OpenClaw gateway
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   gather_facts: true
   tasks:

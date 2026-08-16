@@ -22,8 +22,11 @@
 # the stop tasks in governed-lifecycle.yml. ansible-lint, --syntax-check and
 # --list-tasks all passed that version.
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Deploy an agent profile
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   gather_facts: true
   tasks:
@@ -35,7 +38,7 @@
     - agent-profile
 
 - name: Remove an agent profile
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   gather_facts: true
   tasks:

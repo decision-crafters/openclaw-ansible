@@ -13,8 +13,11 @@
 # failure state, and confirms the unit is still running 15 seconds later rather
 # than accepting a clean restart as proof.
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Roll back Decision Crafters governance controls
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   tasks:
     - name: Restore the previous config and restart the gateway

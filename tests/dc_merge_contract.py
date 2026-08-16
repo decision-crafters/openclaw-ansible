@@ -289,6 +289,64 @@ def no_deployment_identifiers() -> list[tuple[str, bool]]:
     ]
 
 
+def target_floors() -> list[tuple[str, bool]]:
+    """Every governed play must target an inventory host, and prove it did.
+
+    The bindings were parameterized into a private inventory on 2026-08-16 and
+    loaded by nothing for a day, because every governed play targeted
+    `hosts: localhost` — the IMPLICIT host, which host_vars are not keyed to.
+    ansible.cfg was correct, the inventory was correct, the values were correct,
+    and no play ever selected the host they described.
+
+    Two things are pinned here, because either alone re-opens it:
+
+    1. No governed play may name `localhost`. That is the defect itself.
+    2. Every governed playbook must import the preflight. Without it a pattern
+       matching zero hosts makes Ansible print "no hosts matched" and exit ZERO
+       — a run that governs nothing and reports success, which is the worse of
+       the two failures.
+
+    Upstream's own playbooks are exempt and untouched: install.yml targets
+    localhost correctly for a playbook that carries no per-deployment bindings,
+    and this fork is additive by construction.
+    """
+    import re
+
+    plays = sorted((ROLE.parents[1] / "playbooks").glob("governed-*.yml"))
+    preflight_name = "governed-preflight-target.yml"
+
+    if not plays:
+        return [("TARGET governed playbooks found", False)]
+
+    localhost_hits: list[str] = []
+    missing_import: list[str] = []
+    for path in plays:
+        text = path.read_text(errors="ignore")
+        # Comments discuss localhost at length on purpose; only the directive counts.
+        for line in text.splitlines():
+            if re.match(r"\s*hosts:\s*localhost\s*$", line):
+                localhost_hits.append(path.name)
+                break
+        if path.name == preflight_name:
+            continue  # it IS the guard; it targets the implicit host by design
+        if preflight_name not in text:
+            missing_import.append(path.name)
+
+    # The preflight is the one file allowed to say localhost.
+    localhost_hits = [n for n in localhost_hits if n != preflight_name]
+
+    return [
+        (f"TARGET no governed play hardcodes hosts: localhost"
+         + (f" — found in {localhost_hits}" if localhost_hits else ""),
+         not localhost_hits),
+        (f"TARGET every governed playbook imports the preflight"
+         + (f" — missing in {missing_import}" if missing_import else ""),
+         not missing_import),
+        ("TARGET the preflight play exists",
+         (ROLE.parents[1] / "playbooks" / preflight_name).is_file()),
+    ]
+
+
 def admission_floors() -> list[tuple[str, bool]]:
     """Floors on deploying an agent profile to a live, in-use runtime.
 
@@ -469,7 +527,7 @@ def main() -> int:
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

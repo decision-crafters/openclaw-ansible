@@ -12,8 +12,11 @@
 # person typing did not think to ask for — which is how eleven outbound-write
 # keys and seven session tools stayed invisible for days.
 
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
 - name: Audit the OpenClaw configuration
-  hosts: localhost
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
   gather_facts: true
   tasks:
