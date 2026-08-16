@@ -48,6 +48,17 @@ dc_rls_socket: "/run/user/{{ dc_rls_uid | default('') }}/docker.sock"
 dc_rls_dropin_dir: "{{ dc_rls_home }}/.config/systemd/user/openclaw-gateway.service.d"
 
 dc_rls_service: "openclaw-gateway.service"
+
+# The sandbox image OpenClaw requires. It refuses to substitute a stock image:
+# the default carries python3 for the sandbox write/edit helpers, so a plain
+# debian:bookworm-slim is not equivalent and OpenClaw says so explicitly.
+#
+# Built by scripts/sandbox-setup.sh, which ships with the OpenClaw package. The
+# path is derived from the unit's ExecStart rather than pinned, because the real
+# path embeds both a version and a content hash and any literal written today is
+# wrong after the next upgrade.
+dc_rls_sandbox_image: "openclaw-sandbox:bookworm-slim"
+dc_rls_setup_script: ""
 dc_rls_runuser: "{{ dc_runuser | default('/usr/sbin/runuser') }}"
 
 # Refuse rather than proceed when a prerequisite is missing. A half-configured

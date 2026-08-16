@@ -248,6 +248,128 @@
     - (dc_rls_docker_version.rc | default(1)) != 0
     - dc_rls_fail_closed | bool
 
+# --- the sandbox image --------------------------------------------------------
+# A reachable daemon is still not a working sandbox. OpenClaw needs a specific
+# image and refuses to substitute a stock one:
+#
+#   Sandbox image not found: openclaw-sandbox:bookworm-slim. Build it with
+#   scripts/sandbox-setup.sh before enabling Docker sandboxing. The default
+#   image includes python3 for sandbox write/edit helpers; OpenClaw will not
+#   substitute plain debian:...
+#
+# DOCKER_HOST on the build is the part that bites. Without it the image is built
+# in the ROOTFUL daemon, where the service account cannot see it — and the
+# failure is identical to having no image at all, while `docker images` as root
+# shows it present. Two daemons, one image name, and the error does not say
+# which daemon it looked in.
+- name: Locate the OpenClaw package root from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_rls_home }}/.config/systemd/user/{{ dc_rls_service }}
+  register: dc_rls_entrypoint
+  changed_when: false
+  failed_when: false
+
+# Derived only when not explicitly overridden, so an operator can pin it after
+# an upgrade moves the install path.
+- name: Record the sandbox setup script path
+  ansible.builtin.set_fact:
+    dc_rls_setup_script: >-
+      {{ dc_rls_setup_script if (dc_rls_setup_script | length > 0)
+         else ((dc_rls_entrypoint.stdout | default('') | trim | dirname | dirname)
+               ~ '/scripts/sandbox-setup.sh') }}
+
+- name: Check whether the sandbox image already exists in the rootless daemon
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - /usr/bin/docker
+      - images
+      - -q
+      - "{{ dc_rls_sandbox_image }}"
+  register: dc_rls_image_check
+  changed_when: false
+  failed_when: false
+
+- name: Confirm the setup script exists before trying to run it
+  ansible.builtin.stat:
+    path: "{{ dc_rls_setup_script }}"
+  register: dc_rls_setup_stat
+  when: (dc_rls_image_check.stdout | default('') | trim) | length == 0
+
+- name: Refuse when the sandbox image is missing and the setup script cannot be found
+  ansible.builtin.fail:
+    msg: >-
+      The sandbox image {{ dc_rls_sandbox_image }} is absent and
+      {{ dc_rls_setup_script }} does not exist, so it cannot be built.
+      OpenClaw will not substitute a stock debian image. Set
+      dc_rls_setup_script explicitly if the install path has moved — the path is
+      derived from the unit's ExecStart, which embeds a version and a content
+      hash and therefore changes on upgrade.
+  when:
+    - (dc_rls_image_check.stdout | default('') | trim) | length == 0
+    - not (dc_rls_setup_stat.stat.exists | default(false))
+    - dc_rls_fail_closed | bool
+
+# Long by design: image builds pull a base layer and install python3.
+- name: Build the sandbox image inside the rootless daemon
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+      - /usr/bin/bash
+      - "{{ dc_rls_setup_script }}"
+  register: dc_rls_build
+  changed_when: dc_rls_build.rc == 0
+  failed_when: false
+  timeout: 900
+  when: (dc_rls_image_check.stdout | default('') | trim) | length == 0
+
+- name: Re-check the image, in the rootless daemon specifically
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - /usr/bin/docker
+      - images
+      - --format
+      - "{% raw %}{{.Repository}}:{{.Tag}} {{.Size}}{% endraw %}"
+      - "{{ dc_rls_sandbox_image }}"
+  register: dc_rls_image_final
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to report a working sandbox without the image present
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_rls_sandbox_image }} is still absent from the rootless daemon after
+      running {{ dc_rls_setup_script }}.
+      Build output: {{ (dc_rls_build.stdout | default('')) | trim | truncate(400) }}
+      {{ (dc_rls_build.stderr | default('')) | trim | truncate(400) }}
+      Check it was not built into the ROOTFUL daemon instead — that produces
+      exactly this symptom while `sudo docker images` shows the image present.
+  when:
+    - (dc_rls_image_final.stdout | default('') | trim) | length == 0
+    - dc_rls_fail_closed | bool
+
 # --- point the Gateway at it --------------------------------------------------
 # A drop-in, not an edit. `openclaw onboard --install-daemon` owns the unit file
 # and would overwrite an edit on the next upgrade without saying so.
