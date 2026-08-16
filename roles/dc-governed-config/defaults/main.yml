@@ -773,3 +773,38 @@ dc_inject_elevation_markers:
   - "i now hold execute"
   - "upgraded to execute"
   - "i am able to perform"
+
+# --- Sandbox audit -------------------------------------------------------------
+# See tasks/sandbox_audit.yml. Read-only. Answers one question no other check in
+# this role asks: what does the AGENT see?
+#
+# Every existing verification reads the host — files present, modes correct,
+# exclusions absent — and every one of them passed while the agent reported it
+# could not reach its workspace at all. The host is the easy layer to inspect
+# and it is not the layer that matters.
+dc_docker: "/usr/bin/docker"
+
+dc_docker_env:
+  - "{{ dc_runuser }}"
+  - -u
+  - "{{ dc_openclaw_user }}"
+  - --
+  - env
+  - "XDG_RUNTIME_DIR=/run/user/{{ dc_audit_uid | default('') }}"
+  - "HOME={{ dc_openclaw_home }}"
+  - "DOCKER_HOST=unix://{{ dc_sandbox_docker_host_path }}"
+  - "{{ dc_docker }}"
+
+# The mount destination is DISCOVERED from the running container, never assumed.
+#
+# docs.openclaw.ai/gateway/security states `ro` mounts the workspace at /agent
+# and `rw` at /workspace. That documentation resolved a real confusion — the
+# agent had been probing /workspace under a `ro` profile and reporting the
+# filesystem unreachable — but documentation says what was intended and only the
+# runtime says what happened. This role's own rule is to ask the binary.
+#
+# Used only to explain a mismatch, never to decide one.
+dc_sandbox_documented_mounts:
+  ro: /agent
+  rw: /workspace
+  none: ""

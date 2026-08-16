@@ -1,0 +1,224 @@
+---
+# What does the AGENT actually see?
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags sandbox-audit -e ansible_become=false
+#
+# Read-only. Inspects a running sandbox container and reads files from inside
+# it. Writes nothing, restarts nothing, creates and removes no container.
+#
+# WHY THIS EXISTS
+#
+# Every other verification in this role reads the HOST. agent_workspace.yml
+# asserts seven files present at 0444 root with the excluded set absent, reads
+# them back from the filesystem rather than trusting the module results, and all
+# of that is true — while dc-research reported on 2026-08-16 that it could not
+# reach its workspace at all.
+#
+# The host is the easy layer to inspect. It is not the layer that matters. An
+# agent reads through a bind mount into a container, and nothing in this role
+# had ever looked through that mount.
+#
+# Two things then went wrong in sequence, and both are worth encoding:
+#
+#   1. The agent reported `cd: can't cd to /workspace` and I believed it. An
+#      agent's claim about its own runtime is a claim, and this workstream
+#      requires verification for every other claim of that weight.
+#   2. I built a stale-mount theory on it — the container predates the install
+#      by three hours, bind mounts resolve at creation — and was about to write
+#      a container-recycling mechanism. Then the vendor docs said `ro` mounts at
+#      /agent and `rw` at /workspace. Under a `ro` profile the agent had been
+#      probing the `rw` path. The error was the expected result of looking in
+#      the wrong place.
+#
+# So this play DISCOVERS the mount destination from the container rather than
+# asserting either path. Documentation says what was intended; the runtime says
+# what happened, and this role's standing rule is to ask the binary.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without an agent to audit
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id | length > 0
+    fail_msg: "dc_agent_id must be set. Nothing has been read."
+    success_msg: "sandbox audit target: {{ dc_agent_id }}"
+
+- name: Confirm the docker CLI is present
+  ansible.builtin.stat:
+    path: "{{ dc_docker }}"
+  register: dc_sb_docker_bin
+
+- name: Refuse without a container runtime to ask
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_docker }} is not present, so the agent's view cannot be inspected.
+      Reporting the host contents alone would be the exact mistake this play
+      exists to correct. Nothing has been read.
+  when:
+    - not dc_sb_docker_bin.stat.exists
+    - dc_fail_closed | bool
+
+# Container naming is openclaw-sbx-agent-<agent>-<scope-key>-<hash>, so the
+# agent id alone does not identify one container. Listed rather than guessed.
+- name: Find the sandbox containers belonging to this agent
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['ps', '--filter', 'name=openclaw-sbx-agent-' ~ dc_agent_id ~ '-',
+                               '--format', '{{.Names}}'] }}"
+  register: dc_sb_containers
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Record the containers found
+  ansible.builtin.set_fact:
+    dc_sb_names: "{{ (dc_sb_containers.stdout | default('')).split('\n') | select | list }}"
+
+# No container is a REPORTABLE STATE, not a pass and not a crash. The sandbox
+# may simply not have been started for this agent yet — it is created on first
+# use. Saying so is the useful answer; failing would imply a fault that may not
+# exist, and succeeding silently would be worse.
+- name: Report when the agent has no running sandbox
+  ansible.builtin.debug:
+    msg: >-
+      DC-SANDBOX AUDIT | agent={{ dc_agent_id }} | NO RUNNING SANDBOX CONTAINER.
+      This is not a failure and not a pass — containers are created on first
+      use, so an agent that has not run since the last restart has none. It does
+      mean NOTHING HERE IS EVIDENCE about what the agent can see. Run a turn
+      first (`openclaw agent --agent {{ dc_agent_id }}`), then re-run this audit.
+  when: dc_sb_names | length == 0
+
+- name: Inspect the mounts of each sandbox container
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['inspect', item, '--format',
+                               '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}|{{.RW}}' ~ '\n' ~ '{{end}}'] }}"
+  register: dc_sb_mounts
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  loop: "{{ dc_sb_names }}"
+
+- name: Report the mounts as the runtime describes them
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item }} mounts:
+      {{ (item.stdout | default('')).split('\n') | select | list }}
+  loop: "{{ dc_sb_mounts.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# The destination the WORKSPACE landed on, discovered rather than assumed.
+# Matched by source path, because the container also carries tmpfs mounts for
+# /tmp, /var/tmp and /run that have nothing to do with the workspace.
+- name: Derive the workspace mount point inside each container
+  ansible.builtin.set_fact:
+    dc_sb_mountpoints: >-
+      {{ dc_sb_mounts.results | default([])
+         | map(attribute='stdout') | map('default', '', true)
+         | map('split', '\n') | flatten | select
+         | map('split', '|') | selectattr(1, 'search', dc_agent_workspace_root | default('/'))
+         | map(attribute=2) | unique | list }}
+  vars:
+    dc_agent_workspace_root: "{{ dc_openclaw_home }}/workspace"
+
+- name: Compare the observed mount point with the documented one
+  ansible.builtin.set_fact:
+    dc_sb_doc_agreement: >-
+      {{ 'AGREE'
+         if (dc_sandbox_documented_mounts[dc_sandbox_workspace_access] | default('')) in dc_sb_mountpoints
+         else 'DISAGREE — the runtime wins; documentation describes intent' }}
+
+- name: Report what was discovered against what the documentation predicts
+  ansible.builtin.debug:
+    msg: >-
+      DC-SANDBOX MOUNT |
+      workspaceAccess={{ dc_sandbox_workspace_access }} |
+      documented={{ dc_sandbox_documented_mounts[dc_sandbox_workspace_access]
+         | default('<undocumented>') }} |
+      observed_mountpoint={{ dc_sb_mountpoints | join(', ') | default('<none>', true) }} |
+      {{ dc_sb_doc_agreement }}
+
+# The whole point of the play. Reads each installed governance file THROUGH the
+# mount, as the agent would.
+- name: Read each installed file from inside the container
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['exec', dc_sb_names[0], 'head', '-c', '1', dc_sb_mountpoints[0] ~ '/' ~ item] }}"
+  register: dc_sb_reads
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  loop: "{{ dc_agent_workspace_files }}"
+  when:
+    - dc_sb_names | length > 0
+    - dc_sb_mountpoints | length > 0
+
+- name: Confirm the agent can actually read what was installed for it
+  ansible.builtin.assert:
+    that:
+      - (item.rc | default(1)) == 0
+    fail_msg: >-
+      {{ item.item }} is NOT readable at
+      {{ dc_sb_mountpoints[0] }}/{{ item.item }} inside {{ dc_sb_names[0] }},
+      rc={{ item.rc | default('?') }}: {{ item.stderr | default('') | trim }}.
+      The file is present and correct on the HOST — that is what
+      --tags agent-workspace verifies, and it is not the same claim.
+    success_msg: "{{ item.item }} readable through the mount"
+  loop: "{{ dc_sb_reads.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('?') }}"
+  when:
+    - dc_sb_reads.results is defined
+    - dc_fail_closed | bool
+
+- name: Confirm the mount is read-only when the profile says read-only
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['exec', dc_sb_names[0], 'touch', dc_sb_mountpoints[0] ~ '/.dc-write-probe'] }}"
+  register: dc_sb_write_probe
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when:
+    - dc_sb_names | length > 0
+    - dc_sb_mountpoints | length > 0
+    - dc_sandbox_workspace_access == 'ro'
+
+# A write that SUCCEEDS is the finding. The probe file would then exist inside a
+# read-only mount, so the run says so loudly rather than cleaning up quietly —
+# removing the evidence of a broken control is not tidying.
+- name: Refuse to report a read-only mount that accepted a write
+  ansible.builtin.fail:
+    msg: >-
+      A write to {{ dc_sb_mountpoints[0] }}/.dc-write-probe SUCCEEDED inside
+      {{ dc_sb_names[0] }} while workspaceAccess is 'ro'. The read-only
+      guarantee this profile depends on is not in force. The probe file has been
+      left in place deliberately as evidence; remove it by hand after recording
+      the finding.
+  when:
+    - dc_sb_write_probe is not skipped
+    - (dc_sb_write_probe.rc | default(1)) == 0
+    - dc_fail_closed | bool
+
+- name: Summarise the readings
+  ansible.builtin.set_fact:
+    dc_sb_readable: >-
+      {{ dc_sb_reads.results | default([]) | selectattr('rc', 'defined')
+         | selectattr('rc', 'equalto', 0) | list | length }}
+    dc_sb_ro_verdict: >-
+      {{ 'not probed (workspaceAccess is not ro)'
+         if (dc_sb_write_probe is skipped or dc_sb_write_probe.rc is not defined)
+         else ('REFUSED (correct)' if dc_sb_write_probe.rc != 0
+               else 'ACCEPTED — READ-ONLY NOT IN FORCE') }}
+
+- name: Emit the sandbox audit receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SANDBOX AUDIT RECEIPT |
+      agent={{ dc_agent_id }} |
+      containers={{ dc_sb_names | join(', ') | default('none', true) }} |
+      workspace_mountpoint={{ dc_sb_mountpoints | default([]) | join(', ') | default('none', true) }} |
+      files_readable_through_mount={{ dc_sb_readable | default(0) }}/{{ dc_agent_workspace_files | length }} |
+      ro_write_probe={{ dc_sb_ro_verdict | default('not probed') }} |
+      This is the only check in this role that asks what the AGENT sees. Host
+      verification and mount verification are different claims, and the host one
+      passed for a day while the agent reported it could reach nothing.

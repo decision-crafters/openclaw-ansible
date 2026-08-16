@@ -26,3 +26,19 @@
         tasks_from: audit
   tags:
     - audit
+
+# Read-only, and the only check in this repository that asks what the AGENT
+# sees rather than what the host holds. Those are different claims: the host
+# verification passed for a day while dc-research reported it could not reach
+# its workspace at all.
+- name: Audit the agent sandbox from inside the container
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Inspect the sandbox mount and read through it
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sandbox_audit
+  tags:
+    - sandbox-audit
