@@ -623,6 +623,17 @@ dc_audit_paths:
   # governance surface this role owns
   - agents.defaults.sandbox
   - agents.list
+  # Top-level, and the key that decides WHICH AGENT a message reaches.
+  #
+  # Absent from this list until 2026-08-16, and its absence hid the most
+  # consequential fact about the deployment: every Slack message was reaching
+  # `main` — which has no workspace, no AGENTS.md and no run gate — for the
+  # entire period TASK-223 spent validating dc-research. Thirty paths were
+  # audited and not one of them answered "who receives a message".
+  #
+  # `bindings` is an ARRAY, so `config patch` replaces it wholesale. Any change
+  # must read the current value and write the survivors back with it.
+  - bindings
   - tools.allow
   - tools.deny
   - tools.exec.mode
