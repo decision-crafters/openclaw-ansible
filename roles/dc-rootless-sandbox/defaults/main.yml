@@ -58,7 +58,33 @@ dc_rls_service: "openclaw-gateway.service"
 # path embeds both a version and a content hash and any literal written today is
 # wrong after the next upgrade.
 dc_rls_sandbox_image: "openclaw-sandbox:bookworm-slim"
-dc_rls_setup_script: ""
+# Upstream's inline Dockerfile for npm installs, reproduced verbatim from
+# docs/gateway/sandboxing.md (openclaw/openclaw), retrieved 2026-08-16.
+#
+# THIRD-PARTY UPSTREAM. This is the OpenClaw project's content; Decision
+# Crafters claims no ownership and has not modified it. If OpenClaw changes the
+# image contract, re-fetch that page rather than editing this by hand.
+#
+# The repo's scripts/docker/sandbox/Dockerfile additionally pins the base by
+# digest and uses BuildKit cache mounts. This is the version upstream tells npm
+# users to run, so it is the version used here — deviating would mean building
+# something subtly different from what the runtime is documented to expect.
+#
+# Note: no Node. Upstream is explicit that a skill needing Node requires either
+# a custom image or sandbox.docker.setupCommand, which in turn requires network
+# egress, a writable root and a root user — all three of which this profile
+# denies. A skill needing Node is therefore a governance question, not a
+# packaging one.
+dc_rls_sandbox_dockerfile: |
+  FROM debian:bookworm-slim
+  ENV DEBIAN_FRONTEND=noninteractive
+  RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates curl git jq python3 ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+  RUN useradd --create-home --shell /bin/bash sandbox
+  USER sandbox
+  WORKDIR /home/sandbox
+  CMD ["sleep", "infinity"]
 dc_rls_runuser: "{{ dc_runuser | default('/usr/sbin/runuser') }}"
 
 # Refuse rather than proceed when a prerequisite is missing. A half-configured
