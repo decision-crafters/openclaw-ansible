@@ -1,0 +1,47 @@
+---
+# Agent admission: deploy a profile, gather evidence, produce a receipt, remove.
+#
+#   --tags agent-profile   deploy the profile as an agents.list entry
+#   --tags remove-agent    remove it again (the rollback; written first)
+#   --tags admit           the synthetic admission evidence harness
+#   --tags receipt         the requested-versus-observed admission receipt
+#
+#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-admission.yml \
+#     --tags agent-profile -e ansible_become=false -e dc_dry_run=true
+#
+# RUN THE DRY RUN FIRST. These plays write to a runtime the founder is actively
+# using from Slack, and `agents.list` is currently unset — meaning the agent
+# serving Slack is implicit and may or may not survive the list being written.
+# agent_profile.yml refuses to proceed on that without explicit acknowledgement.
+#
+# No ADMIT_BOUNDED comes out of any of this. These plays produce evidence; the
+# disposition is a judgement returned to the founder.
+#
+# NOTE the absence of `apply:` on the include below. `apply.tags` ADDS tags to
+# every included task rather than gating them, which made `--tags status` reach
+# the stop tasks in governed-lifecycle.yml. ansible-lint, --syntax-check and
+# --list-tasks all passed that version.
+
+- name: Deploy an agent profile
+  hosts: localhost
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Apply the agent profile
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_profile
+  tags:
+    - agent-profile
+
+- name: Remove an agent profile
+  hosts: localhost
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Remove the agent profile
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: remove_agent
+  tags:
+    - remove-agent

@@ -353,6 +353,51 @@ dc_life_log_lines: 60
 # Tailscale exists. Never stop by default — see the guard in tasks/lifecycle.yml.
 dc_confirm_stop: false
 
+# --- Agent admission -----------------------------------------------------------
+# Deploying an agent profile writes to a runtime the founder is actively using
+# from Slack. Everything here is shaped by that.
+
+# The profile to deploy. Lives in the PRIVATE dc-agent-profiles repo, not this
+# public fork: it records exact Slack workspace, channel and sender identity,
+# and TASK-223 is Internal Only.
+dc_agent_profile_path: "/home/operator/workspace/dc-agent-profiles/dc-research/openclaw.json"
+dc_agent_id: "dc-research"
+
+# Tools that MUST be denied on the deployed profile. Checked against, not
+# written — the profile is the source of truth and this is the floor it has to
+# clear. The seven session tools appear in no PRM-5 revision and were permitted
+# by omission until 2026-08-16; a profile that quietly drops them from its deny
+# list would reopen that gap without anyone noticing.
+dc_agent_required_denies:
+  - exec
+  - session_status
+  - sessions_history
+  - sessions_list
+  - sessions_send
+  - sessions_spawn
+  - subagents
+
+# THE RISK THIS FLAG EXISTS FOR.
+#
+# `agents.list` is unset on this host, which means the agent serving the
+# founder's Slack (`main`) is IMPLICIT. Writing an agents.list containing only
+# dc-research may add alongside it, or may replace the implicit default and
+# remove the founder's working agent. Which of those happens is UNKNOWN.
+#
+# This is the fifth instance of the pattern recorded four times already: a
+# control that reads as tightening and removes operability. Here it is not
+# hypothetical — main is unlisted and we are writing the list it is absent from.
+#
+# So the play refuses to deploy into an unset agents.list unless the operator
+# says so deliberately, having read the dry-run output first. Same shape as
+# dc_confirm_stop: the awkwardness is the control.
+dc_agent_accept_list_risk: false
+
+# Dry run only — patch is validated by the runtime and nothing is written.
+dc_dry_run: false
+
+dc_admission_report_dir: "/tmp"
+
 # --- Audit --------------------------------------------------------------------
 # Read-only evidence capture. See tasks/audit.yml.
 #

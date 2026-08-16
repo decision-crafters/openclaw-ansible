@@ -72,6 +72,8 @@ def load_defaults() -> dict[str, Any]:
         "dc_sandbox_workspace_access", "dc_gateway_bind",
         "dc_sandbox_scope", "dc_tools_exec_mode", "dc_sandbox_docker_network",
         "dc_plugins_deny", "dc_plugins_allow", "dc_plugins_required",
+        "dc_agent_required_denies", "dc_agent_accept_list_risk",
+        "dc_agent_profile_path", "dc_dry_run",
     ]
     missing = [key for key in required if key not in defaults]
     if missing:
@@ -216,6 +218,39 @@ def availability_floors() -> list[tuple[str, bool]]:
         ("FLOOR plugin allow-list stays inactive", PLUGINS_ALLOW == []),
         ("FLOOR slack remains a required capability", "slack" in PLUGINS_REQUIRED),
         ("FLOOR a model provider remains available", "ollama" in PLUGINS_REQUIRED),
+    ] + admission_floors()
+
+
+def admission_floors() -> list[tuple[str, bool]]:
+    """Floors on deploying an agent profile to a live, in-use runtime.
+
+    The seven session tools were permitted by omission until 2026-08-16 — they
+    appeared in no inventory, no PRM-5 revision and no deny list, and were found
+    only by asking the running agent to enumerate itself. A profile that quietly
+    dropped them from its deny list would reopen that gap, and the deploy play's
+    own assert reads the profile rather than this file, so nothing else pins the
+    requirement.
+
+    dc_agent_accept_list_risk defaults false because `agents.list` is unset on
+    the host: the agent serving the founder's Slack is IMPLICIT, and writing a
+    list it is absent from may remove it. Whether it does is not established.
+    That flag existing and defaulting false is the control; a default of true
+    would make the guard decorative.
+    """
+    required = DEFAULTS.get("dc_agent_required_denies") or []
+    session_tools = [
+        "session_status", "sessions_history", "sessions_list",
+        "sessions_send", "sessions_spawn", "subagents",
+    ]
+    return [
+        ("FLOOR admission requires exec denied", "exec" in required),
+        ("FLOOR admission requires the seven session tools denied",
+         all(t in required for t in session_tools)),
+        ("FLOOR deploying into an unset agents.list is not accepted by default",
+         DEFAULTS.get("dc_agent_accept_list_risk") is False),
+        ("FLOOR dry run is not the default", DEFAULTS.get("dc_dry_run") is False),
+        ("FLOOR the profile lives outside this public fork",
+         "dc-agent-profiles" in str(DEFAULTS.get("dc_agent_profile_path", ""))),
     ]
 
 
