@@ -380,6 +380,14 @@ dc_agent_id: ""
 # clear. The seven session tools appear in no PRM-5 revision and were permitted
 # by omission until 2026-08-16; a profile that quietly drops them from its deny
 # list would reopen that gap without anyone noticing.
+# exec plus all SEVEN session tools. `sessions_yield` was missing from this
+# list until 2026-08-16, so a profile that dropped it would have satisfied the
+# floor — and the contract check meant to catch that was missing the same one
+# while being labelled "the seven session tools denied". The check and the thing
+# checked shared an omission, so the check confirmed its own assumption.
+#
+# Surfaced by the admission harness reporting "denies all 7 required tools"
+# against a profile that denies seventeen. The count was the tell.
 dc_agent_required_denies:
   - exec
   - session_status
@@ -387,6 +395,7 @@ dc_agent_required_denies:
   - sessions_list
   - sessions_send
   - sessions_spawn
+  - sessions_yield
   - subagents
 
 # THE RISK THIS FLAG EXISTS FOR.

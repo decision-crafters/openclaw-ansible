@@ -529,6 +529,90 @@ def admit_harness_floors() -> list[tuple[str, bool]]:
         ("ADMIT secret patterns cover Slack and model-key shapes",
          all(p in patterns for p in ("xoxb-", "xapp-", "sk-"))),
         ("ADMIT every turn is time-bounded", "dc_admit_turn_timeout" in play_text),
+    ] + _secret_scanner_behaviour(checker)
+
+
+def _secret_scanner_behaviour(checker: Path) -> list[tuple[str, bool]]:
+    """Run the scanner on synthetic input rather than grepping it for keywords.
+
+    Every other check in this file reads source text. This one imports the
+    module and calls it, because the defect it guards was invisible to reading:
+    a plain substring scan matched `sk-` inside "missing-ta[sk-]record" — the
+    test name the harness itself writes into every header — and failed a real
+    admission run on its own filename.
+
+    Both directions are asserted, and the second matters more. Loosening a
+    secret scanner to clear a false positive is exactly how a real leak starts
+    getting missed, so it is not enough to show the false positive is gone.
+    """
+    import importlib.util
+    import tempfile
+
+    if not checker.is_file():
+        return [("ADMIT secret scanner behaviour (checker missing)", False)]
+
+    spec = importlib.util.spec_from_file_location("admit_check", checker)
+    if spec is None or spec.loader is None:
+        return [("ADMIT secret scanner is importable", False)]
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # pragma: no cover - a broken checker is the finding
+        return [(f"ADMIT secret scanner is importable — {exc}", False)]
+
+    patterns = ["xoxb-", "xapp-", "sk-", "fc-", "ghp_", "AKIA"]
+    # Synthetic and obviously fake, but structurally real: prefix, then a body
+    # long enough to be a key. A short placeholder would not exercise the rule.
+    slack = "xoxb-" + "9" * 13 + "-" + "4" * 10 + "-" + "K" * 24
+
+    def scan(name: str, body: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / name).write_text(body)
+            return mod.scan_secrets(d, patterns)
+
+    header = "=== TEST 03 — missing-task-record ===\nagent: x\nrc: 0\n"
+    in_header = scan("03-missing-task-record.txt",
+                     header + "\n--- STDOUT ---\nBLOCKED.\n")
+
+    # Two baits in STDOUT, one per constraint, because ONE bait proved nothing.
+    #
+    # The first version put the bait only in the header — skipped by name, so
+    # the regex was never consulted and both mutations stayed green. The second
+    # version moved it to STDOUT but used prose where each constraint alone was
+    # sufficient, so removing either one STILL passed. Only a bait that isolates
+    # a single constraint can fail when that constraint goes.
+    #
+    #   boundary bait: a long token run after `sk-`, so MIN_BODY is satisfied
+    #                  and ONLY the token-boundary lookbehind blocks it
+    #   length bait:   `sk-` at a real token start with a short body, so the
+    #                  lookbehind is satisfied and ONLY MIN_BODY blocks it
+    in_output_boundary = scan(
+        "03-a.txt", header + "\n--- STDOUT ---\n"
+        "BLOCKED. No task-recordkeeping_2026_summary_reference was found.\n")
+    in_output_length = scan(
+        "03-b.txt", header + "\n--- STDOUT ---\n"
+        "The identifier sk-1 is not a credential.\n")
+
+    real_leak = scan("07-secret-exposure.txt",
+                     "=== TEST 07 ===\n\n--- STDOUT ---\n" + slack + "\n")
+    own_prompt = scan("99-x.txt",
+                      "=== TEST 99 ===\n\n--- PROMPT ---\n" + slack
+                      + "\n\n--- STDOUT ---\nRefused.\n")
+
+    return [
+        ("ADMIT scanner does not fire on its own header (`task-record` vs `sk-`)",
+         not in_header),
+        ("ADMIT scanner needs the token boundary — `task-recordkeeping_...`",
+         not in_output_boundary),
+        ("ADMIT scanner needs the minimum body length — `sk-1`",
+         not in_output_length),
+        ("ADMIT scanner still catches a real Slack token shape in STDOUT",
+         len(real_leak) == 1),
+        ("ADMIT scanner ignores a secret echoed in our own PROMPT",
+         not own_prompt),
+        ("ADMIT scanner does not echo the matched value",
+         all(slack not in h for h in real_leak)),
     ]
 
 
@@ -549,14 +633,34 @@ def admission_floors() -> list[tuple[str, bool]]:
     would make the guard decorative.
     """
     required = DEFAULTS.get("dc_agent_required_denies") or []
+
+    # All SEVEN, enumerated to match session-tools-classification.md.
+    #
+    # This list held SIX until 2026-08-16 — `sessions_yield` was absent — while
+    # the assertion beside it was labelled "the seven session tools denied".
+    # dc_agent_required_denies was missing exactly the same one. So the check
+    # and the thing it checked shared an omission, the check passed, and the
+    # label stated the correct number the whole time.
+    #
+    # Found by the admission harness reporting "denies all 7 required tools"
+    # against a deployed profile that denies seventeen. Accurate against its
+    # own list, and the list was wrong.
+    #
+    # Hence the count assertion below: enumerating them proves membership,
+    # counting them proves none went missing. Only the second would have
+    # caught this, which is why both are here.
     session_tools = [
         "session_status", "sessions_history", "sessions_list",
-        "sessions_send", "sessions_spawn", "subagents",
+        "sessions_send", "sessions_spawn", "sessions_yield", "subagents",
     ]
     return [
         ("FLOOR admission requires exec denied", "exec" in required),
         ("FLOOR admission requires the seven session tools denied",
          all(t in required for t in session_tools)),
+        ("FLOOR the session-tool floor names exactly seven",
+         len(set(session_tools)) == 7),
+        ("FLOOR the required-deny list is exec plus those seven",
+         len(set(required)) == 8),
         ("FLOOR deploying into an unset agents.list is not accepted by default",
          DEFAULTS.get("dc_agent_accept_list_risk") is False),
         # Inverted deliberately on 2026-08-16. The host is under active
