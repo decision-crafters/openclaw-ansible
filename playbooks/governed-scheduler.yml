@@ -1,0 +1,65 @@
+---
+# Scheduling grants — prepare, apply, disable.
+#
+# Decision Crafters posture is NO_SCHEDULER by default (TASK-229, accepted
+# 2026-08-16). Agent admission, tool access, communication binding and the
+# ability to perform the underlying work confer NO scheduling authority.
+#
+# Three plays, in the order they exist for:
+#
+#   --tags scheduler-prepare   validate a grant, render the plan. Writes
+#                              nothing. This is the whole of what a manager
+#                              agent's authority reaches.
+#   --tags scheduler-apply     create the job. Two gates, and today it cannot
+#                              pass either way — validation requires an accepted
+#                              decision record and none exists.
+#   --tags scheduler-disable   the reversal, written before the apply.
+#
+# Prepare comes first in the file because it comes first in the process, and
+# because a reader looking for "how do I schedule something" should meet the
+# validation before the write.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+# Read-only, so no apply gate — the same reasoning as governed-audit.yml and
+# the admission suite. Gating a read behind a dry-run flag only means the check
+# never gets run.
+- name: Prepare a scheduling grant
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Validate the grant and render what it would do
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: scheduler_prepare
+  tags:
+    - scheduler-prepare
+
+# A scheduled job is the only thing this repository can create that acts on its
+# own afterwards, survives a Gateway restart, and is NOT reversed by rolling
+# back openclaw.json. Hence the second gate, and hence the disable play.
+- name: Apply an accepted scheduling grant
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Create the native job for the approved worker
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: scheduler_apply
+  tags:
+    - scheduler-apply
+
+- name: Disable a scheduled job
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Reverse an applied grant
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: scheduler_disable
+  tags:
+    - scheduler-disable

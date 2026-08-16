@@ -390,6 +390,18 @@ dc_agent_id: ""
 # against a profile that denies seventeen. The count was the tell.
 dc_agent_required_denies:
   - exec
+  # The two Automation tools. `cron` was in the Gateway-wide deny list from the
+  # start but not in this per-agent FLOOR, and `heartbeat_respond` was in
+  # neither — permitted by omission, which is exactly how the seven session
+  # tools went unnoticed until an agent was asked to enumerate itself.
+  #
+  # Denying them is the worker half of the accepted posture. It stops the agent
+  # MANAGING schedules. TASK-229 verified against pinned v2026.7.1 source that
+  # it does NOT stop an operator creating a Gateway job that TARGETS this agent
+  # — which is the whole point: least privilege for the worker, scheduling
+  # authority somewhere else entirely.
+  - cron
+  - heartbeat_respond
   - session_status
   - sessions_history
   - sessions_list
@@ -666,6 +678,33 @@ dc_audit_paths:
   # gateway-global, no per-channel override
   - messages.ackReactionScope
   - messages.statusReactions
+  # --- persistent-operation surface ------------------------------------------
+  #
+  # Absent from this list until 2026-08-16, and the omission made the accepted
+  # NO_SCHEDULER posture unevidenceable. TASK-225 states it directly: "a
+  # NO_SCHEDULER policy cannot be evidenced solely by tools.deny:['cron']; it
+  # also requires proof that no unauthorized Gateway job exists for that
+  # workload." Nothing here read the scheduler at all, so that proof could not
+  # be produced — only asserted.
+  #
+  # `cron` in an agent's deny list and the Gateway `cron` subsystem are
+  # DIFFERENT LAYERS. TASK-229 verified against pinned v2026.7.1 source that a
+  # denied cron TOOL stops the agent managing schedules and does not disable the
+  # scheduler, remove jobs, stop an operator creating one, or stop a job
+  # targeting that agent. Auditing one and not the other reads as coverage.
+  - cron
+  - cron.enabled
+  # Upstream labels triggers "Dangerous: enables headless scripts". Must stay
+  # false; audited so that staying false is observed rather than assumed.
+  - cron.triggers.enabled
+  - hooks
+  - hooks.enabled
+  # The per-agent narrowing for the event-driven path.
+  - hooks.allowedAgentIds
+  # Heartbeat is PER-AGENT, not gateway-global — agents.defaults.heartbeat and
+  # agents.list[].heartbeat. Recorded because this session initially had it
+  # wrong in the other direction.
+  - agents.defaults.heartbeat
 
 dc_audit_report_owner: "{{ lookup('env', 'SUDO_USER') | default('tosin', true) }}"
 dc_audit_report: "/tmp/openclaw-audit-{{ ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt"
@@ -819,3 +858,33 @@ dc_sandbox_documented_mounts:
   ro: /agent
   rw: /workspace
   none: ""
+
+# --- Scheduling grants ---------------------------------------------------------
+# See tasks/scheduler_prepare.yml, scheduler_apply.yml, scheduler_disable.yml.
+#
+# NO_SCHEDULER is the accepted default (TASK-229, 2026-08-16). Admission, tool
+# access, communication binding and the ability to do the underlying work confer
+# no scheduling authority. Nothing here creates a schedule.
+
+# No default path. A grant names a task, a worker and a cadence, so it is a
+# deployment binding and belongs in the private inventory repository beside
+# host_vars — never in this public one. The plays refuse when it is unset.
+dc_grant_path: ""
+
+dc_grant_schema_path: "{{ role_path }}/files/scheduler-grant.schema.json"
+dc_grant_staging_path: "/root/.dc-scheduler-grant.json"
+dc_grant_profile_staging_path: "/root/.dc-scheduler-profile.json"
+
+# The second gate on tasks/scheduler_apply.yml, beyond the repository-wide
+# dc_apply. Same shape as dc_confirm_stop and dc_agent_accept_list_risk: the
+# awkwardness IS the control.
+#
+# A schedule earns it by being the only thing this repository can create that
+# ACTS ON ITS OWN AFTERWARDS. Every other write changes what the runtime would
+# do if asked; a job changes what it does unasked, on a clock, until removed —
+# and it survives restarts and is not reversed by a config rollback.
+dc_scheduler_accept: false
+
+# Named for --tags scheduler-disable. Unset so the reversal refuses to guess
+# which job an operator meant.
+dc_scheduler_job_id: ""

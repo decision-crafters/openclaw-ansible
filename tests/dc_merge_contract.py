@@ -739,6 +739,105 @@ def _inject_exit(mod, work: list[str], transcript: bool = False) -> int:
             sys.argv = argv
 
 
+def scheduler_floors() -> list[tuple[str, bool]]:
+    """The accepted NO_SCHEDULER posture, expressed as things that must hold.
+
+    TASK-229 is Complete/Accepted and Decision Memory carries the amendments,
+    but until 2026-08-16 the entire mechanical trace of that posture was one
+    line — `cron` in dc_tools_deny. A posture with no enforcement is a sentence,
+    and the sentence was already written.
+
+    What is pinned here is the SEPARATION, not the schedule: a grant cannot be
+    self-accepted, cannot widen the worker it targets, cannot carry delivery
+    authority it was not given, and cannot exist without a stop condition. The
+    apply path is deliberately unreachable — no accepted grant exists — and one
+    check below asserts that the default stays that way.
+    """
+    d = load_defaults()
+    role_files = ROLE / "files"
+    tasks = ROLE / "tasks"
+
+    schema_path = role_files / "scheduler-grant.schema.json"
+    validator = role_files / "validate_grant.py"
+    apply_play = tasks / "scheduler_apply.yml"
+    disable_play = tasks / "scheduler_disable.yml"
+    prepare_play = tasks / "scheduler_prepare.yml"
+
+    schema: dict[str, Any] = {}
+    if schema_path.is_file():
+        try:
+            schema = json.loads(schema_path.read_text())
+        except json.JSONDecodeError:
+            schema = {}
+
+    apply_text = apply_play.read_text(errors="ignore") if apply_play.is_file() else ""
+    audit_paths = d.get("dc_audit_paths", [])
+    required = d.get("dc_agent_required_denies") or []
+
+    props = schema.get("properties", {})
+    lifecycle_req = props.get("lifecycle", {}).get("required", [])
+    authority_req = props.get("authority", {}).get("required", [])
+
+    return [
+        ("SCHEDULER the grant contract exists", schema_path.is_file()),
+        ("SCHEDULER the validator exists", validator.is_file()),
+        ("SCHEDULER prepare and apply are separate plays",
+         prepare_play.is_file() and apply_play.is_file()),
+        # Written before the thing it reverses, as remove_agent.yml was. A
+        # scheduled job is the case where it matters most: it survives a restart
+        # and a config rollback does not reach it.
+        ("SCHEDULER the disable path exists", disable_play.is_file()),
+        # The two defaults that keep the apply path shut.
+        ("SCHEDULER writes require the repo-wide dry-run flag",
+         d.get("dc_apply") is False),
+        ("SCHEDULER apply requires its own second confirmation",
+         d.get("dc_scheduler_accept") is False),
+        # A grant names a task, a worker and a cadence — a deployment binding.
+        ("SCHEDULER no grant path is baked into this public repo",
+         d.get("dc_grant_path") == ""),
+        # Every rule below is one JSON Schema can express; the cross-field rules
+        # live in the validator and are proven in tests/dc_scheduler_grant.py.
+        ("SCHEDULER a grant cannot carry undeclared fields",
+         schema.get("additionalProperties") is False),
+        ("SCHEDULER a STOP condition is required",
+         "stop_condition" in lifecycle_req),
+        ("SCHEDULER a disable command is required",
+         "disable_command" in lifecycle_req),
+        ("SCHEDULER an expiry is required", "expires_on" in lifecycle_req),
+        ("SCHEDULER an accepted decision record is required",
+         "decision_memory_page_id" in authority_req),
+        # An agent filling in its own name here is the failure the whole
+        # contract exists to prevent, so acceptance is a constant not a string.
+        ("SCHEDULER only the founder can be the acceptance authority",
+         props.get("authority", {}).get("properties", {})
+              .get("accepted_by", {}).get("const") == "Tosin Akinosho"),
+        # Execute is absent from the requester enum by construction: a manager
+        # holding it cannot be expressed, so it cannot be accepted.
+        ("SCHEDULER a requesting role cannot claim Execute",
+         "Execute" not in (props.get("requesting_role", {}).get("properties", {})
+                           .get("authority_class", {}).get("items", {})
+                           .get("enum", []))),
+        ("SCHEDULER all three accepted mechanisms are modelled",
+         set(props.get("mechanism", {}).get("enum", []))
+         == {"AUTOMATION", "HEARTBEAT", "EVENT_TRIGGER"}),
+        # The audit gap that made the posture unevidenceable. TASK-225: a
+        # NO_SCHEDULER policy cannot be evidenced solely by tools.deny:['cron']
+        # — it also needs proof that no unauthorized Gateway job exists.
+        ("SCHEDULER the scheduler surface is audited",
+         all(p in audit_paths for p in
+             ("cron", "cron.enabled", "cron.triggers.enabled", "hooks",
+              "agents.defaults.heartbeat"))),
+        ("SCHEDULER both Automation tools are on the worker floor",
+         "cron" in required and "heartbeat_respond" in required),
+        # The apply play must state, in the file, that a config rollback does
+        # not reverse a scheduled job. Getting that wrong on a bad day is how a
+        # job outlives the grant that authorised it.
+        ("SCHEDULER apply records that a config rollback does not reverse it",
+         "rollback does not reverse" in apply_text
+         or "NOT reversed by a config rollback" in apply_text),
+    ]
+
+
 def admission_floors() -> list[tuple[str, bool]]:
     """Floors on deploying an agent profile to a live, in-use runtime.
 
@@ -782,8 +881,16 @@ def admission_floors() -> list[tuple[str, bool]]:
          all(t in required for t in session_tools)),
         ("FLOOR the session-tool floor names exactly seven",
          len(set(session_tools)) == 7),
-        ("FLOOR the required-deny list is exec plus those seven",
-         len(set(required)) == 8),
+        # exec + seven session tools + the two Automation tools.
+        #
+        # cron and heartbeat_respond joined the floor on 2026-08-16 when the
+        # accepted NO_SCHEDULER posture was implemented. cron had been in the
+        # Gateway-wide deny list but not in this per-agent floor;
+        # heartbeat_respond was in neither, permitted by omission.
+        ("FLOOR both Automation tools are denied to workers",
+         all(t in required for t in ("cron", "heartbeat_respond"))),
+        ("FLOOR the required-deny list is exec, seven session tools, two automation",
+         len(set(required)) == 10),
         ("FLOOR deploying into an unset agents.list is not accepted by default",
          DEFAULTS.get("dc_agent_accept_list_risk") is False),
         # Inverted deliberately on 2026-08-16. The host is under active
@@ -939,7 +1046,7 @@ def main() -> int:
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + workspace_floors() + admit_harness_floors() + injection_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + workspace_floors() + admit_harness_floors() + injection_floors() + scheduler_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

@@ -113,6 +113,42 @@
     label: "{{ item }}"
   when: "'get' in dc_audit_verbs"
 
+# --- scheduled jobs -----------------------------------------------------------
+#
+# `config get cron` reports the SUBSYSTEM's configuration. It does not list the
+# JOBS, which live in Gateway runtime state and survive restarts. Reading only
+# the config would report "cron.enabled: false" or "<unset>" and leave an
+# existing job invisible — an audit that answers a neighbouring question and
+# looks like it answered this one.
+#
+# TASK-225: "a NO_SCHEDULER policy cannot be evidenced solely by
+# tools.deny:['cron']; it also requires proof that no unauthorized Gateway job
+# exists for that workload." This task is that proof, or its absence.
+#
+# Bounded and failure-tolerant on purpose. `cron list` may not exist on every
+# build, and an unrecognised subcommand can wait on stdin — that is how the
+# plugin probe hung on 2026-08-15.
+- name: List the Gateway's scheduled jobs
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_audit_cron
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# rc != 0 is NOT "no jobs". It is "this build did not answer", which is an
+# UNKNOWN and must read as one — an empty list and an unanswered question look
+# identical in a report unless the report says which it is.
+- name: Classify what the scheduler answered
+  ansible.builtin.set_fact:
+    dc_audit_cron_state: >-
+      {{ 'UNKNOWN — `cron list` returned rc=' ~ (dc_audit_cron.rc | default('?'))
+            ~ '; this is NOT evidence that no job exists'
+         if (dc_audit_cron.rc | default(1)) != 0
+         else ('no scheduled jobs reported'
+               if (dc_audit_cron.stdout | default('') | trim | length) == 0
+               else 'SCHEDULED JOBS PRESENT — read them against the accepted grants') }}
+
 # --- report -------------------------------------------------------------------
 # Redacted by value SHAPE, not by key name. None of dc_audit_paths should return
 # a credential, but a future path might, and a key-name denylist misses the key
@@ -151,6 +187,22 @@
           | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>')) | indent(2, true) }}
       {% endif %}
       {% endfor %}
+
+      === scheduled jobs (persistent operation) ===
+      {{ dc_audit_cron_state | default('not probed') }}
+
+      {{ (dc_audit_cron.stdout | default('') | trim) | indent(2, true) }}
+      {{ (dc_audit_cron.stderr | default('') | trim) | indent(2, true) }}
+
+      Decision Crafters posture is NO_SCHEDULER by default (TASK-229, accepted
+      2026-08-16). Any job listed above must correspond to an accepted
+      workload-specific scheduling grant naming the target agent, cadence,
+      payload, evidence destination and STOP condition. A job with no such
+      grant is a finding, not a configuration.
+
+      A denied `cron` TOOL does not prevent any of this. It stops the AGENT
+      managing schedules; the Gateway scheduler and an operator remain able to
+      create a job that targets that same agent.
 
       === reading these — IMPORTANT ===
       `<unset>` DOES NOT MEAN INACTIVE. There is a proven counterexample on this
