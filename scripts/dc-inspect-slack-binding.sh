@@ -193,31 +193,114 @@ echo
 # The enum is the honest answer to "is 'open' as broad as it sounds". Reading the
 # value and inferring from the word would be exactly the mistake that put an IP
 # address into gateway.bind, which is also an enum.
-echo "  --- what values groupPolicy actually accepts (from the live schema) ---"
+# The whole channels.slack subtree, not just groupPolicy.
+#
+# The first version printed groupPolicy's enum and stopped, which answered "how
+# broad is 'open'" (three values: open, disabled, allowlist) and left the
+# question that actually matters unanswered: **where does the allowlist live?**
+#
+# `groupPolicy: "allowlist"` names a policy. It does not say which key holds the
+# permitted entries, whether those entries are channel IDs or user IDs, or
+# whether DMs fall under "group" at all — the name suggests group conversations,
+# so direct messages may be governed by a different key or not gated here.
+#
+# Setting the policy without knowing where the list lives risks an allowlist that
+# is empty by omission, which denies everything. That is the `plugins.allow: []`
+# trap in a different key, and the founder reaches this Gateway from a phone
+# through Slack — so the failure mode is losing access to the runtime, silently.
+#
+# Reading every key beats inferring from one. Descriptions are printed in full
+# because the enum told us less than the wording will.
+echo "  --- channels.slack schema subtree (from the live schema) ---"
 OC_ENTRY="$(awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}' \
   "$OC_HOME/.config/systemd/user/$UNIT" 2>/dev/null)"
 if [ -n "${OC_ENTRY:-}" ]; then
-  runuser -u "$OC_USER" -- /usr/bin/node "$OC_ENTRY" config schema 2>/dev/null \
-  | python3 -c "
-import json,sys
-try: s=json.load(sys.stdin)
-except Exception: print('    could not read schema'); raise SystemExit
-defs=s.get('\$defs') or s.get('definitions') or {}
-def deref(n,d=0):
-    while isinstance(n,dict) and '\$ref' in n and d<30:
-        n=defs.get(n['\$ref'].split('/')[-1],{}); d+=1
-    return n or {}
-n=deref(s)
-for p in ('channels','slack','groupPolicy'):
-    n=deref((n.get('properties') or {}).get(p,{}))
-    if not n: print(f'    path stops at {p!r} — key not in schema under channels.slack'); raise SystemExit
-vals=n.get('enum')
-if not vals:
-    for b in (n.get('anyOf') or n.get('oneOf') or []):
-        b=deref(b); vals=(vals or [])+b.get('enum',[])
-print('    groupPolicy allowed values:', vals or '<not enum-constrained>')
-print('    description:', (n.get('description') or '<none>')[:400])
-"
+  SCHEMA_TMP="$(mktemp)"
+  runuser -u "$OC_USER" -- timeout 30 /usr/bin/node "$OC_ENTRY" config schema \
+    </dev/null >"$SCHEMA_TMP" 2>/dev/null
+  python3 - "$SCHEMA_TMP" <<'PY'
+import json, sys
+
+try:
+    schema = json.load(open(sys.argv[1]))
+except Exception as exc:
+    print(f"    could not read schema ({exc.__class__.__name__})")
+    raise SystemExit
+
+defs = schema.get("$defs") or schema.get("definitions") or {}
+
+
+def deref(node, depth=0):
+    while isinstance(node, dict) and "$ref" in node and depth < 30:
+        node = defs.get(node["$ref"].split("/")[-1], {})
+        depth += 1
+    return node or {}
+
+
+def enum_of(node):
+    if "enum" in node:
+        return list(node["enum"])
+    values = []
+    for branch in (node.get("anyOf") or node.get("oneOf") or []):
+        branch = deref(branch)
+        values.extend(branch.get("enum", []))
+        if "const" in branch:
+            values.append(branch["const"])
+    return values or None
+
+
+node = deref(schema)
+for part in ("channels", "slack"):
+    node = deref((node.get("properties") or {}).get(part, {}))
+    if not node:
+        print(f"    path stops at {part!r} — not in the schema")
+        raise SystemExit
+
+props = node.get("properties") or {}
+if not props:
+    print("    channels.slack has no declared properties (free-form object)")
+    raise SystemExit
+
+
+def describe(name, spec, indent="    "):
+    spec = deref(spec)
+    kind = spec.get("type") or ("enum" if enum_of(spec) else "?")
+    line = f"{indent}{name}: {kind}"
+    values = enum_of(spec)
+    if values:
+        line += f"  enum={values}"
+    if "default" in spec:
+        line += f"  default={spec['default']!r}"
+    print(line)
+    desc = spec.get("description")
+    if desc:
+        print(f"{indent}  ↳ {desc}")
+    # One level down: this is where an allowlist's item type would be declared.
+    if spec.get("type") == "array":
+        items = deref(spec.get("items", {}))
+        item_enum = enum_of(items)
+        print(f"{indent}  items: {items.get('type') or '?'}"
+              + (f"  enum={item_enum}" if item_enum else ""))
+        if items.get("description"):
+            print(f"{indent}    ↳ {items['description']}")
+    for sub_name, sub_spec in sorted((spec.get("properties") or {}).items()):
+        describe(sub_name, sub_spec, indent + "    ")
+
+
+for name, spec in sorted(props.items()):
+    describe(name, spec)
+
+# Named explicitly because these are the keys the bounded posture needs and the
+# ones most likely to be absent. "Not found" here is itself the finding: it
+# means the control does not exist under the name we assumed, and the posture
+# must be built from what IS declared above rather than from what we expected.
+print()
+print("    keys the bounded posture depends on:")
+for wanted in ("groupPolicy", "allowedChannels", "channels", "allowlist",
+               "allowedUsers", "users", "dm", "dmPolicy", "allowedTeams"):
+    print(f"      {wanted}: {'PRESENT' if wanted in props else 'not declared'}")
+PY
+  rm -f "$SCHEMA_TMP"
 else
   echo "    could not locate the OpenClaw entrypoint; schema not consulted"
 fi
@@ -345,6 +428,72 @@ else:
     if not ch:
         print('    none — the app is installed but joined to nothing.')
 "
+else
+  echo "  Skipped — no token. UNKNOWN."
+fi
+echo
+
+# --- 4b. Who is on the other end of each DM ---------------------------------
+# The bounded posture must NAME the founder's DM and exclude the other, which
+# is impossible while both are opaque IDs.
+#
+# This cannot be answered from the Claude Slack connector: its
+# list_channel_members explicitly does not support DMs. The bot's own token can,
+# via conversations.members, so the credential already being documented here is
+# the only thing that can close the question.
+#
+# Participants only. conversations.history is NOT called and no message content
+# is read — identifying who a conversation is with does not require reading what
+# was said in it, and the second is a much larger intrusion than this task needs.
+echo "=== 4b. DM participants (identity only, no message content) ================="
+if [ -n "${TOKEN:-}" ]; then
+  DM_IDS="$(curl -s -X POST https://slack.com/api/users.conversations \
+    -H "Authorization: Bearer $TOKEN" -d "types=im&limit=200" 2>/dev/null \
+    | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+if d.get('ok'):
+    print(' '.join(c['id'] for c in d.get('channels',[])))
+")"
+  if [ -z "${DM_IDS:-}" ]; then
+    echo "  No DMs returned, or the token lacks im:read. UNKNOWN — not 'no DMs'."
+  fi
+  for dm in ${DM_IDS:-}; do
+    members="$(curl -s -X POST https://slack.com/api/conversations.members \
+      -H "Authorization: Bearer $TOKEN" -d "channel=$dm&limit=50" 2>/dev/null \
+      | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+print(' '.join(d.get('members',[])) if d.get('ok') else 'ERR:'+str(d.get('error')))
+")"
+    case "$members" in
+      ERR:*) echo "  $dm -> could not list members (${members#ERR:})"; continue ;;
+    esac
+    names=""
+    for uid in $members; do
+      who="$(curl -s -X POST https://slack.com/api/users.info \
+        -H "Authorization: Bearer $TOKEN" -d "user=$uid" 2>/dev/null \
+        | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+if not d.get('ok'): print('?'); raise SystemExit
+u=d['user']
+tag='bot' if u.get('is_bot') else 'human'
+print(f\"{u.get('name','?')}[{tag}]\")
+")"
+      names="$names ${uid}=${who:-?}"
+    done
+    echo "  $dm ->$names"
+  done
+  echo
+  echo "  The founder's DM is the one containing U0EXAMPLE01 (tosin.akinosho)."
+  echo "  That conversation MUST appear in dc_slack_required_conversations."
+  echo "  Founder confirmed 2026-08-16 that the access path is channel AND DM,"
+  echo "  device-dependent — so excluding DMs as a class would sever the phone"
+  echo "  path this whole governance decision exists to protect."
 else
   echo "  Skipped — no token. UNKNOWN."
 fi
