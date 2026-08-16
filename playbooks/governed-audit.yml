@@ -1,0 +1,25 @@
+---
+# Read-only OpenClaw configuration audit.
+#
+#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-audit.yml \
+#     -e ansible_become=false
+#
+# Writes nothing but its own report. No config change, no restart, no plugin
+# change. Safe to run at any time, including while the Gateway is serving Slack.
+#
+# Replaces ad-hoc command pasting. Ad-hoc works once: it produces no re-runnable
+# receipt, cannot be diffed against a previous run, and omits whatever the
+# person typing did not think to ask for — which is how eleven outbound-write
+# keys and seven session tools stayed invisible for days.
+
+- name: Audit the OpenClaw configuration
+  hosts: localhost
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the read-only audit
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: audit
+  tags:
+    - audit

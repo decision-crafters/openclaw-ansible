@@ -1,0 +1,153 @@
+---
+# Read-only OpenClaw configuration auditor.
+#
+# Run: sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-audit.yml \
+#        -e ansible_become=false
+#
+# Exists because every piece of evidence in this workstream so far was gathered
+# by pasting ad-hoc commands into a terminal and copying the output back. That
+# works once. It does not produce a receipt anyone can re-run, it cannot be
+# diffed against a previous run, and it silently omits whatever the person
+# typing it did not think to ask for — which is how eleven outbound-write keys
+# and seven session tools stayed invisible for days.
+#
+# WRITES NOTHING. No config change, no restart, no plugin enable/disable. The
+# only file it creates is its own report. That is asserted, not just intended:
+# every command below is `config validate` or `config get`, both read-only, and
+# `changed_when: false` throughout.
+#
+# Uses the runtime's own validator rather than this role's. `openclaw config
+# validate` checks the WHOLE merged config; files/validate_overlay.py only ever
+# checked the keys this role writes. That distinction was recorded as an open
+# residual before anyone ran `openclaw config --help`.
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_audit_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+# Verb existence is checked, not assumed. `plugins list` was assumed to exist,
+# was not a real subcommand, and hung on stdin rather than erroring — costing a
+# debugging session and leaving a criterion UNCONFIRMED. One --help would have
+# prevented it, so this asks first.
+- name: Discover the config subcommands this build actually has
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', '--help'] }}"
+  register: dc_audit_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to audit a build whose config verbs are unknown
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw config --help` did not return usable output
+      (rc={{ dc_audit_help.rc | default('?') }}). Refusing to run verbs that may
+      not exist on this build — an unrecognised subcommand does not necessarily
+      error here, it can wait on stdin, which is how the plugin probe hung.
+  when:
+    - (dc_audit_help.rc | default(1)) != 0 or (dc_audit_help.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Record which verbs are available
+  ansible.builtin.set_fact:
+    dc_audit_verbs: >-
+      {{ ['file', 'get', 'patch', 'schema', 'set', 'unset', 'validate']
+         | select('in', dc_audit_help.stdout) | list }}
+
+# --- the whole-config check ---------------------------------------------------
+- name: Validate the entire live config against the schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_audit_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: "'validate' in dc_audit_verbs"
+
+# --- effective values ---------------------------------------------------------
+# `config get` returns the EFFECTIVE value — after merge and after defaults —
+# which is the only thing that answers "what is in force". Reading the config
+# file answers "what was written", and dumping the schema answers "what is
+# legal". Three different questions; only this one is about the running system.
+- name: Read each audited path
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+  register: dc_audit_values
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: "{{ dc_audit_paths }}"
+  loop_control:
+    label: "{{ item }}"
+  when: "'get' in dc_audit_verbs"
+
+# --- report -------------------------------------------------------------------
+# Redacted by value SHAPE, not by key name. None of dc_audit_paths should return
+# a credential, but a future path might, and a key-name denylist misses the key
+# someone named differently. Over-redaction is the safe direction.
+- name: Render the audit report
+  ansible.builtin.copy:
+    dest: "{{ dc_audit_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      OPENCLAW CONFIGURATION AUDIT
+      host={{ ansible_facts['nodename'] }}  generated={{ ansible_facts['date_time'].iso8601 }}
+      read-only: no config written, no restart, no plugin change
+
+      === config verbs available on this build ===
+        {{ dc_audit_verbs | join(', ') }}
+
+      === whole-config validation (runtime's own validator) ===
+      {% if 'validate' in dc_audit_verbs %}
+        rc={{ dc_audit_validate.rc | default('?') }}
+      {{ (dc_audit_validate.stdout | default('')) | trim | indent(2, true) }}
+      {{ (dc_audit_validate.stderr | default('')) | trim | indent(2, true) }}
+      {% else %}
+        `config validate` not available on this build — NOT the same as validated.
+      {% endif %}
+
+      === effective values ===
+      {% for r in dc_audit_values.results | default([]) %}
+      --- {{ r.item }} ---
+      {% if (r.rc | default(1)) != 0 %}
+        <unset, or path not present>  rc={{ r.rc | default('?') }}
+      {% else %}
+      {{ (r.stdout | default('') | trim | regex_replace('(xox[abposr]-[A-Za-z0-9-]+)', '<REDACTED>')
+          | regex_replace('(xapp-[A-Za-z0-9-]+)', '<REDACTED>')
+          | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>')) | indent(2, true) }}
+      {% endif %}
+      {% endfor %}
+
+      === reading these ===
+      An empty or absent value is NOT an inactive control. It means the runtime
+      is using a default nobody chose. Under channels.slack exactly four keys
+      declare a schema default, so for most of them the effective behaviour lives
+      in code and documentation rather than in the schema.
+  changed_when: false
+
+- name: Summarise the audit outcome
+  ansible.builtin.set_fact:
+    dc_audit_ok: >-
+      {{ dc_audit_values.results | default([])
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | list | length }}
+    dc_audit_validate_state: >-
+      {{ ('rc=' ~ (dc_audit_validate.rc | default('?')))
+         if 'validate' in dc_audit_verbs else 'UNAVAILABLE' }}
+
+- name: Emit the audit receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-OPENCLAW AUDIT |
+      verbs={{ dc_audit_verbs | join(',') }} |
+      config_validate={{ dc_audit_validate_state }} |
+      paths_read={{ dc_audit_ok }}/{{ dc_audit_paths | length }} |
+      report={{ dc_audit_report }} (0600, {{ dc_audit_report_owner }}) |
+      wrote_no_config=true restarted_nothing=true

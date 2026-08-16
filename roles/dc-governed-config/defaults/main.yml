@@ -353,6 +353,73 @@ dc_life_log_lines: 60
 # Tailscale exists. Never stop by default — see the guard in tasks/lifecycle.yml.
 dc_confirm_stop: false
 
+# --- Audit --------------------------------------------------------------------
+# Read-only evidence capture. See tasks/audit.yml.
+#
+# The CLI invocation. `openclaw` resolves on the service account's PATH via a
+# login shell; the entrypoint is not hardcoded because the real path embeds a
+# version and a content hash and changes on upgrade.
+dc_audit_cli:
+  - "{{ dc_runuser }}"
+  - -u
+  - "{{ dc_openclaw_user }}"
+  - --
+  - /usr/bin/env
+  - "XDG_RUNTIME_DIR=/run/user/{{ dc_audit_uid | default('') }}"
+  - "HOME={{ dc_openclaw_home }}"
+  - bash
+  - -lc
+  - openclaw
+
+# Paths read with `openclaw config get`, which returns the EFFECTIVE value —
+# after merge and after defaults. That is the only question about the running
+# system; the config file answers what was written and the schema answers what
+# is legal.
+#
+# The list is deliberately wider than the keys this role writes. Every gap found
+# in this workstream was a key nobody thought to look at: seven session tools
+# permitted by omission, eleven outbound-write keys unset, and
+# messages.ackReactionScope which is not even under channels.slack.
+dc_audit_paths:
+  # governance surface this role owns
+  - agents.defaults.sandbox
+  - agents.list
+  - tools.allow
+  - tools.deny
+  - tools.exec.mode
+  - tools.elevated.enabled
+  - gateway.bind
+  - plugins.allow
+  - plugins.deny
+  - plugins.enabled
+  - plugins.bundledDiscovery
+  # Slack binding
+  - channels.slack.groupPolicy
+  - channels.slack.channels
+  - channels.slack.dmPolicy
+  - channels.slack.allowFrom
+  - channels.slack.botLoopProtection
+  # outbound-write keys — none of these is gated by agent tool policy
+  - channels.slack.ackReaction
+  - channels.slack.typingReaction
+  - channels.slack.streaming
+  - channels.slack.actions
+  - channels.slack.reactionNotifications
+  - channels.slack.heartbeat
+  - channels.slack.slashCommand
+  - channels.slack.unfurlLinks
+  - channels.slack.responsePrefix
+  # approval routing — channel-layer, where agent-layer exec denial does not reach
+  - channels.slack.execApprovals
+  - commands.ownerAllowFrom
+  - approvals
+  # gateway-global, no per-channel override
+  - messages.ackReactionScope
+  - messages.statusReactions
+
+dc_audit_report_owner: "{{ lookup('env', 'SUDO_USER') | default('tosin', true) }}"
+dc_audit_report: "/tmp/openclaw-audit-{{ ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt"
+
 # --- Behaviour ---------------------------------------------------------------
 # Refuse rather than proceed when the config is missing or unparseable. A merge
 # that silently creates a file would be clobbered by the next onboarding run,
