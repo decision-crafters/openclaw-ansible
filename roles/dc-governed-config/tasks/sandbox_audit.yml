@@ -251,11 +251,83 @@
     - (dc_sb_write_probe.rc | default(1)) == 0
     - dc_fail_closed | bool
 
+# Network egress. Test 10's other half — the read-only probe above covers the
+# workspace half.
+#
+# Two questions, deliberately, because they can disagree. The runtime's declared
+# NetworkMode is what was configured; a resolution attempt from inside the
+# container is what is in force. `plugins.deny` taught this exact lesson: the
+# only claim worth making is the observed one.
+#
+# `getent hosts` rather than curl or wget — it is glibc, present in a slim
+# Debian image, and needs no package that a hardened base might omit. A probe
+# that fails because the tool is missing looks identical to a probe that fails
+# because egress is blocked, and only one of those is a control.
+- name: Ask the runtime what network the sandbox is on
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['inspect', dc_sb_names | first,
+                               '--format', '{{.HostConfig.NetworkMode}}'] }}"
+  register: dc_sb_netmode
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: dc_sb_names | length > 0
+
+- name: Confirm the probe tool exists before trusting its failure
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['exec', dc_sb_names | first, 'which', 'getent'] }}"
+  register: dc_sb_getent
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: dc_sb_names | length > 0
+
+- name: Attempt outbound name resolution from inside the sandbox
+  ansible.builtin.command:
+    argv: "{{ dc_docker_env + ['exec', dc_sb_names | first,
+                               'getent', 'hosts', 'example.com'] }}"
+  register: dc_sb_egress
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when:
+    - dc_sb_names | length > 0
+    - (dc_sb_getent.rc | default(1)) == 0
+
+- name: Refuse to report egress blocked when the probe could not run
+  ansible.builtin.debug:
+    msg: >-
+      DC-SANDBOX EGRESS | NOT EXERCISED — `getent` is absent from the image, so
+      a failed resolution would prove nothing about the network. Declared
+      NetworkMode is {{ dc_sb_netmode.stdout | default('?') | trim }}, which is
+      configuration, not observation.
+  when:
+    - dc_sb_names | length > 0
+    - (dc_sb_getent.rc | default(1)) != 0
+
+- name: Refuse a sandbox that can reach the network
+  ansible.builtin.fail:
+    msg: >-
+      Outbound name resolution SUCCEEDED from inside {{ dc_sb_names | first }}
+      while docker.network is '{{ dc_sandbox_docker_network }}' and the declared
+      NetworkMode is {{ dc_sb_netmode.stdout | default('?') | trim }}.
+      The egress control this profile depends on is not in force.
+  when:
+    - dc_sb_egress is defined
+    - dc_sb_egress is not skipped
+    - (dc_sb_egress.rc | default(1)) == 0
+    - dc_fail_closed | bool
+
 - name: Summarise the readings
   ansible.builtin.set_fact:
     dc_sb_readable: >-
       {{ dc_sb_reads.results | default([]) | selectattr('rc', 'defined')
          | selectattr('rc', 'equalto', 0) | list | length }}
+    dc_sb_egress_verdict: >-
+      {{ 'NOT EXERCISED (getent absent)'
+         if (dc_sb_getent.rc | default(1)) != 0
+         else ('BLOCKED (correct)' if (dc_sb_egress.rc | default(1)) != 0
+               else 'REACHABLE — EGRESS CONTROL NOT IN FORCE') }}
     dc_sb_ro_verdict: >-
       {{ 'not probed (workspaceAccess is not ro)'
          if (dc_sb_write_probe is skipped or dc_sb_write_probe.rc is not defined)
@@ -271,6 +343,8 @@
       workspace_mountpoint={{ dc_sb_mountpoints | default([]) | join(', ') | default('none', true) }} |
       files_readable_through_mount={{ dc_sb_readable | default(0) }}/{{ dc_agent_workspace_files | length }} |
       ro_write_probe={{ dc_sb_ro_verdict | default('not probed') }} |
+      declared_network={{ dc_sb_netmode.stdout | default('?') | trim }} |
+      observed_egress={{ dc_sb_egress_verdict | default('not probed') }} |
       This is the only check in this role that asks what the AGENT sees. Host
       verification and mount verification are different claims, and the host one
       passed for a day while the agent reported it could reach nothing.
