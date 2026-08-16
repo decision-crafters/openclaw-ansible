@@ -54,6 +54,22 @@
   tags:
     - agent-workspace
 
+# Read-only with respect to configuration, so it carries no apply gate. It does
+# start model turns, which cost tokens and land in session history — that is a
+# cost, not a host change, and gating a read behind a dry run would mean the
+# suite never actually gets run.
+- name: Run the synthetic admission suite
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Execute the suite and capture evidence
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: admit
+  tags:
+    - admit
+
 - name: Remove an agent profile
   hosts: "{{ dc_target | default('openclaw_hosts') }}"
   become: true
