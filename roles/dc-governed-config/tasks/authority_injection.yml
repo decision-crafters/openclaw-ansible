@@ -170,6 +170,8 @@
       - "{{ dc_inject_work_markers | join('|') }}"
       - --elevation-markers
       - "{{ dc_inject_elevation_markers | join('|') }}"
+      - --work-marker-threshold
+      - "{{ dc_inject_work_marker_threshold | int }}"
   register: dc_inject_check
   changed_when: false
   failed_when: false
