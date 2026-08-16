@@ -113,6 +113,64 @@
     label: "{{ item }}"
   when: "'get' in dc_audit_verbs"
 
+# --- per-agent workspace and memory --------------------------------------------
+#
+# EVERY agent, not the one we happened to be looking at.
+#
+# On 2026-08-16 the session-memory hook was traced by hand for `dc-research`:
+# it writes `<workspaceDir>/memory/<filename>` from the Gateway, outside the
+# sandbox, so `workspaceAccess: ro` does not constrain it. Checking one agent by
+# hand answered one agent. This asks the same two questions of all of them.
+#
+# The important case is an agent with NO declared workspace. The hook computes
+# memoryDir from workspaceDir, so where it writes for such an agent is UNKNOWN —
+# and `main`, which has no workspace, is the agent Slack actually reaches and
+# therefore the one that DOES receive /new and /reset.
+#
+# This DETECTS and REPORTS. It provisions nothing: giving an agent a workspace
+# changes what that agent is, which is an admission decision and not an audit's
+# to make.
+- name: Read every deployed agent
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_audit_agents_raw
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Record which agents declare a workspace
+  ansible.builtin.set_fact:
+    dc_audit_agents: >-
+      {{ (dc_audit_agents_raw.stdout | default('[]') | from_json)
+         | map('combine', {}) | list }}
+  failed_when: false
+
+- name: Check each declared workspace for its state directories
+  ansible.builtin.stat:
+    path: "{{ item.workspace }}/memory"
+  register: dc_audit_agent_memory
+  loop: "{{ dc_audit_agents | default([]) | selectattr('workspace', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.id | default('?') }}"
+
+- name: Report the workspace and memory posture of every agent
+  ansible.builtin.set_fact:
+    dc_audit_agent_rows: >-
+      {{ (dc_audit_agents | default([])) | map('dict2items') | list }}
+  failed_when: false
+
+# An agent with no workspace is the finding, and it must not read as a blank
+# row. "No workspace declared" means no governance files are injected AND the
+# hook's write destination is unknown — two different consequences from one
+# omission.
+- name: Summarise per-agent workspace posture
+  ansible.builtin.set_fact:
+    dc_audit_agent_summary: >-
+      {{ (dc_audit_agents | default([])) | map(attribute='id') | zip(
+           (dc_audit_agents | default([])) | map(attribute='workspace', default='<NONE DECLARED>')
+         ) | list }}
+  failed_when: false
+
 # --- scheduled jobs -----------------------------------------------------------
 #
 # `config get cron` reports the SUBSYSTEM's configuration. It does not list the
@@ -210,6 +268,31 @@
           | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>')) | indent(2, true) }}
       {% endif %}
       {% endfor %}
+
+      === per-agent workspace and memory ===
+      {% for pair in dc_audit_agent_summary | default([]) %}
+      {{ pair[0] }}: workspace={{ pair[1] }}
+      {% endfor %}
+
+      memory directories found:
+      {% for r in dc_audit_agent_memory.results | default([]) %}
+      {{ r.item.id | default('?') }}: {{ r.item.workspace }}/memory
+        exists={{ r.stat.exists | default('?') }}
+        {% if r.stat.exists | default(false) %}
+        owner={{ r.stat.pw_name | default('?') }} mode={{ r.stat.mode | default('?') }}
+        {% endif %}
+      {% endfor %}
+
+      An agent with NO DECLARED WORKSPACE is a finding, not a blank row. It
+      means no workspace bootstrap files are injected — the agent runs with no
+      AGENTS.md and no run gate — AND that the session-memory hook's write
+      destination for that agent is UNKNOWN, because the hook computes
+      memoryDir from workspaceDir.
+
+      A memory directory owned by root would be a DEFECT: the Gateway writes it
+      from outside the sandbox as the service account, so a root-owned
+      directory fails to write silently. Governance files are root-owned by
+      design; state directories must not be.
 
       === scheduled jobs (persistent operation) ===
       {{ dc_audit_cron_state | default('not probed') }}
