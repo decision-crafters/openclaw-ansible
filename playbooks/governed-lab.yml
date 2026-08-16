@@ -27,3 +27,18 @@
     - dc-governed-config
   tags:
     - govern
+
+# Third play, and separate on purpose. The governance posture is applied and
+# stable; a Slack-bounding mistake must be independently reversible rather than
+# forcing a rollback of both. It also has a distinct failure mode — it can lock
+# the founder out of the only route to this host that works from a phone.
+- name: Bound the Slack human-access path
+  hosts: localhost
+  become: true
+  tasks:
+    - name: Apply the Slack boundary
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_bound
+  tags:
+    - slack-bound

@@ -203,6 +203,101 @@ dc_runuser: "/usr/sbin/runuser"
 # schema is ~1.9MB — large enough that a module argument is the wrong carrier.
 dc_schema_staging_path: "/root/.dc-openclaw-schema.json"
 
+# --- Slack bounded human access -----------------------------------------------
+# Founder decision 2026-08-15/16: Slack is REQUIRED for baseline human ↔ OpenClaw
+# communication — the Gateway binds loopback and Tailscale is not configured, so
+# Slack is the only route from a phone. The task is therefore to BOUND it, never
+# to disable it.
+#
+# Every key below was read from the live schema and cross-checked against
+# docs/channels/slack.md (openclaw/openclaw), retrieved 2026-08-16. Two facts
+# from that reading changed the design:
+#
+#   groupPolicy's schema DEFAULT is "allowlist". This host explicitly sets
+#   "open", so the current posture is a deliberate widening away from the
+#   shipped default rather than a missing tightening.
+#
+#   DMs are governed separately by dmPolicy, with its own enum
+#   (pairing | allowlist | open | disabled). "group" never covered DMs — an
+#   earlier plan to "exclude DMs" was aimed at a key that does not control them.
+
+dc_slack_group_policy: "allowlist"   # open | disabled | allowlist
+
+# Keyed by Slack channel ID, and that is not a style preference. From the docs:
+#
+#   "Name-based keys (`#channel-name` or `channel-name`) do NOT match under
+#    groupPolicy: 'allowlist'. The channel lookup is ID-first by default, so a
+#    name-based key will never route successfully and all messages in that
+#    channel will be silently blocked."
+#
+# Silently. A name here would produce a bot that looks configured and answers
+# nobody, with no error anywhere.
+#
+# C0EXAMPLE01 = #all-decision-crafters. #social (C0EXAMPLE02) is deliberately
+# ABSENT: founder decision 2026-08-16 scopes access to one channel, so the bot
+# stops responding there. That is the intended consequence, not an oversight.
+#
+# users: the per-channel sender allowlist. This is what stops Claude, ChatGPT
+# and any other workspace member driving the agent — they are present in the
+# channel and are not U0EXAMPLE01. It also closes the bot-sender question
+# without relying on `allowBots`, whose schema shape is a bare enum this role
+# has not confirmed. Restricting by sender is the control we understand.
+#
+# requireMention: founder preference, stated 2026-08-15. The bot answers when
+# addressed and ignores unrelated channel traffic.
+dc_slack_channels:
+  C0EXAMPLE01:
+    enabled: true
+    requireMention: true
+    users:
+      - U0EXAMPLE01
+
+# DM access. `pairing` is the schema default and is what this host runs today
+# with dmPolicy unset — which is why the founder's DM already works.
+#
+# allowFrom is the CANONICAL DM allowlist per the docs, not dm.allowFrom, which
+# the same page marks legacy. Raw uppercase Slack user IDs are a documented
+# accepted form; lowercase or short lookalikes fail at startup.
+dc_slack_dm_policy: "allowlist"
+dc_slack_allow_from:
+  - U0EXAMPLE01                      # tosin.akinosho, the only permitted sender
+
+# Conversations that MUST remain reachable — checked against, never written.
+# The mirror of dc_plugins_required, and it exists for the same reason: every
+# other control here fails when a restriction goes missing, and nothing would
+# catch a capability being removed.
+#
+# D0EXAMPLE01 is the founder's DM (resolved 2026-08-16: U0EXAMPLE01 +
+# U0EXAMPLE02). Founder confirmed the access path is channel AND DM, device
+# dependent — so a posture that dropped DMs would sever the phone route this
+# whole decision exists to protect.
+#
+# PRESERVATION, NOT EXPANSION. Decision Memory records that the Slack baseline
+# revision "does not authorize private-channel/DM expansion". Naming a DM that
+# already exists is preservation; creating one would not be permitted.
+dc_slack_required_conversations:
+  - C0EXAMPLE01
+  - D0EXAMPLE01
+
+# Loop and dedup protection — a named baseline requirement that had no key until
+# the schema was dumped. Enabled explicitly rather than left to the default,
+# because an inherited default is not an applied control.
+dc_slack_loop_protection: true
+
+# Accepted forms for a sender entry, per docs/channels/slack.md: a raw stable
+# user ID, or one of the qualified prefixes, or the wildcard. Names, slugs,
+# display names and email addresses FAIL AT STARTUP, and so do lowercase or
+# short lookalikes — and a failed startup here means no Slack at all, which is
+# no route to this host. Stated once so the guard and the docs cannot drift.
+# Accepted channel-key forms. Bare IDs for workspace installs; the qualified
+# team:...:channel:... form is required on Enterprise Grid so policies cannot
+# cross workspace boundaries.
+dc_sb_channel_id_re: >-
+  ^(C[A-Z0-9]{8,}|team:T[A-Z0-9]{8,}:channel:C[A-Z0-9]{8,})$
+
+dc_sb_user_id_re: >-
+  ^(U[A-Z0-9]{8,}|slack:U[A-Z0-9]{8,}|user:U[A-Z0-9]{8,}|team:T[A-Z0-9]{8,}:user:U[A-Z0-9]{8,}|\*)$
+
 # --- Lifecycle ----------------------------------------------------------------
 # The systemctl prefix every lifecycle and verification task needs. Defined once
 # because getting it wrong is the single most repeated mistake on this host, and

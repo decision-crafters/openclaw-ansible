@@ -68,6 +68,71 @@ FORBIDDEN_LIST_MEMBERS = {
     ("plugins", "deny"): ["slack", "ollama"],
 }
 
+# Conversations the operator reaches this host through. A backup that does not
+# admit these is schema-valid and would otherwise be selected as known-good,
+# restoring a runtime that runs correctly and answers nobody.
+#
+# C0EXAMPLE01 = #all-decision-crafters. D0EXAMPLE01 = the founder's DM, resolved
+# 2026-08-16, and the route that works from a phone.
+REQUIRED_CHANNELS = ["C0EXAMPLE01"]
+REQUIRED_DMS = ["D0EXAMPLE01"]
+
+
+def slack_lockout_reasons(config: dict) -> list[str]:
+    """Ways a Slack config can be legal, healthy, and unreachable.
+
+    None of these is a schema violation. `groupPolicy: "allowlist"` with an
+    empty channel map validates perfectly and blocks every channel silently;
+    documented behaviour is that a name-based key never routes under allowlist,
+    so it fails the same way while looking configured.
+
+    Checked only when the relevant key is present. A config predating the Slack
+    boundary has no groupPolicy and is not judged against a posture it was
+    written before.
+    """
+    slack = ((config.get("channels") or {}).get("slack")) or {}
+    if not slack:
+        return []
+
+    problems: list[str] = []
+    group_policy = slack.get("groupPolicy")
+
+    if group_policy == "allowlist":
+        channels = slack.get("channels") or {}
+        if not channels:
+            problems.append(
+                "channels.slack.groupPolicy='allowlist' with no channels listed "
+                "— blocks every channel silently"
+            )
+        else:
+            missing = [c for c in REQUIRED_CHANNELS if c not in channels]
+            if missing:
+                problems.append(
+                    f"channels.slack.channels omits {missing}, which the operator "
+                    "reaches this host through"
+                )
+            named = [k for k in channels if not k.startswith(("C", "team:"))]
+            if named:
+                problems.append(
+                    f"channels.slack.channels uses name-based keys {named}; these "
+                    "never route under allowlist and block silently"
+                )
+
+    dm_policy = slack.get("dmPolicy")
+    if dm_policy == "disabled" and REQUIRED_DMS:
+        problems.append(
+            f"channels.slack.dmPolicy='disabled' severs {REQUIRED_DMS} — the phone route"
+        )
+    if dm_policy == "allowlist" and not (slack.get("allowFrom") or []):
+        problems.append(
+            "channels.slack.dmPolicy='allowlist' with an empty allowFrom — admits nobody"
+        )
+
+    if slack.get("enabled") is False:
+        problems.append("channels.slack.enabled=false — no Slack at all")
+
+    return problems
+
 STAMP = re.compile(r"(\d{8}T\d{6})")
 
 
@@ -185,6 +250,8 @@ def main() -> int:
                     f"{'.'.join(path)} denies {severed}, which would restore a "
                     "runtime the operator cannot reach"
                 )
+
+        problems.extend(slack_lockout_reasons(config))
 
         if problems:
             rejected.append(f"{candidate.name}: {'; '.join(problems)}")
