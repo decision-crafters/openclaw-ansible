@@ -1,0 +1,56 @@
+---
+# Rootless Docker for the OpenClaw service account, so `sandbox.mode: all` can
+# actually run.
+#
+# The problem this solves, stated precisely: the governed profile sets
+# sandbox.mode "all", which needs a container runtime. The upstream role
+# deliberately removes the service account from the `docker` group, because
+# the rootful socket is host-root-equivalent — see
+# roles/openclaw/tasks/docker-security.yml and tests/docker-group-security.yml.
+#
+# Both are right. The resolution is not to pick one, it is to give the service
+# account a container runtime that does NOT confer root: a rootless daemon
+# owned by the user, on a socket under /run/user/<uid>.
+#
+# THIS ROLE MUST NEVER ADD THE SERVICE ACCOUNT TO THE DOCKER GROUP. Doing so
+# would grant host-root-equivalent control, undo the upstream fix, and break its
+# CI assertion — strictly worse than running with no sandbox at all. There is an
+# explicit guard for this in tasks/main.yml.
+
+dc_rls_user: "{{ openclaw_user | default('openclaw') }}"
+dc_rls_home: "{{ openclaw_home | default('/home/openclaw') }}"
+
+# newuidmap/newgidmap live in `uidmap`. Without them rootlesskit cannot map the
+# subordinate ranges and the daemon fails to start with a message about
+# newuidmap being missing, which is at least honest.
+#
+# slirp4netns provides rootless networking. Docker also accepts vpnkit, which is
+# not installed here; slirp4netns is the maintained default on Linux.
+dc_rls_packages:
+  - uidmap
+  - slirp4netns
+
+# Subordinate id delegation. 65536 is the conventional range size and matches
+# what `useradd` would allocate. The offset is chosen high to avoid colliding
+# with any existing allocation; the role reads the file and refuses to overlap
+# rather than assuming this is free.
+dc_rls_subid_start: 231072
+dc_rls_subid_count: 65536
+
+# Where the rootless daemon listens. This is fixed by the rootless design —
+# a user-owned socket under the user's runtime directory — and is the value the
+# Gateway must be pointed at.
+dc_rls_socket: "/run/user/{{ dc_rls_uid | default('') }}/docker.sock"
+
+# How the Gateway learns about it. A systemd drop-in rather than an edit to the
+# unit, because `openclaw onboard --install-daemon` owns that unit and would
+# overwrite an edit on the next upgrade without saying so. A drop-in survives.
+dc_rls_dropin_dir: "{{ dc_rls_home }}/.config/systemd/user/openclaw-gateway.service.d"
+
+dc_rls_service: "openclaw-gateway.service"
+dc_rls_runuser: "{{ dc_runuser | default('/usr/sbin/runuser') }}"
+
+# Refuse rather than proceed when a prerequisite is missing. A half-configured
+# rootless daemon fails at container-create time, inside an agent run, which is
+# the worst place to discover it.
+dc_rls_fail_closed: true

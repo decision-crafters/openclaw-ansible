@@ -1,0 +1,19 @@
+---
+# Restart through runuser, not become. `-e ansible_become=false` is used to
+# avoid a sudo password prompt and it disables become_user too, so a handler
+# using become_user would silently run as root and fail to reach the service
+# account's session bus.
+- name: Restart openclaw gateway for rootless docker
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - systemctl
+      - --user
+      - restart
+      - "{{ dc_rls_service }}"
+  changed_when: true

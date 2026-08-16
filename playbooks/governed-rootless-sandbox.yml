@@ -1,0 +1,24 @@
+---
+# Give the OpenClaw service account a rootless Docker daemon, so the governed
+# profile's `sandbox.mode: all` can actually run.
+#
+# Background: the governed config sets sandbox.mode "all", which requires a
+# container runtime. The upstream role deliberately removes the service account
+# from the `docker` group because the rootful socket is host-root-equivalent.
+# Both are correct. A rootless daemon owned by the user resolves it without
+# granting root, and this playbook refuses to run if the group membership has
+# been restored as a shortcut.
+#
+#   sudo /home/operator/.local/bin/ansible-playbook \
+#     playbooks/governed-rootless-sandbox.yml -e ansible_become=false
+#
+# Then confirm the gateway is healthy:
+#   sudo /home/operator/.local/bin/ansible-playbook playbooks/governed-lifecycle.yml \
+#     --tags status -e ansible_become=false
+
+- name: Provide a rootless container runtime for the OpenClaw sandbox
+  hosts: localhost
+  become: true
+  gather_facts: true
+  roles:
+    - dc-rootless-sandbox
