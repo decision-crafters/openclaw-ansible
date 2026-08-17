@@ -72,3 +72,19 @@
         tasks_from: hook_verify
   tags:
     - hook-verify
+
+# Zero mutation: reads the live schema and effective config to revalidate the
+# accepted v2026.7.1 sub-agent isolation semantics against the PINNED build. It
+# spawns nothing -- dc-research denies both `subagents` and `sessions_spawn`, so
+# no child can be produced from it without a configuration change.
+- name: Revalidate sub-agent isolation against the pinned build
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read the schema and effective policy
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: subagent_conformance
+  tags:
+    - subagent-conformance

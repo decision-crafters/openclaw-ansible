@@ -1007,3 +1007,37 @@ dc_hook_verify_report: >-
 # A variable rather than a literal so the play can assert it against --help
 # before depending on it, which is the check that was missing.
 dc_inject_session_flag: "--session-key"
+
+# --- Sub-agent host conformance ------------------------------------------------
+# See tasks/subagent_conformance.yml. Zero mutation: no spawn, no session.
+#
+# Founder direction 2026-08-17 corrected the evidence state. The wrong-workspace
+# reports (#40825, #15032) are HISTORICAL, on 2026.3.x, and closed. The accepted
+# position is VERIFIED UPSTREAM for v2026.7.1 — targeted sub-agent bootstrap uses
+# the TARGET agent workspace, and child tools are governed by the agent policy
+# first and narrowed by the sub-agent layer second.
+#
+# What Decision Crafters still owes is HOST REVALIDATION on the pinned
+# 2026.7.1-2 runtime. These paths are what that revalidation reads.
+dc_subagent_conformance_paths:
+  - agents.defaults.subagents
+  - agents.defaults.subagents.allowAgents
+  - agents.defaults.subagents.maxSpawnDepth
+  - agents.defaults.subagents.maxChildrenPerAgent
+  - agents.defaults.subagents.model
+  - tools.subagents
+  - tools.subagents.tools.allow
+  - tools.subagents.tools.deny
+  - tools.agentToAgent
+  # Provenance only. The residual risk is that a main-agent authentication
+  # profile may be merged as fallback for a spawned agent, so what is read is
+  # whether such a fallback is CONFIGURED — never any credential value.
+  - agents.defaults.auth
+  - agents.defaults.model
+
+dc_sc_reader_path: "/root/.dc-subagent-conformance.py"
+dc_sc_effective_path: "/root/.dc-subagent-effective.json"
+dc_sc_agents_path: "/root/.dc-subagent-agents.json"
+dc_sc_report: >-
+  /tmp/openclaw-subagent-conformance-{{
+  ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt
