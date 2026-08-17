@@ -169,17 +169,54 @@
 # `kind` derives from the Slack id prefix: C = channel (group), D = direct
 # message. Guessing that wrong produces a binding that matches nothing, and
 # matching nothing is silent.
-- name: Build the binding list
+# A real Ansible loop accumulating real dicts.
+#
+# The previous version used a Jinja {% for %} block to emit JSON text and then
+# concatenated it to a list, which fails with "can only concatenate list (not
+# str) to list". The comment above it already said "an explicit loop, not a
+# filter chain" — the comment was right and the code did not match it. A
+# template that BUILDS TEXT that happens to look like JSON is the same clever
+# move in a different costume.
+- name: Build one binding per required conversation
+  ansible.builtin.set_fact:
+    dc_rb_entries: >-
+      {{ (dc_rb_entries | default([])) + [{
+           'agentId': dc_agent_id,
+           'match': {
+             'channel': 'slack',
+             'peer': {
+               'kind': ('direct' if item is match('^D') else 'group'),
+               'id': item
+             }
+           }
+         }] }}
+  loop: "{{ dc_slack_required_conversations }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assemble the array that will be written
   ansible.builtin.set_fact:
     dc_rb_payload: "{{ dc_rb_kept + dc_rb_entries }}"
-  vars:
-    dc_rb_entries: >-
-      [{% for c in dc_slack_required_conversations %}
-        {"agentId": "{{ dc_agent_id }}",
-         "match": {"channel": "slack",
-                   "peer": {"kind": "{{ 'direct' if c is match('^D') else 'group' }}",
-                            "id": "{{ c }}"}}}{{ "," if not loop.last }}
-      {% endfor %}]
+
+# Both halves are asserted before the runtime is asked. A malformed binding is
+# accepted by config patch and simply never matches, so a shape error here is
+# silent at every later stage.
+- name: Confirm the composed bindings are well formed
+  ansible.builtin.assert:
+    that:
+      - dc_rb_payload | length == (dc_rb_kept | length) + (dc_slack_required_conversations | length)
+      - dc_rb_entries | selectattr('match.peer.id', 'defined') | list | length
+        == dc_slack_required_conversations | length
+      - dc_rb_entries | selectattr('agentId', 'equalto', dc_agent_id) | list | length
+        == dc_slack_required_conversations | length
+    fail_msg: >-
+      The composed binding array is not the expected shape:
+      {{ dc_rb_payload | to_json | truncate(400) }}.
+      A malformed binding is accepted by the runtime and simply never matches,
+      so this is checked here rather than discovered as silence later.
+    success_msg: >-
+      {{ dc_rb_entries | length }} binding(s) composed,
+      {{ dc_rb_kept | length }} pre-existing preserved
 
 - name: Ask the runtime to validate the binding without applying it
   ansible.builtin.command:
