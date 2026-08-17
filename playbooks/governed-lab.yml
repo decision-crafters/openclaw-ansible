@@ -48,3 +48,32 @@
         tasks_from: slack_bound
   tags:
     - slack-bound
+
+# Founder decision 2026-08-17, Option B: route the already-authorized Slack
+# conversations to the governed agent instead of letting them fall through to
+# the default. Writes ONE key -- top-level `bindings`. Nothing under
+# channels.slack changes: no new app, OAuth grant, scope, credential or sender.
+- name: Route the bounded Slack path to the governed agent
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Bind the conversations
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_rebind
+  tags:
+    - slack-rebind
+
+# The reversal, written before the thing it reverses. `bindings` is unset today,
+# so `{"bindings": null}` restores the original state exactly -- and this play
+# refuses to delete an array holding entries it did not write.
+- name: Remove the Slack routing bindings
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Unbind the conversations
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_unbind
+  tags:
+    - slack-unbind

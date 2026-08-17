@@ -1,0 +1,149 @@
+---
+# Remove the Slack routing bindings. The reversal for slack_rebind.yml.
+#
+#   sudo ansible-playbook playbooks/governed-lab.yml \
+#     --tags slack-unbind -e ansible_become=false -e dc_apply=true
+#
+# WRITTEN BEFORE THE THING IT REVERSES — same order as remove_agent.yml and
+# scheduler_disable.yml. Here it matters more than usual: this reversal restores
+# the founder's route into a host whose only human access is Slack.
+#
+# WHY THE REVERSAL IS EXACT TODAY, AND WHY THAT WILL STOP BEING TRUE
+#
+# `bindings` is currently UNSET on this host. So the exact reversal of any
+# binding we add is `{"bindings": null}` — deleting the key restores the
+# original state byte for byte, with no prior array to reconstruct.
+#
+# That is a property of TODAY, not of the mechanism. The moment a binding
+# exists that this role did not write — a second agent, a different channel —
+# deleting the whole key would remove someone else's routing too. This play
+# therefore refuses to delete a bindings array containing entries it does not
+# recognise, rather than assuming it is the only writer.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Read the current bindings
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'bindings'] }}"
+  register: dc_ub_before
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Parse the current bindings
+  ansible.builtin.set_fact:
+    dc_ub_current: >-
+      {{ (dc_ub_before.stdout | default('[]') | from_json)
+         if (dc_ub_before.rc | default(1)) == 0 else [] }}
+  failed_when: false
+
+- name: Report when there is nothing to remove
+  ansible.builtin.debug:
+    msg: >-
+      DC-SLACK-UNBIND | `bindings` is already unset
+      (rc={{ dc_ub_before.rc | default('?') }}). Slack falls through to the
+      default agent. Already-absent is the goal state, not a failure —
+      nothing to do.
+  when: (dc_ub_before.rc | default(1)) != 0
+
+# Everything this role would have written: a Slack binding naming the agent we
+# deploy. Anything else in the array came from elsewhere and is not ours to
+# delete.
+- name: Separate our bindings from anyone else's
+  ansible.builtin.set_fact:
+    dc_ub_ours: >-
+      {{ dc_ub_current | selectattr('agentId', 'defined')
+         | selectattr('agentId', 'equalto', dc_agent_id)
+         | selectattr('match', 'defined')
+         | selectattr('match.channel', 'defined')
+         | selectattr('match.channel', 'equalto', 'slack') | list }}
+    dc_ub_theirs: >-
+      {{ dc_ub_current | rejectattr('agentId', 'defined')
+         | list
+         + (dc_ub_current | selectattr('agentId', 'defined')
+            | rejectattr('agentId', 'equalto', dc_agent_id) | list) }}
+  when: (dc_ub_before.rc | default(1)) == 0
+
+# Deleting the key is only correct while we are the sole writer. This is the
+# guard that stops a convenient `bindings: null` from silently unrouting an
+# agent this role has never heard of.
+- name: Refuse to delete bindings this role did not write
+  ansible.builtin.fail:
+    msg: >-
+      `bindings` contains {{ dc_ub_theirs | length }} entr(y|ies) not written by
+      this role: {{ dc_ub_theirs | map(attribute='agentId', default='<none>') | list }}.
+      Deleting the whole key would unroute them too. `config patch` replaces
+      arrays wholesale, so removing one element means rewriting the array with
+      the survivors — a different operation with a different risk, and not this
+      one. Nothing has been changed.
+  when:
+    - (dc_ub_before.rc | default(1)) == 0
+    - (dc_ub_theirs | default([]) | length) > 0
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "remove Slack bindings for {{ dc_agent_id }} (--tags slack-unbind)"
+    dc_apply_target: "bindings (top-level array)"
+    dc_apply_overlay:
+      action: "delete the bindings key"
+      removing: "{{ dc_ub_ours | default([]) }}"
+      restores: "Slack falls through to the default agent"
+  when: (dc_ub_before.rc | default(1)) == 0
+
+- name: Back up the config before unbinding
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-unbind.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  when: (dc_ub_before.rc | default(1)) == 0
+
+- name: Delete the bindings key
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: '{"bindings": null}'
+  register: dc_ub_patch
+  changed_when: dc_ub_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  when: (dc_ub_before.rc | default(1)) == 0
+
+- name: Read the bindings back
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'bindings'] }}"
+  register: dc_ub_after
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  when: (dc_ub_before.rc | default(1)) == 0
+
+# rc != 0 here is SUCCESS — the key is gone. Stated explicitly because a
+# non-zero return normally means failure and this is the one place it does not.
+- name: Confirm the bindings are gone
+  ansible.builtin.assert:
+    that:
+      - (dc_ub_after.rc | default(0)) != 0
+        or (dc_ub_after.stdout | default('') | trim) in ('', '[]', 'null')
+    fail_msg: >-
+      `bindings` still returns a value after the delete:
+      {{ dc_ub_after.stdout | default('') | trim | truncate(200) }}.
+      Slack routing may not have been restored. Verify by messaging OpenClaw
+      and confirming which agent answers.
+    success_msg: "bindings removed; Slack falls through to the default agent"
+  when: (dc_ub_before.rc | default(1)) == 0
+
+- name: Emit the unbind receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SLACK-UNBIND RECEIPT |
+      removed={{ dc_ub_ours | default([]) | length }} binding(s) for {{ dc_agent_id }} |
+      preserved={{ dc_ub_theirs | default([]) | length }} other binding(s) |
+      Slack now falls through to the DEFAULT AGENT |
+      CONFIRM BY MESSAGING OPENCLAW. `bindings` reading unset proves the config
+      changed; it does not prove a message reaches anyone. Ask the responder for
+      its agent id — that is the check that actually closes this.
