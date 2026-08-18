@@ -118,3 +118,17 @@
         tasks_from: tool_policy_evidence
   tags:
     - tool-policy-evidence
+
+# TASK-242 criterion 2. Read-only: schema, effective config, and one --dry-run
+# validation that writes nothing.
+- name: Capture model-path evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read every model-bearing path
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: model_path_evidence
+  tags:
+    - model-paths

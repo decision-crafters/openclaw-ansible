@@ -1162,3 +1162,22 @@ dc_sc_report: >-
 # per-deployment governance decision, and a wrong value here would silently
 # change what the agent is.
 dc_agent_model_pin: ""
+
+# TASK-242 criterion 2 — every configuration path by which a governed agent's
+# content could reach a model other than its pinned primary.
+#
+# Wider than the fallback question on purpose. Pinning `model.primary` pins one
+# call path; auxiliary model paths and session overrides are separate surfaces,
+# and an agent exposing `image` has at least one of them.
+dc_model_path_probes:
+  - agents.defaults.model
+  - agents.defaults.model.primary
+  - agents.defaults.model.fallbacks
+  - agents.defaults.utilityModel
+  - agents.defaults.imageModel
+  - agents.defaults.pdfModel
+  - agents.defaults.provider
+  - agents.list
+  - model
+  - session
+  - sessions
