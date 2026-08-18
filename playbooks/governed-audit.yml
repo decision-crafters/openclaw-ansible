@@ -104,3 +104,17 @@
         tasks_from: slack_evidence
   tags:
     - slack-evidence
+
+# Runtime tool-policy evidence for admission rows 04/07/08/13. Read-only; reads
+# what the Gateway already logs and grants nothing.
+- name: Capture tool-policy evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Extract the effective removal chain
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: tool_policy_evidence
+  tags:
+    - tool-policy-evidence

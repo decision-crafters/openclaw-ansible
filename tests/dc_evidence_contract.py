@@ -167,9 +167,15 @@ def main() -> int:
                             f"(add it to an EVIDENCE-CLASS line)")
 
         # --- ANCHOR PRESENT AT ALL ----------------------------------------
+        # A file may declare its own anchor. The Slack provider marker is not
+        # universal -- a tool-policy chain is bounded by its own rule line --
+        # and hardcoding one marker would push authors toward a wrong anchor or
+        # toward waiving the rule entirely.
+        m = re.search(r"EVIDENCE-ANCHOR:\s*(.+)", text)
+        marker = m.group(1).strip() if m else ANCHOR_MARKER
         checks.append((
-            f"{path.name} derives an anchored window",
-            f"split('{ANCHOR_MARKER}')" in text or f'split("{ANCHOR_MARKER}")' in text,
+            f"{path.name} derives an anchored window (marker: {marker})",
+            f"split('{marker}')" in text or f'split("{marker}")' in text,
         ))
 
         # --- FLOOR --------------------------------------------------------
