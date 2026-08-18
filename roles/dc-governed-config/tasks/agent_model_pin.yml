@@ -1,0 +1,218 @@
+---
+# Pin the model on a governed agent's own entry. MUTATES agents.list.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags model-pin -e ansible_become=false -e dc_apply=true
+#
+# WHY
+#
+# Neither deployed agent declares a `model`; both inherit
+# `agents.defaults.model`. So one key elsewhere governs what the admitted agent
+# actually is. Moving it changes the agent with NO change to the agent's own
+# entry and nothing in `agents.list` recording it — the same shape as the
+# resolved-default workspace that produced a retracted claim about `main`, and
+# as `bindings`, and as the account bucket. Absence of a key is not absence of
+# a setting; the runtime resolves a default.
+#
+# This does not narrow or widen any capability. It records, on the agent, the
+# model the agent was admitted with, so the admitted envelope stops depending
+# on a value maintained somewhere else for someone else's reasons.
+#
+# WHETHER PER-AGENT MODEL IS EVEN SUPPORTED IS NOT ASSUMED HERE.
+#
+# `config patch --dry-run` validates against the LIVE schema, so the dry run is
+# the check. If this build does not accept a per-agent `model`, the dry run
+# fails and nothing is written — which is a finding, not a failure, and is
+# cheaper than researching the question first.
+#
+# ARRAY REPLACE. `config patch` replaces arrays wholesale, so the whole
+# agents.list is rebuilt with every other entry preserved verbatim.
+#
+# RESTART: required in the same class as `bindings` unless proven otherwise.
+# The restart handler is notified rather than an inline restart, because
+# nothing here needs to observe the effective state in the same run.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a target agent and a model to pin
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id | default('') | length > 0
+      - dc_agent_model_pin | default('') | length > 0
+    fail_msg: >-
+      dc_agent_id and dc_agent_model_pin must both be set. dc_agent_model_pin
+      should be the model as the runtime reports it, e.g. the `primary` value
+      from `agents.defaults.model`. Nothing has been changed.
+    success_msg: "pinning {{ dc_agent_model_pin | default('?') }} on {{ dc_agent_id | default('?') }}"
+
+- name: Read the deployed agents
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_mp_before
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Parse the deployed agents
+  ansible.builtin.set_fact:
+    dc_mp_list: "{{ dc_mp_before.stdout | default('[]') | from_json }}"
+  failed_when: false
+
+- name: Refuse when the target agent is not deployed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_id }} is not present in agents.list
+      ({{ dc_mp_list | map(attribute='id', default='?') | list }}).
+      Nothing has been changed.
+  when:
+    - dc_agent_id not in (dc_mp_list | map(attribute='id', default='') | list)
+    - dc_fail_closed | bool
+
+# Idempotence, and a guard against silently replacing someone else's decision.
+- name: Note any model already pinned on the target
+  ansible.builtin.set_fact:
+    dc_mp_existing: >-
+      {{ (dc_mp_list | selectattr('id', 'equalto', dc_agent_id) | first).model | default({}) }}
+
+- name: Refuse to overwrite a different pinned model
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_id }} already pins a model: {{ dc_mp_existing }}. This play
+      will not silently replace it — a model change is its own decision with
+      its own reasoning, not a side effect of re-running a pin. Unset it
+      deliberately first if the change is intended. Nothing has been changed.
+  when:
+    - (dc_mp_existing | default({}) | length) > 0
+    - (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+    - dc_fail_closed | bool
+
+- name: Report when the pin is already in place
+  ansible.builtin.debug:
+    msg: >-
+      DC-MODEL-PIN | {{ dc_agent_id }} already pins
+      {{ dc_agent_model_pin }} — nothing to do.
+  when: (dc_mp_existing.primary | default('')) == dc_agent_model_pin
+
+# Rebuild the WHOLE array: every other entry verbatim, the target with `model`
+# merged in. Written as an explicit loop rather than a filter chain, for the
+# same reason slack_rebind.yml is: this array decides what the agents ARE.
+- name: Compose the rebuilt agents.list
+  ansible.builtin.set_fact:
+    dc_mp_payload: >-
+      {{ (dc_mp_payload | default([])) + [
+           (item | combine({'model': {'primary': dc_agent_model_pin}}))
+           if item.id == dc_agent_id else item ] }}
+  loop: "{{ dc_mp_list }}"
+  loop_control:
+    label: "{{ item.id | default('?') }}"
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+
+- name: Confirm no agent was lost or gained
+  ansible.builtin.assert:
+    that:
+      - (dc_mp_payload | length) == (dc_mp_list | length)
+      - (dc_mp_payload | selectattr('id', 'equalto', dc_agent_id)
+         | map(attribute='model.primary') | first) == dc_agent_model_pin
+    fail_msg: >-
+      The rebuilt agents.list is not the expected shape. `config patch`
+      replaces arrays wholesale, so a composition error here DELETES agents.
+      {{ dc_mp_payload | to_json | truncate(300) }}
+    success_msg: >-
+      {{ dc_mp_payload | length }} agent(s) preserved,
+      model pinned on {{ dc_agent_id }}
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+
+# THE SCHEMA CHECK. If this build rejects a per-agent model, we learn it here
+# without writing anything.
+- name: Ask the runtime to validate the pin without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ {'agents': {'list': dc_mp_payload}} | to_json }}"
+  register: dc_mp_dry
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+
+- name: Refuse a pin the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      The runtime rejected a per-agent `model` key
+      (rc={{ dc_mp_dry.rc | default('?') }}):
+      {{ dc_mp_dry.stderr | default(dc_mp_dry.stdout) | default('') | truncate(400) }}.
+      This build may not support pinning a model per agent. That is a FINDING,
+      not a failure — the admitted envelope then cannot pin its own model and
+      the residual must be recorded rather than closed. Nothing has been changed.
+  when:
+    - (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+    - (dc_mp_dry.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "pin {{ dc_agent_model_pin }} on {{ dc_agent_id }} (--tags model-pin)"
+    dc_apply_target: "agents.list (array — REPLACED wholesale)"
+    dc_apply_overlay:
+      pinning: "{{ dc_agent_model_pin }}"
+      agents_preserved: "{{ dc_mp_payload | default([]) | map(attribute='id') | list }}"
+      grants: "nothing — records the model the agent was admitted with"
+      restart: "REQUIRED unless proven otherwise; handler notified"
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+
+- name: Back up the config before pinning
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: >-
+      {{ dc_openclaw_backup_dir }}/openclaw.json.pre-model-pin.{{
+         ansible_facts['date_time'].iso8601_basic_short }}
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+
+- name: Write the pinned agents.list
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ {'agents': {'list': dc_mp_payload}} | to_json }}"
+  register: dc_mp_patch
+  changed_when: dc_mp_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  when: (dc_mp_existing.primary | default('')) != dc_agent_model_pin
+  notify: Restart openclaw gateway
+
+- name: Read the pin back
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_mp_after
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Confirm the pin is written and no agent was lost
+  ansible.builtin.assert:
+    that:
+      - ((dc_mp_after.stdout | from_json) | length) == (dc_mp_list | length)
+      - ((dc_mp_after.stdout | from_json) | selectattr('id', 'equalto', dc_agent_id)
+         | map(attribute='model.primary') | first) == dc_agent_model_pin
+    fail_msg: >-
+      agents.list did not read back as expected after the write. Restore from
+      {{ dc_openclaw_backup_dir }} before proceeding.
+    success_msg: "{{ dc_agent_id }} pins {{ dc_agent_model_pin }}; all agents preserved"
+
+- name: Emit the model-pin receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-MODEL-PIN RECEIPT | agent={{ dc_agent_id }} |
+      pinned={{ dc_agent_model_pin }} |
+      agents_preserved={{ (dc_mp_after.stdout | from_json) | map(attribute='id') | list }} |
+      GRANTS NOTHING — this records the model the agent was admitted with, so
+      the envelope stops depending on agents.defaults.model being maintained
+      elsewhere. |
+      NOT PROVEN HERE: that a `primary` key is the whole story. The name implies
+      other tiers, and whether a fallback can substitute a different model under
+      failure is UNKNOWN and unpinned by this play. |
+      reverse_with=`config patch` agents.list back to the pre-pin backup

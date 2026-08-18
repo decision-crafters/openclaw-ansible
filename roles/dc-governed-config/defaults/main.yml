@@ -774,6 +774,26 @@ dc_audit_paths:
   - plugins.enabled
   - plugins.bundledDiscovery
   # Slack binding
+  # WHICH MODEL IS THIS AGENT ACTUALLY RUNNING. Added 2026-08-18.
+  #
+  # `agents.list` carries no `model` key for either deployed agent, so both
+  # INHERIT a default — and until now nothing in this audit read one. The gap is
+  # the same shape as `bindings` and the account bucket: a key nobody thought to
+  # look at, deciding something consequential.
+  #
+  # It is the most consequential of the three. The model is the largest single
+  # determinant of agent behaviour, and every behavioural row in the admission
+  # receipt — the run-gate refusals, 12c's five REFUSED variants, the quality of
+  # the reasoning — was produced by a model this audit could not name. An
+  # admission accepted "against the exact tested envelope" does not currently
+  # pin the model inside that envelope, so changing a default elsewhere silently
+  # changes the admitted agent with no config change to the agent at all.
+  #
+  # Reading the NAME only. Provider credential blocks are deliberately not
+  # audited: `plugins.entries.ollama` and similar may carry an API key, and this
+  # report is written to /tmp.
+  - agents.defaults.model
+  - agents.defaults.provider
   # THE ACCOUNT BUCKET. Added 2026-08-17, after a correct-looking binding failed
   # to route for a second time.
   #
@@ -1137,3 +1157,8 @@ dc_sc_agents_path: "/root/.dc-subagent-agents.json"
 dc_sc_report: >-
   /tmp/openclaw-subagent-conformance-{{
   ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt
+
+# The model the agent was ADMITTED with. Empty by default: pinning is a
+# per-deployment governance decision, and a wrong value here would silently
+# change what the agent is.
+dc_agent_model_pin: ""

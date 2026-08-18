@@ -123,3 +123,17 @@
         tasks_from: sender_denial_restore
   tags:
     - sender-denial-restore
+
+# Pin the model on a governed agent's own entry. Grants nothing; records the
+# model the agent was admitted with so the envelope stops depending on
+# agents.defaults.model being maintained elsewhere.
+- name: Pin the agent model
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Write the pin
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_model_pin
+  tags:
+    - model-pin
