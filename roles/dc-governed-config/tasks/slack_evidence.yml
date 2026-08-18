@@ -44,7 +44,7 @@
 # historical one — nobody forgot to anchor, they forgot they needed to.
 #
 # EVIDENCE-CLASS: cumulative = dc_se_lines, dc_se_inbound, dc_se_turns, dc_se_agent_turns, dc_se_sockets
-# EVIDENCE-CLASS: present = dc_se_resolved
+# EVIDENCE-CLASS: present = dc_se_resolved, dc_se_problems
 
 - name: Establish the CLI and confirm its verbs
   ansible.builtin.include_tasks: agent_common.yml
@@ -138,6 +138,29 @@
          + (dc_se_resolved | map('truncate', 180) | list)
          + ['(an empty list here means NO per-channel sender restriction resolved — '
             ~ 'on this build that FAILS OPEN, it does not mean nobody is permitted)'] }}
+
+# WHY A TURN PRODUCED NOTHING.
+#
+# Added 2026-08-18. A model pin was applied, a probe was ingested, a
+# tool-policy chain was emitted -- and no reply reached Slack. This task could
+# show that the turn STARTED and had no way to show why it produced nothing,
+# because it extracted only inbound/turn/socket lines. An evidence task that
+# can see a failure begin and not see it fail is half a tool.
+#
+# Anchored: errors from a previous run would otherwise be read as current.
+- name: Read warnings and errors since the last provider start
+  ansible.builtin.set_fact:
+    dc_se_problems: >-
+      {{ dc_se_window | regex_findall('(?m)^.*\s(warn|error|fatal)\s.*$') }}
+
+- name: Report anything that went wrong in the current window
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-SLACK-EVIDENCE PROBLEMS (since the last provider start)']
+         + (dc_se_problems | map('truncate', 300) | list
+            if (dc_se_problems | length) > 0
+            else ['(none — which is NOT proof the turn succeeded; a turn that '
+                  ~ 'produces no output and logs nothing looks identical here)']) }}
 
 - name: Count gateway processes on this host
   ansible.builtin.shell:
