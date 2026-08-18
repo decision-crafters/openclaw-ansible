@@ -1,0 +1,173 @@
+---
+# Read-only Slack ingress evidence. The governed replacement for three ad-hoc
+# scratchpad scripts written on 2026-08-17/18.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags slack-evidence -e ansible_become=false
+#
+# WRITES NOTHING. No config change, no restart, no message sent.
+#
+# WHY THIS IS NOT `--tags logs`
+#
+# `--tags logs` reads JOURNALD. The Slack channel writes to the OpenClaw FILE
+# log, reachable only through `openclaw logs`. Searching journald for Slack
+# ingress returns zero lines on a host that is demonstrably handling Slack
+# traffic -- which reads as "no events" and is really "wrong sink". That mistake
+# was made on 2026-08-17 and cost a false conclusion.
+#
+# THE DISCRIMINATOR THIS EXISTS TO APPLY
+#
+#   `gateway/channels/slack/inbound` line  -> the Slack event ARRIVED
+#   following `agents/tool-policy` block   -> an agent TURN was created
+#
+# Inbound present + no turn  = refused after ingress.
+# Inbound absent             = says NOTHING about refusal. The event may have
+#                              gone to another socket connection, or the log may
+#                              have rotated. It is INSUFFICIENT EVIDENCE.
+#
+# THE REFUSAL THAT MATTERS MOST
+#
+# The Gateway's file log SPANS RESTARTS -- lines from several restarts coexist
+# in one query, so any 'is X true now' question must be anchored to the last
+# `starting provider` marker. A scratchpad version of this check
+# searched a 7-line log and reported "this gateway never saw the event" -- a null
+# result from an empty source, scored as a finding, inside the very check written
+# to prevent exactly that. This task therefore REFUSES to score a log too short
+# to be evidence, rather than reporting a confident absence.
+
+# EVIDENCE-CLASS declarations. Every fact derived from the log must be named in
+# exactly one of these, and the test suite enforces it.
+#
+# The point is not the annotation. It is that classifying forces the author to
+# NOTICE which question is being asked. All three anchoring bugs in this
+# workstream came from writing a present-tense check while believing it was a
+# historical one — nobody forgot to anchor, they forgot they needed to.
+#
+# EVIDENCE-CLASS: cumulative = dc_se_lines, dc_se_inbound, dc_se_turns, dc_se_agent_turns, dc_se_sockets
+# EVIDENCE-CLASS: present = dc_se_resolved
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Read the Gateway file log
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['logs', '--limit', dc_slack_evidence_limit | string,
+                              '--plain', '--no-color'] }}"
+  register: dc_se_log
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# regex_findall with (?m), NOT split('\n').
+#
+# YAML escaping decides whether `\n` is a newline or two literal characters, and
+# it differs by scalar style: a DOUBLE-QUOTED scalar interprets it, a FOLDED
+# (>-) scalar does not. The first version of this file mixed both, so the line
+# COUNT was right (double-quoted) while every extraction below silently matched
+# nothing and returned the whole log as a single element -- reporting 1 inbound
+# event and 1 agent turn regardless of what happened.
+#
+# Anchoring on (?m)^...$ removes the escaping question from the problem instead
+# of getting it right once and hoping the next editor does too.
+- name: Count what is actually available
+  ansible.builtin.set_fact:
+    dc_se_lines: "{{ dc_se_log.stdout | default('') | regex_findall('(?m)^.*$') | length }}"
+
+# THE GUARD. A short log is not a quiet host; it is a rotated file. Scoring it
+# would manufacture evidence of absence out of absence of evidence.
+- name: Refuse to score a log too short to be evidence
+  ansible.builtin.fail:
+    msg: >-
+      The Gateway file log returned only {{ dc_se_lines }} line(s)
+      (rc={{ dc_se_log.rc | default('?') }}), below the
+      dc_slack_evidence_min_lines floor of {{ dc_slack_evidence_min_lines }}.
+      The file log RESETS ON RESTART, so this is consistent with a recent
+      restart and is NOT evidence that no Slack event occurred. Reporting an
+      absence from this would be a null result scored as a finding.
+      Send a message and re-run, or raise dc_slack_evidence_limit.
+      INSUFFICIENT EVIDENCE — nothing scored.
+  when:
+    - (dc_se_lines | int) < (dc_slack_evidence_min_lines | int)
+    - dc_fail_closed | bool
+
+- name: Extract inbound Slack events
+  ansible.builtin.set_fact:
+    dc_se_inbound: >-
+      {{ dc_se_log.stdout | default('')
+         | regex_findall('(?m)^.*slack/inbound.*$') }}
+
+- name: Extract agent turns and the rules that shaped them
+  ansible.builtin.set_fact:
+    dc_se_turns: >-
+      {{ dc_se_log.stdout | default('')
+         | regex_findall('(?m)^.*agents/tool-policy.*$') }}
+    dc_se_agent_turns: >-
+      {{ dc_se_log.stdout | default('')
+         | regex_findall('(?m)^.*agents\.' ~ dc_agent_id ~ '\.tools\.deny.*$') }}
+
+# Slack delivers each event to exactly ONE socket connection. If connections
+# exist that this deployment does not own, an event can be authorized by a
+# config we never audited -- which would void any sender-denial conclusion drawn
+# from a Slack reply. Surfaced because it changes what the evidence can mean.
+- name: Extract socket-mode connection warnings
+  ansible.builtin.set_fact:
+    dc_se_sockets: >-
+      {{ dc_se_log.stdout | default('')
+         | regex_findall('(?m)^.*active connections for this Slack app.*$') }}
+
+# WHO IS A PERMITTED SENDER, according to the RUNNING process.
+#
+# Anchored to the last `starting provider` marker, because the log spans
+# restarts and an unanchored count returns the union of every restart's
+# permitted set -- which reads as "everyone is permitted" and is never true of
+# any single moment. Config `get` answers what was written; this answers what
+# the process resolved.
+- name: Isolate the most recent provider start
+  ansible.builtin.set_fact:
+    dc_se_window: "{{ (dc_se_log.stdout | default('')) | split('starting provider') | last }}"
+
+- name: Read the currently resolved permitted senders
+  ansible.builtin.set_fact:
+    dc_se_resolved: >-
+      {{ dc_se_window | regex_findall('(?m)^.*(?:channel users resolved|slack users resolved).*$') }}
+
+- name: Report the effective permitted-sender set
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-SLACK-EVIDENCE EFFECTIVE SENDERS (anchored to the last provider start)']
+         + (dc_se_resolved | map('truncate', 180) | list)
+         + ['(an empty list here means NO per-channel sender restriction resolved — '
+            ~ 'on this build that FAILS OPEN, it does not mean nobody is permitted)'] }}
+
+- name: Count gateway processes on this host
+  ansible.builtin.shell:
+    cmd: pgrep -af 'openclaw/dist/index.js gateway' | grep -v pgrep | wc -l
+  register: dc_se_procs
+  changed_when: false
+  failed_when: false
+
+- name: Render the Slack evidence report
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-SLACK-EVIDENCE',
+          'log_lines=' ~ dc_se_lines,
+          'inbound_events=' ~ (dc_se_inbound | length),
+          'tool_policy_lines=' ~ (dc_se_turns | length),
+          (dc_agent_id ~ '_turns=') ~ (dc_se_agent_turns | length),
+          'gateway_processes_here=' ~ (dc_se_procs.stdout | default('?') | trim),
+          'socket_warnings=' ~ (dc_se_sockets | length)]
+         + ['--- inbound ---'] + (dc_se_inbound | map('truncate', 200) | list)
+         + ['--- ' ~ dc_agent_id ~ ' turns ---'] + (dc_se_agent_turns | map('truncate', 200) | list)
+         + ['--- socket connections ---'] + (dc_se_sockets | map('truncate', 240) | list) }}
+
+- name: Emit the evidence receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SLACK-EVIDENCE RECEIPT |
+      window=WHOLE LOG, which SPANS RESTARTS — counts here are cumulative, not current |
+      inbound={{ dc_se_inbound | length }} turns={{ dc_se_agent_turns | length }} |
+      READ THIS CAREFULLY: inbound present WITHOUT a turn is a refusal after
+      ingress. Inbound ABSENT proves nothing at all — the event may have been
+      delivered to a socket connection this deployment does not own, or the log
+      may have rotated. NO OUTPUT != REFUSAL. |
+      wrote_no_config=true restarted_nothing=true sent_no_message=true

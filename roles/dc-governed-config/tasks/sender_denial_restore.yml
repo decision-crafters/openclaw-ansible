@@ -1,0 +1,116 @@
+---
+# TASK-223 test 12b — RESTORATION. Written before the mutation it reverses.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags sender-denial-restore -e ansible_become=false -e dc_apply=true
+#
+# Restores from the ON-HOST baseline written by sender_denial_apply.yml, not
+# from anything held in a session. If the run that mutated the config is lost,
+# this still works.
+#
+# A negative test that leaves founder access uncertain is a FAILED ROLLBACK,
+# regardless of what the test itself scored.
+
+# EVIDENCE-CLASS: cumulative = dc_sdr_has_anchor
+# EVIDENCE-CLASS: present = dc_sdr_window
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Read the restore point
+  ansible.builtin.slurp:
+    src: "{{ dc_sender_test_baseline }}"
+  register: dc_sdr_raw
+  failed_when: false
+
+- name: Refuse without a restore point
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_sender_test_baseline }} is missing or unreadable. Cannot restore
+      what was never captured. Restore the allowlist by hand and verify Slack
+      access before trusting it.
+  when:
+    - dc_sdr_raw.content is not defined
+    - dc_fail_closed | bool
+
+- name: Parse the restore point
+  ansible.builtin.set_fact:
+    dc_sdr_users: "{{ (dc_sdr_raw.content | b64decode | from_json).users }}"
+
+- name: Restore the original sender allowlist
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ {'channels': {'slack': {'channels':
+                {dc_sender_test_channel: {'users': dc_sdr_users}}}}} | to_json }}"
+  register: dc_sdr_patch
+  changed_when: dc_sdr_patch.rc == 0
+  failed_when: false
+  timeout: 120
+
+- name: Restart the Gateway so the restoration takes effect
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['gateway', 'restart'] }}"
+  changed_when: true
+  failed_when: false
+  timeout: 180
+
+# ANCHORED WAIT. `until: stdout is search('socket mode connected')` over the
+# whole log is satisfied by a PREVIOUS restart's line, so it returns on the
+# first poll and waits for nothing — after which every check below runs against
+# a Gateway that may still be starting. Same defect class as the unanchored
+# resolution counts; found by the evidence contract, not by a failing run.
+- name: Wait for the Slack provider to reconnect
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['logs', '--limit', '300', '--plain', '--no-color'] }}"
+  register: dc_sdr_up
+  until: >-
+    {{ (dc_sdr_up.stdout | default('') | split('starting provider') | last)
+       is search('slack socket mode connected') }}
+  retries: 30
+  delay: 3
+  changed_when: false
+  failed_when: false
+
+# ANCHORED. The unanchored version of this assertion was a FALSE-CONFIRMATION
+# BUG: the Gateway file log spans restarts, so `channel users resolved.*founder`
+# matches the PRE-TEST resolution block and passes without the restoration
+# having taken effect at all. A rollback check that cannot fail is worse than no
+# rollback check, because it ends the test with founder access unverified while
+# reporting it verified.
+- name: Note whether the log can be anchored at all
+  ansible.builtin.set_fact:
+    dc_sdr_has_anchor: "{{ (dc_sdr_up.stdout | default('')) is search('starting provider') }}"
+
+- name: Isolate the most recent provider start
+  ansible.builtin.set_fact:
+    dc_sdr_window: "{{ (dc_sdr_up.stdout | default('')) | split('starting provider') | last }}"
+
+- name: Refuse to confirm restoration without an anchorable window
+  ansible.builtin.fail:
+    msg: >-
+      No 'starting provider' marker in the Gateway log, so restoration cannot be
+      confirmed against the running process — only against history, which always
+      shows the founder permitted. INSUFFICIENT EVIDENCE. Do not treat founder
+      access as restored; verify by sending a message before trusting it.
+  when:
+    - not dc_sdr_has_anchor | bool
+    - dc_fail_closed | bool
+
+- name: Confirm the founder is a permitted sender again
+  ansible.builtin.assert:
+    that:
+      - dc_sdr_window is search('channel users resolved.*' ~ dc_sender_test_founder)
+    fail_msg: >-
+      {{ dc_sender_test_founder }} did NOT resolve as a permitted channel user
+      after restoration. FOUNDER ACCESS IS NOT RESTORED. Do not stop here.
+    success_msg: "{{ dc_sender_test_founder }} resolves as a permitted channel user again"
+
+- name: Emit the restoration receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-12B RESTORE RECEIPT |
+      restored={{ dc_sdr_users | join(',') }} |
+      channel={{ dc_sender_test_channel }} |
+      NOT YET PROVEN: that a message from the founder reaches the agent. The
+      resolution log proves the permitted set was rebuilt, not that routing
+      works. SEND A POSITIVE-CONTROL MESSAGE and score with --tags slack-evidence.

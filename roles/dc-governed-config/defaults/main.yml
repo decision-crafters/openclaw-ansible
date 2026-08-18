@@ -305,6 +305,78 @@ dc_slack_allow_from: []
 # person, and this repository is public.
 dc_slack_required_conversations: []
 
+# TASK-223 test 12b — the sender-denial negative control.
+#
+# The placeholder is REPLACED IN, never removed to empty. `users: []` installs
+# no restriction on 2026.7.1-2 and fails OPEN, which made the 2026-08-17 run of
+# this test INDETERMINATE rather than a pass. sender_denial_apply.yml refuses an
+# empty placeholder outright.
+#
+# EMPTY BY DEFAULT for the channel and founder: this is a per-deployment test
+# naming a real person and a real conversation, and this repository is public.
+dc_sender_test_channel: ""
+dc_sender_test_founder: ""
+# Set in the PRIVATE inventory. It must LOOK like a real Slack user id -- the
+# runtime appears to drop ids it cannot resolve, which would leave the list
+# effectively empty and fail open -- but must not BE one. Empty here because
+# this repository is public and the value sits beside a real channel and a real
+# person; the apply task refuses an empty placeholder rather than defaulting to
+# a shape that would silently fail open.
+dc_sender_test_placeholder: ""
+dc_sender_test_baseline: "/var/tmp/dc-12b-baseline.json"
+
+# Slack ingress evidence capture (tasks/slack_evidence.yml). Read-only.
+#
+# The floor is the important one. The Gateway file log RESETS ON RESTART, so a
+# short log means "recently restarted", not "no Slack traffic". A scratchpad
+# version of this check scored a 7-line log as "this gateway never saw the
+# event" -- absence of evidence reported as evidence of absence, inside the very
+# check written to prevent that. Below this floor the task REFUSES to score.
+dc_slack_evidence_limit: 4000
+dc_slack_evidence_min_lines: 25
+
+# Conversations ROUTED to the governed agent. Consumed only by slack_rebind.yml.
+#
+# Deliberately separate from dc_slack_required_conversations above, because a DM
+# is named differently depending on the question being asked:
+#
+#   is it reachable?  -> the D... IM CONVERSATION id
+#   where does it go? -> the U... USER id of the sender
+#
+# One list served both until 2026-08-17. A routing binding was built from the
+# D... id, matched nothing, and stayed silent for a day; correcting the shared
+# variable in place would have fixed routing while silently disabling the two
+# access guards that select on the `^D` prefix. Neither meaning is wrong — they
+# are just not the same list, and collapsing them costs a guard either way.
+#
+# Accepts C... (public channel), G... (private channel or MPIM) and U... (user,
+# for a DM). A D... id is REFUSED rather than typed as `direct`.
+#
+# EMPTY BY DEFAULT, and it grants nothing on its own: routing an already-
+# authorized conversation to a governed agent is containment, not expansion.
+dc_slack_route_peers: []
+
+# The account bucket every routing binding is filed under. Written into each
+# entry by slack_rebind.yml; nothing else reads it.
+#
+# WHY THIS IS NOT SIMPLY OMITTED, WHICH IS WHAT THE FIRST VERSION DID
+#
+# `accountId` looks optional and reads as "any account". It is neither. Bindings
+# are bucketed by account BEFORE peer matching, and an absent accountId
+# normalises to the LITERAL STRING "default". If the deployment's Slack account
+# is named anything else, the bucket lookup misses, the peer tier never runs at
+# all, and every message falls through to the default agent.
+#
+# The failure is invisible from every angle the role can see: the config
+# validates, `agents bindings` prints the binding, and no error is emitted
+# anywhere. It presents as a bot that looks configured and answers nobody.
+#
+# "*" is the channel-wide fallback and is the safe default for a single-account
+# deployment. Set it to the explicit account id when a second Slack app exists —
+# at that point "*" stops being correct, because two agents would both claim
+# every account.
+dc_slack_binding_account_id: "*"
+
 # Loop and dedup protection — a named baseline requirement that had no key until
 # the schema was dumped. Enabled explicitly rather than left to the default,
 # because an inherited default is not an applied control.
@@ -702,6 +774,30 @@ dc_audit_paths:
   - plugins.enabled
   - plugins.bundledDiscovery
   # Slack binding
+  # THE ACCOUNT BUCKET. Added 2026-08-17, after a correct-looking binding failed
+  # to route for a second time.
+  #
+  # Routing buckets bindings by account BEFORE it ever compares a peer. An
+  # absent `accountId` on a binding normalises to the LITERAL string "default",
+  # so on an account named anything else the peer tier is never evaluated and
+  # every message falls through to the default agent. Thirty-odd paths were
+  # audited and not one of them answered "which account bucket is this".
+  #
+  # Same class of gap as `bindings` itself: a key nobody thought to look at,
+  # hiding the most consequential fact about where messages go.
+  - channels.slack.accounts
+  - channels.slack.accountId
+  # How a DM session key is built. With the default "main", Slack DMs collapse
+  # into the agent's main session, so a session key that does not name the DM
+  # peer is NOT evidence that a binding failed. Audited so that evidence is read
+  # correctly rather than argued about.
+  - session.dmScope
+  # Whether any of the runtime evidence above is observable at all. If verbose
+  # logging is off, an absent [routing] line means nothing was recorded -- not
+  # that nothing happened. Auditing this is what keeps NO OUTPUT from being
+  # misread as REFUSAL.
+  - logging
+  - logging.level
   - channels.slack.groupPolicy
   - channels.slack.channels
   - channels.slack.dmPolicy

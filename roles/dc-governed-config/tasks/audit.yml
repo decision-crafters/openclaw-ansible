@@ -346,3 +346,102 @@
       paths_read={{ dc_audit_ok }}/{{ dc_audit_paths | length }} |
       report={{ dc_audit_report }} (0600, {{ dc_audit_report_owner }}) |
       wrote_no_config=true restarted_nothing=true
+
+# --- is the running process on the config we audited? -------------------------
+#
+# Everything above reads the CONFIG. None of it reads the PROCESS. Those are
+# different questions, and the whole audit silently assumes they agree.
+#
+# handlers/main.yml already names this divergence — a config changed on disk with
+# the running process still on the previous one — as the worst outcome this role
+# can produce. It was written as a warning about the restart handler and left
+# undetected everywhere else.
+#
+# Added 2026-08-17, after a routing binding was written, validated, read back and
+# confirmed bound, and still did not route. Every check the role had said the
+# change was applied. Not one of them asked whether the process had it.
+#
+# This is deliberately NOT a pass/fail gate. A process older than the config is
+# perfectly normal for a key the runtime reads per-request, and failing the audit
+# on it would cry wolf on the ordinary case — the mistake `cron list` made above
+# and the reason it was rewritten. It reports a fact and names its own limits.
+# Both epochs are produced by the TARGET, in one script, as two integers.
+#
+# The first version of this parsed systemd's human timestamp in Jinja with
+# `to_datetime(...) | to_datetime | int`. That format varies by locale and
+# systemd version, and the chain does not mean what it reads like — it would
+# have produced a confident verdict from a silently wrong number. Three separate
+# defects in this workstream came from exactly that move. `date -d` is the tool
+# that already knows how to parse systemd's output; use it.
+#
+# `date -d ""` fails loudly on an unparseable string, which is what we want:
+# rc != 0 becomes UNKNOWN rather than epoch 0 becoming "process is ancient".
+- name: Read the process start and config write times as epochs
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      started=$({{ dc_runuser }} -u {{ dc_openclaw_user }} --
+      env XDG_RUNTIME_DIR=/run/user/{{ dc_audit_uid | default('') }}
+      systemctl --user show {{ dc_openclaw_service | quote }}
+      -p ActiveEnterTimestamp --value) &&
+      test -n "$started" &&
+      printf 'started=%s\nconfig=%s\n'
+      "$(date -d "$started" +%s)"
+      "$(stat -c %Y {{ dc_openclaw_config_path | quote }})"
+  register: dc_audit_ages
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# regex_findall, NOT regex_search with a capture group.
+#
+# `regex_search(p, '\1')` returns None when nothing matches, and `| first` then
+# raises "'NoneType' object is not iterable" — which FAILS THE WHOLE AUDIT. The
+# `| default('')` sits after `first` and never gets the chance to help.
+#
+# That is the wrong failure direction for a check whose entire purpose is to
+# report an unanswerable question as UNKNOWN. An audit that dies while telling
+# you it could not read a timestamp has destroyed thirty other findings to
+# report one absence. regex_findall returns [] on no match, and `[] | first`
+# yields Undefined, which `default('')` does catch.
+- name: Record the two epochs
+  ansible.builtin.set_fact:
+    dc_audit_started_at: >-
+      {{ (dc_audit_ages.stdout | default('')
+          | regex_findall('started=([0-9]+)') | first | default('')) }}
+    dc_audit_config_at: >-
+      {{ (dc_audit_ages.stdout | default('')
+          | regex_findall('config=([0-9]+)') | first | default('')) }}
+  failed_when: false
+
+# Both timestamps or neither. A comparison against a missing value would produce
+# a confident-looking verdict from one real number and one default, which is
+# worse than reporting that the question could not be answered.
+- name: Classify config-versus-process drift
+  ansible.builtin.set_fact:
+    dc_audit_drift: >-
+      {{ 'UNKNOWN — could not read both timestamps (rc='
+           ~ (dc_audit_ages.rc | default('?'))
+           ~ '); this is NOT evidence that the process is current'
+         if (dc_audit_started_at | default('') | length == 0)
+            or (dc_audit_config_at | default('') | length == 0)
+         else ('PROCESS PREDATES CONFIG by '
+               ~ ((dc_audit_config_at | int) - (dc_audit_started_at | int))
+               ~ 's — keys this runtime reads only at startup are NOT live'
+               if (dc_audit_config_at | int) > (dc_audit_started_at | int)
+               else 'process started at or after the last config write') }}
+  failed_when: false
+
+# The comparison above parses a systemd timestamp format that varies by locale
+# and systemd version. If it throws, the fact is simply undefined — so the
+# report must handle that rather than assume a verdict was produced.
+- name: Report config-versus-process drift
+  ansible.builtin.debug:
+    msg: >-
+      DC-AUDIT DRIFT |
+      {{ dc_audit_drift | default('UNKNOWN — the drift comparison did not evaluate') }} |
+      config={{ dc_openclaw_config_path }} |
+      NOTE this compares WHEN, not WHAT. A process newer than the config is not
+      proof it loaded these values, and a process older than the config is not
+      proof it did not — the runtime may re-read a key per request. This narrows
+      the question; it does not close it.

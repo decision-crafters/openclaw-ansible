@@ -96,3 +96,30 @@
         tasks_from: remove_agent
   tags:
     - remove-agent
+
+# TASK-223 test 12b — sender-denial negative control. Sibling of the 12c
+# authority-injection harness. Mutates ONE channel allowlist and restarts;
+# sender controls are resolved at Gateway startup, so a restart is required and
+# is part of the test rather than an afterthought.
+- name: Run the 12b sender-denial negative control
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Install the deny state
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sender_denial_apply
+  tags:
+    - sender-denial
+
+# The reversal, written before the thing it reverses.
+- name: Restore the sender allowlist
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Restore from the on-host baseline
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sender_denial_restore
+  tags:
+    - sender-denial-restore

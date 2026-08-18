@@ -88,3 +88,19 @@
         tasks_from: subagent_conformance
   tags:
     - subagent-conformance
+
+# Read-only Slack ingress evidence, from the OpenClaw FILE log rather than
+# journald. Separate from --tags logs because that reads journald, which carries
+# no Slack lines at all on this host — searching it returns zero and reads as
+# "no events" when it means "wrong sink".
+- name: Capture Slack ingress evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read inbound events and agent turns
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_evidence
+  tags:
+    - slack-evidence

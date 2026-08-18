@@ -103,6 +103,14 @@
     mode: '0600'
   when: (dc_ub_before.rc | default(1)) == 0
 
+# NOTIFIES THE RESTART HANDLER, for the same reason slack_rebind.yml does and
+# with a sharper consequence.
+#
+# `bindings` is read at startup. Deleting the key without a restart leaves the
+# running process still routing to the governed agent — so the REVERSAL would
+# report success while the thing it reverses is still in force. This play exists
+# to restore the founder's route into a host whose only human access is Slack;
+# a reversal that silently does not reverse is the worst possible version of it.
 - name: Delete the bindings key
   ansible.builtin.command:
     argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
@@ -112,6 +120,7 @@
   failed_when: false
   timeout: 120
   when: (dc_ub_before.rc | default(1)) == 0
+  notify: Restart openclaw gateway
 
 - name: Read the bindings back
   ansible.builtin.command:
