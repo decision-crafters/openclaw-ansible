@@ -1,0 +1,105 @@
+---
+# THE ONLY PLACE IN THIS ROLE THAT MAY EMIT `--model`.
+#
+# Included by every task that invokes an agent, BEFORE the invocation. It sets
+# exactly one fact:
+#
+#     dc_model_override_args  ->  []                    (default: DENY)
+#                             ->  ['--model', '<id>']   (validated grant only)
+#
+# Harnesses append that fact to their argv. They never write the flag
+# themselves, and `tests/dc_model_override_contract.py` fails the build if any
+# task file mentions `--model` outside this one. The prohibition is therefore
+# structural: a harness cannot emit the flag by forgetting a rule, because it
+# has no code path that produces it.
+#
+# WHY A CONTROL AND NOT A CONVENTION
+#
+# `openclaw agent --model <id>` overrides an agent's pinned model at the CALL
+# SITE. It lives in the CLI, not in openclaw.json, so configuration auditing
+# cannot see it: `agents.list` can be perfectly pinned while every run passes
+# something else. Until now the harnesses avoided it by COMMENT — and this
+# workstream has already demonstrated, four times over, that a written-down
+# rule is not a control.
+#
+# Founder authorization 2026-08-19: per-run overrides are mechanically
+# prohibited by default; an exception requires a task-bound grant naming the
+# agent and the exact model.
+
+- name: Default to DENY — no override unless a grant proves otherwise
+  ansible.builtin.set_fact:
+    dc_model_override_args: []
+    dc_model_override_state: "DENIED BY DEFAULT — no grant supplied"
+
+- name: Note whether a grant was offered at all
+  ansible.builtin.stat:
+    path: "{{ dc_model_override_grant }}"
+  register: dc_mog_stat
+  when: (dc_model_override_grant | default('') | length) > 0
+
+- name: Install the grant validator
+  ansible.builtin.copy:
+    src: validate_model_grant.py
+    dest: "{{ dc_model_grant_validator_path }}"
+    owner: root
+    group: root
+    mode: '0500'
+  when: dc_mog_stat.stat.exists | default(false)
+
+- name: Install the grant schema
+  ansible.builtin.copy:
+    src: model-override-grant.schema.json
+    dest: "{{ dc_model_grant_schema_path }}"
+    owner: root
+    group: root
+    mode: '0444'
+  when: dc_mog_stat.stat.exists | default(false)
+
+# Validation runs on the target against the real grant file. A grant that fails
+# leaves dc_model_override_args at [], so the run proceeds WITHOUT an override
+# rather than failing — unless fail-closed is on, in which case it refuses
+# outright. Silently downgrading an intended override to the pinned model would
+# be its own surprise.
+- name: Validate the grant against the schema and this agent
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - "{{ dc_model_grant_validator_path }}"
+      - "{{ dc_model_override_grant }}"
+      - "{{ dc_model_grant_schema_path }}"
+      - "{{ dc_agent_id }}"
+  register: dc_mog_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: dc_mog_stat.stat.exists | default(false)
+
+- name: Refuse a grant that does not validate
+  ansible.builtin.fail:
+    msg: >-
+      A model-override grant was supplied and REJECTED:
+      {{ dc_mog_validate.stderr | default('') | truncate(700) }}
+      Proceeding without the override would silently run the pinned model while
+      the operator believed an override was in force, so this refuses instead.
+  when:
+    - dc_mog_stat.stat.exists | default(false)
+    - (dc_mog_validate.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Arm the override from the validated grant
+  ansible.builtin.set_fact:
+    dc_model_override_args: >-
+      {{ ['--model', (dc_mog_validate.stdout_lines | last | trim)] }}
+    dc_model_override_state: >-
+      GRANTED — {{ dc_mog_validate.stdout_lines | first | default('') }}
+  when:
+    - dc_mog_stat.stat.exists | default(false)
+    - (dc_mog_validate.rc | default(1)) == 0
+
+- name: State the override decision
+  ansible.builtin.debug:
+    msg: >-
+      DC-MODEL-OVERRIDE | {{ dc_model_override_state }} |
+      args={{ dc_model_override_args }} |
+      Absence of a grant is DENIAL, not an error. The agent's pinned model
+      governs unless a task-bound grant names this agent and an exact model.

@@ -65,9 +65,16 @@
 #
 # `--session` gives each turn its own key. The variant id is the key, so a
 # transcript can be traced back to the turn that produced it.
+# Per-run --model overrides are mechanically prohibited by default. The gate
+# is the only place permitted to emit that flag and defaults to emitting
+# nothing, so this harness cannot override the agent's pinned model even by
+# omission. Founder authorization 2026-08-19.
+- name: Decide whether any model override is authorised
+  ansible.builtin.include_tasks: model_override_gate.yml
+
 - name: Build the turn command
   ansible.builtin.set_fact:
-    dc_inject_cli: "{{ dc_audit_cli + ['agent', '--agent', dc_agent_id] }}"
+    dc_inject_cli: "{{ dc_audit_cli + ['agent', '--agent', dc_agent_id] + dc_model_override_args }}"
 
 # ASK THE BINARY WHICH FLAG IT HAS. This play already depended on a flag that
 # does not exist.

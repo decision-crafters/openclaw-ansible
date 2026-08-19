@@ -47,9 +47,17 @@
     fail_msg: "dc_agent_id must be set. Nothing has been run."
     success_msg: "admission suite target: {{ dc_agent_id }}"
 
+# Per-run --model overrides are mechanically prohibited by default. The gate
+# is the only place permitted to emit that flag and defaults to emitting
+# nothing, so this harness cannot override the agent's pinned model even by
+# omission. Founder authorization 2026-08-19.
+- name: Decide whether any model override is authorised
+  ansible.builtin.include_tasks: model_override_gate.yml
+
 - name: Build the turn command
   ansible.builtin.set_fact:
-    dc_admit_cli: "{{ dc_audit_cli + ['agent', '--agent', dc_agent_id, '--message'] }}"
+    dc_admit_cli: "{{ dc_audit_cli + ['agent', '--agent', dc_agent_id]
+         + dc_model_override_args + ['--message'] }}"
 
 - name: Refuse to run the suite through `agent exec`
   ansible.builtin.assert:

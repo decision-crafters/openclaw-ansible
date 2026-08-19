@@ -1303,3 +1303,19 @@ dc_tool_probe_prompt: >-
 dc_tool_probe_report: >-
   /tmp/openclaw-tool-surface-{{
      ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+
+# --- Model override gate ------------------------------------------------------
+#
+# EMPTY BY DEFAULT AND THAT IS THE CONTROL. With no grant path set, the gate
+# emits no --model at all and the agent's pinned model governs.
+#
+# `openclaw agent --model <id>` overrides the pin at the CALL SITE. It lives in
+# the CLI, not in openclaw.json, so configuration auditing cannot see it:
+# agents.list can be perfectly pinned while every run passes something else.
+#
+# Set this only to a grant naming the exact agent and exact model, bound to a
+# task, accepted by the founder, and single-use. The schema makes the
+# alternatives INEXPRESSIBLE rather than merely invalid.
+dc_model_override_grant: ""
+dc_model_grant_validator_path: "/root/.dc-validate-model-grant.py"
+dc_model_grant_schema_path: "/root/.dc-model-override-grant.schema.json"

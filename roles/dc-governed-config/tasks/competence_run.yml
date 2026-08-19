@@ -137,39 +137,30 @@
     - not (dc_cr_agent_help.stdout | default('') is search('--session-key'))
     - dc_fail_closed | bool
 
+# Per-run --model overrides are mechanically prohibited by default. The gate is
+# the ONLY place in this role permitted to emit that flag, and it defaults to
+# emitting nothing. Founder authorization 2026-08-19.
+- name: Decide whether any model override is authorised
+  ansible.builtin.include_tasks: model_override_gate.yml
+
 - name: Invoke the agent on the frozen packet in a fresh session
   ansible.builtin.command:
-    argv:
-      - "{{ dc_runuser }}"
-      - -u
-      - "{{ dc_openclaw_user }}"
-      - --
-      - env
-      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
-      - "HOME={{ dc_openclaw_home }}"
-      - /usr/bin/node
-      - "{{ dc_audit_entrypoint }}"
-      # `openclaw agent` takes NO POSITIONAL ARGUMENTS. Usage is
-      # `openclaw agent [options]`; the message body is --message.
-      #
-      # "Too many arguments" was the PROMPT passed positionally, not --agent.
-      # An intermediate fix made the agent id positional on the strength of the
-      # error's hint text and would have failed identically -- the usage line
-      # was sitting in the CLI surface artifact the whole time.
-      #
-      # --model is DELIBERATELY NOT PASSED. It is a per-run model override that
-      # would supersede the agent's pin, and observing the pin govern a turn is
-      # half of what this run exists for.
-      #
-      # --deliver is DELIBERATELY NOT PASSED (defaults false), so this test does
-      # not post to Slack.
-      - agent
-      - --agent
-      - "{{ dc_agent_id }}"
-      - --session-key
-      - "{{ dc_competence_session_key }}"
-      - --message
-      - "{{ dc_competence_prompt }}"
+    # Base argv, then the gate's decision appended. This harness has NO
+    # code path that emits --model on its own: dc_model_override_args is
+    # [] unless a validated, task-bound grant armed it. The prohibition
+    # is structural rather than advisory, and the contract test fails the
+    # build if --model appears literally in any task file but the gate.
+    #
+    # --deliver is still deliberately absent (defaults false), so no test
+    # run posts to Slack.
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env',
+          'XDG_RUNTIME_DIR=/run/user/' ~ dc_openclaw_uid,
+          'HOME=' ~ dc_openclaw_home,
+          '/usr/bin/node', dc_audit_entrypoint,
+          'agent', '--agent', dc_agent_id,
+          '--session-key', dc_competence_session_key,
+          '--message', dc_competence_prompt] + dc_model_override_args }}
   register: dc_cr_run
   changed_when: true
   failed_when: false

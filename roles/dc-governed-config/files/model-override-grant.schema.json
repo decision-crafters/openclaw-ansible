@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Model override grant",
+  "description": "Authorises ONE governed harness run to pass --model, overriding an agent's pinned model. Fail-closed by construction: absence of a grant is denial, and several fields are const so that an over-broad grant cannot be EXPRESSED rather than merely rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agentId", "model", "taskId", "decisionRecord", "acceptedBy", "reason", "reversal", "singleUse"],
+  "properties": {
+    "agentId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exact agent. A grant naming no agent, or a wildcard, is not expressible."
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^*]+$",
+      "description": "The exact model. Wildcards are refused by pattern: a grant must name what will run, not a family."
+    },
+    "taskId": {
+      "type": "string",
+      "pattern": "^TASK-[0-9]+$",
+      "description": "The task the override serves. Task-bound by construction."
+    },
+    "decisionRecord": {
+      "type": "string",
+      "minLength": 8,
+      "description": "The canonical record carrying the acceptance."
+    },
+    "acceptedBy": {
+      "const": "Tosin Akinosho",
+      "description": "Sole acceptance authority. A const, so a self-accepted grant cannot be expressed."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 40,
+      "description": "Why the pinned model is insufficient for this run. Length floor deters a placeholder."
+    },
+    "reversal": {
+      "type": "string",
+      "minLength": 10,
+      "description": "How the run is undone. If it cannot be described, it is not reversible."
+    },
+    "singleUse": {
+      "const": true,
+      "description": "A const, so a STANDING override cannot be expressed. One grant, one run."
+    }
+  }
+}

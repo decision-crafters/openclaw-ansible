@@ -133,25 +133,30 @@
 
 # --model is NOT passed: it would override the agent's pinned model.
 # --deliver is NOT passed (defaults false): nothing reaches Slack.
+# Per-run --model overrides are mechanically prohibited by default. The gate is
+# the ONLY place in this role permitted to emit that flag, and it defaults to
+# emitting nothing. Founder authorization 2026-08-19.
+- name: Decide whether any model override is authorised
+  ansible.builtin.include_tasks: model_override_gate.yml
+
 - name: Ask the agent to enumerate what it can call
   ansible.builtin.command:
-    argv:
-      - "{{ dc_runuser }}"
-      - -u
-      - "{{ dc_openclaw_user }}"
-      - --
-      - env
-      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
-      - "HOME={{ dc_openclaw_home }}"
-      - /usr/bin/node
-      - "{{ dc_audit_entrypoint }}"
-      - agent
-      - --agent
-      - "{{ dc_agent_id }}"
-      - --session-key
-      - "{{ dc_tool_probe_session_key }}"
-      - --message
-      - "{{ dc_tool_probe_prompt }}"
+    # Base argv, then the gate's decision appended. This harness has NO
+    # code path that emits --model on its own: dc_model_override_args is
+    # [] unless a validated, task-bound grant armed it. The prohibition
+    # is structural rather than advisory, and the contract test fails the
+    # build if --model appears literally in any task file but the gate.
+    #
+    # --deliver is still deliberately absent (defaults false), so no test
+    # run posts to Slack.
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env',
+          'XDG_RUNTIME_DIR=/run/user/' ~ dc_openclaw_uid,
+          'HOME=' ~ dc_openclaw_home,
+          '/usr/bin/node', dc_audit_entrypoint,
+          'agent', '--agent', dc_agent_id,
+          '--session-key', dc_tool_probe_session_key,
+          '--message', dc_tool_probe_prompt] + dc_model_override_args }}
   register: dc_tsp_run
   changed_when: true
   failed_when: false
