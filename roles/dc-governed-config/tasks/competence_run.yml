@@ -112,7 +112,7 @@
 # would have prevented the whole cycle.
 - name: Discover the agent subcommand's flags
   ansible.builtin.command:
-    argv: "{{ dc_audit_cli + ['agent', '--help'] }}"
+    argv: "{{ dc_audit_cli + ['agent', dc_agent_id, '--help'] }}"
   register: dc_cr_agent_help
   changed_when: false
   failed_when: false
@@ -121,16 +121,17 @@
 - name: Refuse to invoke with flags this build does not have
   ansible.builtin.fail:
     msg: >-
-      `openclaw agent --help` did not offer the flags this play uses
+      `openclaw agent {{ dc_agent_id }} --help` did not offer --session-key
       (rc={{ dc_cr_agent_help.rc | default('?') }}).
-      --agent present: {{ dc_cr_agent_help.stdout is search('--agent') }};
-      --session-key present: {{ dc_cr_agent_help.stdout is search('--session-key') }}.
+      NOTE the help page: the AGENT ID IS POSITIONAL, and the flags live under
+      `agent <id> --help`, not `agent --help`. The first version of this check
+      read the latter, passed, and let a wrong invocation through — asking the
+      binary is only worth anything if it is the right page.
       Invoking anyway would produce an empty run that is INDETERMINATE rather
       than informative. Help output follows:
       {{ dc_cr_agent_help.stdout | default('') | truncate(900) }}
   when:
-    - not (dc_cr_agent_help.stdout | default('') is search('--agent'))
-      or not (dc_cr_agent_help.stdout | default('') is search('--session-key'))
+    - not (dc_cr_agent_help.stdout | default('') is search('--session-key'))
     - dc_fail_closed | bool
 
 - name: Invoke the agent on the frozen packet in a fresh session
@@ -145,8 +146,9 @@
       - "HOME={{ dc_openclaw_home }}"
       - /usr/bin/node
       - "{{ dc_audit_entrypoint }}"
+      # POSITIONAL. `--agent <id>` is not this command's shape; passing it
+      # alongside the prompt yields "Too many arguments for this command".
       - agent
-      - --agent
       - "{{ dc_agent_id }}"
       - --session-key
       - "{{ dc_competence_session_key }}"
