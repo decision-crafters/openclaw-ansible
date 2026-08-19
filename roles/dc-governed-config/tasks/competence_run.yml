@@ -103,6 +103,36 @@
     - dc_cr_sessions_before.stdout is search(dc_competence_session_key)
     - dc_fail_closed | bool
 
+# ASK THE BINARY BEFORE USING THE FLAGS.
+#
+# A previous harness in this workstream took `--session` from documentation for
+# a different command, never checked it against --help, and produced five turns
+# of no output. The evaluator correctly called that INDETERMINATE, which is the
+# only reason a completely broken run did not read as a clean sweep. One --help
+# would have prevented the whole cycle.
+- name: Discover the agent subcommand's flags
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['agent', '--help'] }}"
+  register: dc_cr_agent_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to invoke with flags this build does not have
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw agent --help` did not offer the flags this play uses
+      (rc={{ dc_cr_agent_help.rc | default('?') }}).
+      --agent present: {{ dc_cr_agent_help.stdout is search('--agent') }};
+      --session-key present: {{ dc_cr_agent_help.stdout is search('--session-key') }}.
+      Invoking anyway would produce an empty run that is INDETERMINATE rather
+      than informative. Help output follows:
+      {{ dc_cr_agent_help.stdout | default('') | truncate(900) }}
+  when:
+    - not (dc_cr_agent_help.stdout | default('') is search('--agent'))
+      or not (dc_cr_agent_help.stdout | default('') is search('--session-key'))
+    - dc_fail_closed | bool
+
 - name: Invoke the agent on the frozen packet in a fresh session
   ansible.builtin.command:
     argv:
@@ -126,9 +156,18 @@
   failed_when: false
   timeout: 900
 
+# stdout AND stderr. The first version wrote stdout only, so the run that
+# failed with rc=1 and no stdout produced a transcript containing nothing and a
+# refusal message that could not say why. A harness that detects a broken
+# invocation and cannot describe it has done half its job.
 - name: Write the transcript for independent scoring
   ansible.builtin.copy:
-    content: "{{ dc_cr_run.stdout | default('') }}"
+    content: |
+      === rc={{ dc_cr_run.rc | default('?') }} ===
+      === stdout ===
+      {{ dc_cr_run.stdout | default('') }}
+      === stderr ===
+      {{ dc_cr_run.stderr | default('') }}
     dest: "{{ dc_competence_report }}"
     owner: root
     group: root
@@ -141,7 +180,9 @@
     msg: >-
       The agent returned no output (rc={{ dc_cr_run.rc | default('?') }}).
       That is INDETERMINATE — a broken invocation, not a wrong answer, and not
-      a refusal. Do not score it. Transcript at {{ dc_competence_report }}.
+      a refusal. Do not score it against the rubric.
+      stderr: {{ dc_cr_run.stderr | default('(none captured)') | truncate(700) }}
+      Transcript at {{ dc_competence_report }}.
   when:
     - (dc_cr_run.stdout | default('') | trim | length) == 0
     - dc_fail_closed | bool
