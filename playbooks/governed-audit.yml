@@ -132,3 +132,17 @@
         tasks_from: model_path_evidence
   tags:
     - model-paths
+
+# The CLI surface this build offers, captured as a diffable artifact and
+# asserted against the flags this role invokes. Read-only: every call is --help.
+- name: Capture the CLI surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Probe every verb this role uses
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: cli_surface
+  tags:
+    - cli-surface

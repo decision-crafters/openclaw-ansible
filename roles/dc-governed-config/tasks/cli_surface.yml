@@ -1,0 +1,121 @@
+---
+# The CLI surface this build actually offers, captured as a governed artifact.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags cli-surface -e ansible_become=false
+#
+# READ-ONLY. Every invocation is `--help`.
+#
+# WHY THIS EXISTS
+#
+# Four separate failures in this workstream came from inferring a CLI shape
+# instead of reading it, and each was recoverable only because something
+# downstream refused:
+#
+#   `--session`      taken from documentation for a DIFFERENT command; five
+#                    turns returned nothing and scored INDETERMINATE.
+#   `plugins list`   assumed to exist; it did not, and hung on stdin rather
+#                    than erroring, costing a debugging session.
+#   `--agent <id>`   passed to `openclaw agent`, whose agent id is POSITIONAL:
+#                    "Too many arguments for this command".
+#   `agent --help`   read as the flag surface when the flags live under
+#                    `agent <id> --help` — a preflight that passed a broken
+#                    invocation, which is worse than no preflight.
+#
+# The lesson was written down after the first one and did not hold, because
+# "ask the binary" is a habit and habits are not controls. This is the control:
+# the surface is recorded, and the flags this role DEPENDS ON are asserted to
+# exist. An OpenClaw upgrade that renames one now fails an audit instead of a
+# 3am run.
+#
+# The report is written to a file so it can be DIFFED across upgrades. What
+# changed in the CLI between two versions is otherwise nobody's artifact.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Capture the top-level verb list
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['--help'] }}"
+  register: dc_cs_top
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Capture each subcommand's help page
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + (item.argv | default([item.verb, '--help'])) }}"
+  register: dc_cs_pages
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: "{{ dc_cli_surface_probes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# The assertion that makes this a control rather than a report.
+#
+# Each probe declares the flags this role INVOKES. A missing one means the role
+# is about to call something this build does not have — which historically
+# produced silence, a hang, or an unparseable error, never a clean failure.
+- name: Find required flags this build does not offer
+  ansible.builtin.set_fact:
+    dc_cs_missing: >-
+      {{ (dc_cs_missing | default([])) + (
+           [item.item.name ~ ' -> ' ~ (item.item.requires
+             | reject('in', item.stdout | default('')) | list | join(', '))]
+           if (item.item.requires | default([])
+               | reject('in', item.stdout | default('')) | list | length) > 0
+           else []) }}
+  loop: "{{ dc_cs_pages.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Refuse when the role depends on a flag this build lacks
+  ansible.builtin.fail:
+    msg: >-
+      This build does not offer flags this role invokes:
+      {{ dc_cs_missing | join(' | ') }}.
+      Calling them has historically produced silence, a hang, or an
+      unparseable error rather than a clean failure — which is why this is a
+      refusal and not a warning. Reconcile the role against the CLI before
+      running anything that uses them.
+  when:
+    - (dc_cs_missing | default([]) | length) > 0
+    - dc_fail_closed | bool
+
+- name: Render the CLI surface report
+  ansible.builtin.copy:
+    content: |
+      # OpenClaw CLI surface — host {{ inventory_hostname }}
+      # Captured {{ ansible_facts['date_time'].iso8601 }}
+      # Diff this across upgrades: a renamed or removed flag is a breaking
+      # change to every play that invokes it, and is otherwise invisible until
+      # something fails at runtime.
+
+      === top-level ===
+      {{ dc_cs_top.stdout | default('(unavailable)') }}
+      {% for r in dc_cs_pages.results | default([]) %}
+
+      === {{ r.item.name }} ===  (rc={{ r.rc | default('?') }})
+      requires: {{ r.item.requires | default([]) | join(', ') or '(none declared)' }}
+      {{ r.stdout | default('(unavailable)') }}
+      {% endfor %}
+    dest: "{{ dc_cli_surface_report }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Emit the CLI surface receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-CLI-SURFACE RECEIPT |
+      probes={{ dc_cli_surface_probes | length }} |
+      answered={{ dc_cs_pages.results | default([])
+                  | selectattr('rc', 'equalto', 0) | list | length }} |
+      required_flags_missing={{ dc_cs_missing | default([]) | length }} |
+      report={{ dc_cli_surface_report }} |
+      A probe that did not answer is UNKNOWN, not absent — an unrecognised
+      subcommand on this build does not necessarily error, it can wait on
+      stdin. Read rc before reading the page. |
+      wrote_no_config=true restarted_nothing=true

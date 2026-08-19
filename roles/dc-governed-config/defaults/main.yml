@@ -1223,3 +1223,56 @@ dc_competence_prompt: ""
 dc_competence_report: >-
   /tmp/openclaw-competence-{{
      ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+
+# --- CLI surface audit --------------------------------------------------------
+#
+# Every verb this role invokes, with the flags it DEPENDS ON. `requires` is the
+# contract: the audit refuses if this build does not offer one, because calling
+# a flag that does not exist has historically produced silence or a hang here,
+# never a clean error.
+#
+# `argv` overrides the default `<verb> --help` where the help page is not there.
+# `agent` is the case that taught this: the flags live under
+# `agent <id> --help`, and `agent --help` is a DIFFERENT page that mentions
+# --agent and passed a preflight for an invocation that could not work.
+dc_cli_surface_probes:
+  - name: "config"
+    argv: ["config", "--help"]
+    requires: ["get", "patch", "schema", "validate"]
+  - name: "config patch"
+    argv: ["config", "patch", "--help"]
+    requires: ["--stdin", "--dry-run"]
+  - name: "agent <id>"
+    argv: ["agent", "{{ dc_agent_id }}", "--help"]
+    requires: ["--session-key"]
+  - name: "sessions"
+    argv: ["sessions", "--help"]
+    requires: ["list"]
+  - name: "sessions list"
+    argv: ["sessions", "list", "--help"]
+    requires: ["--agent"]
+  - name: "logs"
+    argv: ["logs", "--help"]
+    requires: ["--limit", "--plain", "--no-color"]
+  - name: "gateway"
+    argv: ["gateway", "--help"]
+    requires: ["restart", "status"]
+  - name: "agents"
+    argv: ["agents", "--help"]
+    requires: []
+  - name: "cron"
+    argv: ["cron", "--help"]
+    requires: ["list"]
+  - name: "hooks"
+    argv: ["hooks", "--help"]
+    requires: []
+  - name: "plugins"
+    argv: ["plugins", "--help"]
+    requires: []
+  - name: "pairing"
+    argv: ["pairing", "--help"]
+    requires: []
+
+dc_cli_surface_report: >-
+  /tmp/openclaw-cli-surface-{{
+     ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
