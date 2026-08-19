@@ -1284,3 +1284,22 @@ dc_cli_surface_probes:
 dc_cli_surface_report: >-
   /tmp/openclaw-cli-surface-{{
      ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+
+# --- Tool-surface probe -------------------------------------------------------
+#
+# Verifies an agent's EFFECTIVE tool surface after a tools allow/deny change.
+# Names the tool it is checking: a probe that does not name one cannot fail.
+#
+# Empty by default. The probe invokes the agent, so it needs an authorization
+# that says so, and the session key must be unused — a reused session reports
+# the surface as it was when that session began.
+dc_tool_probe_expect_denied: ""
+dc_tool_probe_session_key: ""
+dc_tool_probe_prompt: >-
+  List every tool you are able to call, exactly as they appear in your function
+  schema, one per line. Do not call any of them. If you cannot call a tool that
+  you would expect to have, say so explicitly. Answer only with the list and
+  that note.
+dc_tool_probe_report: >-
+  /tmp/openclaw-tool-surface-{{
+     ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt

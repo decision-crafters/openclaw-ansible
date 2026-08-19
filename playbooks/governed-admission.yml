@@ -150,3 +150,16 @@
         tasks_from: competence_run
   tags:
     - competence
+
+# Verify an agent's effective tool surface after a tools allow/deny change.
+# Invokes the agent; writes no config and restarts nothing.
+- name: Probe the effective tool surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Enumerate what the agent can actually call
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: tool_surface_probe
+  tags:
+    - tool-surface

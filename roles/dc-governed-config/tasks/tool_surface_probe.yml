@@ -1,0 +1,230 @@
+---
+# Verify an agent's EFFECTIVE tool surface after a tool allow/deny change.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags tool-surface -e ansible_become=false -e dc_apply=true
+#
+# INVOKES THE AGENT, so it needs the same explicit apply as any other agent
+# invocation. It writes no configuration and restarts nothing: the config change
+# is applied separately by --tags agent-profile, which owns the dry-run, backup,
+# validation, restart and readback. This task answers only the question that
+# play cannot: what the agent can ACTUALLY call afterwards.
+#
+# WHY A FRESH SESSION
+#
+# A pre-existing session carries its own resolved state. Reusing one would
+# report the surface as it was when that session began, which is precisely the
+# wrong answer after a policy change.
+#
+# THE RULE THIS TASK EXISTS TO ENFORCE
+#
+# The tool-policy log records REMOVALS ONLY. If the changed tool appears in a
+# `removedTools` array it is DENIED BY RULE — a captured config-layer denial. If
+# it does NOT appear, that is NOT a denial: the tool may never have been offered.
+# Absence must be corroborated against the agent's own enumeration of what it can
+# call, which this task therefore also collects. Reporting "not in the log" as
+# "denied" would manufacture a control out of silence.
+#
+# EVIDENCE-ANCHOR: "rule":"tools.profile
+# EVIDENCE-CLASS: cumulative = dc_tsp_log_lines, dc_tsp_has_chain
+# EVIDENCE-CLASS: present = dc_tsp_window, dc_tsp_chain, dc_tsp_is_agent_turn, dc_tsp_removed
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse to invoke the agent without an explicit apply
+  ansible.builtin.fail:
+    msg: >-
+      This task invokes the agent. Re-run with -e dc_apply=true under an
+      authorization that names this probe. Nothing has been invoked.
+  when: not (dc_apply | default(false) | bool)
+
+- name: Refuse without a tool to verify and a fresh session key
+  ansible.builtin.assert:
+    that:
+      - dc_tool_probe_expect_denied | default('') | length > 0
+      - dc_tool_probe_session_key | default('') | length > 0
+    fail_msg: >-
+      dc_tool_probe_expect_denied and dc_tool_probe_session_key must be set.
+      A probe that does not name the tool it is checking cannot fail.
+    success_msg: "verifying {{ dc_tool_probe_expect_denied | default('?') }} is denied for {{ dc_agent_id }}"
+
+# --- the configured claim ------------------------------------------------------
+- name: Read the deployed agents
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_tsp_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Extract the target agent's configured deny list
+  ansible.builtin.set_fact:
+    dc_tsp_configured_deny: >-
+      {{ ((dc_tsp_agents.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_agent_id) | first).tools.deny | default([]) }}
+
+- name: Refuse when the runtime does not carry the expected deny
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_tool_probe_expect_denied }} is not in
+      agents.list[{{ dc_agent_id }}].tools.deny on the running config
+      ({{ dc_tsp_configured_deny | length }} entries). The profile change has
+      not been applied to the host — apply it with --tags agent-profile first.
+      Probing now would measure the previous posture. Nothing has been invoked.
+  when:
+    - dc_tool_probe_expect_denied not in (dc_tsp_configured_deny | default([]))
+    - dc_fail_closed | bool
+
+# --- the behavioural check -----------------------------------------------------
+- name: Confirm the session key is unused
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', 'list', '--agent', dc_agent_id] }}"
+  register: dc_tsp_sessions_before
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse to reuse an existing session
+  ansible.builtin.fail:
+    msg: >-
+      Session key {{ dc_tool_probe_session_key }} already exists. A reused
+      session reports the tool surface as it was when that session began, which
+      is the wrong answer after a policy change. Choose an unused key.
+  when:
+    - dc_tsp_sessions_before.stdout is search(dc_tool_probe_session_key[-6:])
+    - dc_fail_closed | bool
+
+# --model is NOT passed: it would override the agent's pinned model.
+# --deliver is NOT passed (defaults false): nothing reaches Slack.
+- name: Ask the agent to enumerate what it can call
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - "HOME={{ dc_openclaw_home }}"
+      - /usr/bin/node
+      - "{{ dc_audit_entrypoint }}"
+      - agent
+      - --agent
+      - "{{ dc_agent_id }}"
+      - --session-key
+      - "{{ dc_tool_probe_session_key }}"
+      - --message
+      - "{{ dc_tool_probe_prompt }}"
+  register: dc_tsp_run
+  changed_when: true
+  failed_when: false
+  timeout: 600
+
+- name: Write the enumeration for the record
+  ansible.builtin.copy:
+    content: |
+      === rc={{ dc_tsp_run.rc | default('?') }} ===
+      === stdout ===
+      {{ dc_tsp_run.stdout | default('') }}
+      === stderr ===
+      {{ dc_tsp_run.stderr | default('') }}
+    dest: "{{ dc_tool_probe_report }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Refuse to score an empty enumeration
+  ansible.builtin.fail:
+    msg: >-
+      The agent returned no output (rc={{ dc_tsp_run.rc | default('?') }}).
+      INDETERMINATE — a broken invocation, not a denial and not a refusal.
+      stderr: {{ dc_tsp_run.stderr | default('(none)') | truncate(500) }}
+  when:
+    - (dc_tsp_run.stdout | default('') | trim | length) == 0
+    - dc_fail_closed | bool
+
+# --- the runtime policy chain --------------------------------------------------
+- name: Read the Gateway log
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['logs', '--limit', '2000', '--plain', '--no-color'] }}"
+  register: dc_tsp_log
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Measure the log before reasoning about it
+  ansible.builtin.set_fact:
+    dc_tsp_log_lines: "{{ dc_tsp_log.stdout | default('') | regex_findall('(?m)^.*$') | length }}"
+    dc_tsp_has_chain: "{{ (dc_tsp_log.stdout | default('')) is search('\"rule\":\"tools.profile') }}"
+
+- name: Refuse to report policy evidence from an insufficient log
+  ansible.builtin.fail:
+    msg: >-
+      The log returned {{ dc_tsp_log_lines }} line(s) and
+      {{ 'no' if not (dc_tsp_has_chain | bool) else 'a' }} tool-policy chain.
+      INSUFFICIENT EVIDENCE for the runtime half. The enumeration at
+      {{ dc_tool_probe_report }} is unaffected.
+  when:
+    - (dc_tsp_log_lines | int) < (dc_slack_evidence_min_lines | int)
+      or not (dc_tsp_has_chain | bool)
+    - dc_fail_closed | bool
+
+- name: Isolate the most recent policy chain
+  ansible.builtin.set_fact:
+    dc_tsp_window: "{{ (dc_tsp_log.stdout | default('')) | split('\"rule\":\"tools.profile') | last }}"
+
+- name: Confirm the chain belongs to the target agent
+  ansible.builtin.set_fact:
+    dc_tsp_is_agent_turn: "{{ dc_tsp_window is search('agents\\.' ~ dc_agent_id ~ '\\.tools\\.deny') }}"
+    dc_tsp_chain: "{{ dc_tsp_window | regex_findall('(?m)^.*agents/tool-policy.*$') }}"
+    dc_tsp_removed: "{{ dc_tsp_window | regex_findall('\"removedTools\":\\[([^\\]]*)\\]') | join(',') }}"
+
+- name: Refuse to attribute another agent's chain
+  ansible.builtin.fail:
+    msg: >-
+      The most recent policy chain carries no
+      `agents.{{ dc_agent_id }}.tools.deny` rule, so it is another agent's turn
+      and says nothing about {{ dc_agent_id }}. INSUFFICIENT EVIDENCE.
+  when:
+    - not (dc_tsp_is_agent_turn | bool)
+    - dc_fail_closed | bool
+
+- name: Record the config digest for the receipt
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_config_path }}"
+    checksum_algorithm: sha256
+  register: dc_tsp_digest
+
+- name: Report the effective tool surface
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-TOOL-SURFACE — ' ~ dc_agent_id,
+          'session=' ~ dc_tool_probe_session_key ~ ' (fresh)',
+          'configured_deny_count=' ~ (dc_tsp_configured_deny | length),
+          'expected_denied=' ~ dc_tool_probe_expect_denied,
+          'config_sha256=' ~ (dc_tsp_digest.stat.checksum | default('?')),
+          'enumeration=' ~ dc_tool_probe_report,
+          '--- verdict for ' ~ dc_tool_probe_expect_denied ~ ' ---',
+          ('DENIED BY RULE — captured at the config layer, named in removedTools'
+           if ('"' ~ dc_tool_probe_expect_denied ~ '"') in dc_tsp_removed
+           else 'NOT NAMED in removedTools. This is NOT a denial — the tool may
+                 never have been offered. Corroborate against the enumeration
+                 below before concluding anything.'),
+          '--- policy chain for this turn ---']
+         + (dc_tsp_chain | map('truncate', 260) | list)
+         + ['--- agent enumeration (corroboration) ---',
+            (dc_tsp_run.stdout | default('') | truncate(1800))] }}
+
+- name: Emit the tool-surface receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-TOOL-SURFACE RECEIPT | agent={{ dc_agent_id }} |
+      session={{ dc_tool_probe_session_key }} (fresh) |
+      config_sha256={{ dc_tsp_digest.stat.checksum | default('?') }} |
+      NOT NAMED IS NOT DENIED. The tool-policy log records removals only, so a
+      tool absent from it was either never offered or left permitted, and this
+      source cannot tell them apart. The agent's own enumeration is the
+      corroboration; neither alone settles it. |
+      invoked_agent=true wrote_no_config=true restarted_nothing=true
+      passed_no_model_override=true delivered_nothing=true
