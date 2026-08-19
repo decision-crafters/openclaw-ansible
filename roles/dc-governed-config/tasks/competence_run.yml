@@ -100,6 +100,9 @@
       resolution and forfeit the behavioural proof of the model pin, which is
       half the purpose of this run. Choose an unused key.
   when:
+    # Exact key against the session STORE, not the elided display table. A
+    # short-tail match here collided across two differently-named keys in the
+    # tool-surface probe and refused a genuinely fresh session.
     - dc_cr_sessions_before.stdout is search(dc_competence_session_key)
     - dc_fail_closed | bool
 
@@ -212,14 +215,29 @@
   failed_when: false
   timeout: 60
 
-# `sessions list` ELIDES THE MIDDLE of long keys — `agent:dc-researc...sus7ap`
-# — so a prefix match on the configured key can never hit. Match on the TAIL,
-# which survives the elision.
+# `sessions list` ELIDES THE MIDDLE of long keys — `agent:dc-researc...ce-001`
+# — so a prefix match cannot hit and a tail match CANNOT DISTINGUISH keys that
+# share their last characters. `dc-research-competence-001` and
+# `dc-research-toolsurface-001` render identically once elided.
+#
+# So this reports EVERY matching row and flags ambiguity rather than silently
+# taking one. Picking arbitrarily would attribute one session's model to
+# another, which is exactly the class of error that makes a report worse than
+# no report.
 - name: Isolate the new session's row
   ansible.builtin.set_fact:
     dc_cr_session_row: >-
       {{ dc_cr_sessions_after.stdout | default('')
          | regex_findall('(?m)^.*' ~ dc_competence_session_key[-6:] ~ '.*$') }}
+
+- name: Flag an ambiguous session match
+  ansible.builtin.set_fact:
+    dc_cr_session_row: >-
+      {{ ['AMBIGUOUS — ' ~ (dc_cr_session_row | length) ~ ' session rows share this '
+          ~ 'elided suffix, so the model below cannot be attributed to THIS run. '
+          ~ 'Treat as UNOBSERVED and disambiguate from the session store.']
+         + dc_cr_session_row }}
+  when: (dc_cr_session_row | length) > 1
 
 - name: Read the tool policy applied to this turn
   ansible.builtin.command:

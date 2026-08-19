@@ -85,14 +85,50 @@
   failed_when: false
   timeout: 60
 
+# MATCH THE STORE, NOT THE DISPLAY.
+#
+# `sessions list` elides the middle of long keys — `agent:dc-researc...ce-001` —
+# so a prefix match cannot hit and a short-tail match COLLIDES:
+# `dc-research-toolsurface-001` and `dc-research-competence-001` share the last
+# six characters, and the tail match refused a genuinely unused key. That is a
+# false positive on a fail-closed guard, which blocks correct work and teaches
+# people to bypass the control.
+#
+# The listing prints its own store path. The JSON there holds exact keys, so
+# read that instead of pattern-matching a truncated table.
+- name: Locate the session store for this agent
+  ansible.builtin.set_fact:
+    dc_tsp_store: >-
+      {{ (dc_tsp_sessions_before.stdout | default('')
+          | regex_findall('Session store: (\S+)') | first | default('')) }}
+
+- name: Refuse without a session store to check against
+  ansible.builtin.fail:
+    msg: >-
+      Could not locate the session store from `sessions list --agent
+      {{ dc_agent_id }}`. Whether {{ dc_tool_probe_session_key }} is fresh
+      cannot be established, and a reused session would silently report the
+      pre-change tool surface. INSUFFICIENT EVIDENCE — nothing invoked.
+  when:
+    - (dc_tsp_store | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Read the session store
+  ansible.builtin.command:
+    argv: ["grep", "-c", "{{ dc_tool_probe_session_key }}", "{{ dc_tsp_store }}"]
+  register: dc_tsp_key_hits
+  changed_when: false
+  failed_when: false
+
 - name: Refuse to reuse an existing session
   ansible.builtin.fail:
     msg: >-
-      Session key {{ dc_tool_probe_session_key }} already exists. A reused
-      session reports the tool surface as it was when that session began, which
-      is the wrong answer after a policy change. Choose an unused key.
+      Session key {{ dc_tool_probe_session_key }} already exists in
+      {{ dc_tsp_store }}. A reused session reports the tool surface as it was
+      when that session began, which is the wrong answer after a policy change.
+      Choose an unused key.
   when:
-    - dc_tsp_sessions_before.stdout is search(dc_tool_probe_session_key[-6:])
+    - (dc_tsp_key_hits.stdout | default('0') | trim | int) > 0
     - dc_fail_closed | bool
 
 # --model is NOT passed: it would override the agent's pinned model.
