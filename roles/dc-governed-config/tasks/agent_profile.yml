@@ -337,4 +337,9 @@
       {{ 'agents.list was UNSET, so `main` was implicit and NO check here establishes its survival'
          if dc_agent_list_unset | bool
          else 'agents.list was already set' }} —
-      confirm by messaging OpenClaw from Slack before treating this as complete
+      CONFIRM BY READING `agents.list` (--tags audit), not by messaging Slack.
+      That advice was correct only while Slack reached the default agent. Since
+      the 2026-08-17 rebind, Slack routes to the governed agent, so a reply
+      confirms THAT agent is alive and establishes nothing whatever about
+      `main`. `config patch` replaces arrays wholesale, so the risk here is a
+      DELETED agent, and only enumerating the list can see one missing.
