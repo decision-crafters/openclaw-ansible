@@ -21,7 +21,7 @@ WHAT THIS ENFORCES
   2. The gate DEFAULTS TO DENY, before any grant is consulted.
   3. Every agent-invoking harness routes through the gate and composes its
      output, so it has no code path that emits the flag independently.
-  4. The schema makes over-broad grants INEXPRESSIBLE, not merely invalid:
+  4. The schema makes over-broad grants NOT REPRESENTABLE AS VALID, not merely rejected:
      self-acceptance, standing grants and wildcard models are const/pattern
      violations.
 
@@ -55,11 +55,19 @@ GOOD = {
 }
 
 
-def run_validator(grant: dict, agent: str = "dc-research"):
+def run_validator(grant: dict, agent: str = "dc-research",
+                  task: str = "TASK-242", ledger: str | None = None):
+    """Each call gets a FRESH ledger unless one is passed, so negative controls
+    do not consume grants for each other. Replay is tested by deliberately
+    sharing a ledger across two calls."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump(grant, fh)
         path = fh.name
-    p = subprocess.run([sys.executable, str(VALIDATOR), path, str(SCHEMA), agent],
+    if ledger is None:
+        ledger = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+        Path(ledger).unlink()  # absent ledger is the normal first-use case
+    p = subprocess.run([sys.executable, str(VALIDATOR), path, str(SCHEMA),
+                        agent, task, ledger],
                        capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
 
@@ -151,6 +159,38 @@ def main() -> int:
     for label, (grant, agent) in negatives.items():
         rc, _, _ = run_validator(grant, agent)
         checks.append((f"NEGATIVE CONTROL rejected: {label}", rc != 0))
+
+    # --- 5. replay prevention: single-use must be BEHAVIOURAL ---------------
+    shared = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    Path(shared).unlink()
+    rc1, out1, _ = run_validator(GOOD, ledger=shared)
+    rc2, _, err2 = run_validator(GOOD, ledger=shared)
+    checks.append(("REPLAY: first presentation of a grant is accepted", rc1 == 0))
+    checks.append(("REPLAY: the SAME grant presented again is refused", rc2 != 0))
+    checks.append(("REPLAY: the refusal names it as already used",
+                   "already been used" in err2))
+    # Digest is over CONTENT, so a copy under a new name is still spent.
+    rc3, _, _ = run_validator(dict(GOOD), ledger=shared)
+    checks.append(("REPLAY: a copy of a spent grant is also refused", rc3 != 0))
+    # An unreadable ledger must refuse, not assume freshness.
+    bad_ledger = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    bad_ledger.write("{ not json"); bad_ledger.close()
+    rc4, _, err4 = run_validator(GOOD, ledger=bad_ledger.name)
+    checks.append(("REPLAY: an unreadable ledger refuses rather than assuming unused",
+                   rc4 != 0 and "ledger unreadable" in err4))
+
+    # --- 6. task binding: taskId must be checked, not merely shaped ----------
+    rc5, _, err5 = run_validator(GOOD, task="TASK-999")
+    checks.append(("TASK BINDING: a grant for another task is refused", rc5 != 0))
+    checks.append(("TASK BINDING: the refusal names both tasks",
+                   "TASK-242" in err5 and "TASK-999" in err5))
+    rc6, _, err6 = run_validator(GOOD, task="")
+    checks.append(("TASK BINDING: no governing task is refused, not waved through",
+                   rc6 != 0))
+    checks.append(("the gate refuses a grant when no governing task is set",
+                   "dc_governing_task" in GATE.read_text()))
+    checks.append(("the gate passes a replay ledger to the validator",
+                   "dc_model_grant_ledger_path" in GATE.read_text()))
 
     failed = [n for n, ok in checks if not ok]
     for n, ok in checks:

@@ -1315,7 +1315,17 @@ dc_tool_probe_report: >-
 #
 # Set this only to a grant naming the exact agent and exact model, bound to a
 # task, accepted by the founder, and single-use. The schema makes the
-# alternatives INEXPRESSIBLE rather than merely invalid.
+# alternatives NOT REPRESENTABLE AS A VALID GRANT (they do not stop anyone writing the bytes).
 dc_model_override_grant: ""
 dc_model_grant_validator_path: "/root/.dc-validate-model-grant.py"
 dc_model_grant_schema_path: "/root/.dc-model-override-grant.schema.json"
+
+# Task governing the current invocation. A grant's taskId is checked against
+# this; without it the grant binds to nothing and is refused.
+dc_governing_task: ""
+
+# Replay ledger. Grant content digests are recorded here on accept, and a digest
+# already present is refused. `singleUse: true` in the schema is a DECLARATION;
+# this file is what makes it behaviour. Digested by CONTENT, so copying or
+# renaming a grant does not mint a fresh use.
+dc_model_grant_ledger_path: "/root/.dc-model-grant-ledger.json"
