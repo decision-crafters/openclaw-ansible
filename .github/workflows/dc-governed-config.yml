@@ -114,3 +114,6 @@ jobs:
       # the apply path and the rollback path, through every gate above.
       - name: Reject module parameters that only fail at run time
         run: python3 tests/dc_module_args.py
+
+      - name: Enforce the model-override anti-bypass contract
+        run: python3 tests/dc_model_override_contract.py
