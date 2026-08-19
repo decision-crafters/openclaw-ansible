@@ -146,12 +146,26 @@
       - "HOME={{ dc_openclaw_home }}"
       - /usr/bin/node
       - "{{ dc_audit_entrypoint }}"
-      # POSITIONAL. `--agent <id>` is not this command's shape; passing it
-      # alongside the prompt yields "Too many arguments for this command".
+      # `openclaw agent` takes NO POSITIONAL ARGUMENTS. Usage is
+      # `openclaw agent [options]`; the message body is --message.
+      #
+      # "Too many arguments" was the PROMPT passed positionally, not --agent.
+      # An intermediate fix made the agent id positional on the strength of the
+      # error's hint text and would have failed identically -- the usage line
+      # was sitting in the CLI surface artifact the whole time.
+      #
+      # --model is DELIBERATELY NOT PASSED. It is a per-run model override that
+      # would supersede the agent's pin, and observing the pin govern a turn is
+      # half of what this run exists for.
+      #
+      # --deliver is DELIBERATELY NOT PASSED (defaults false), so this test does
+      # not post to Slack.
       - agent
+      - --agent
       - "{{ dc_agent_id }}"
       - --session-key
       - "{{ dc_competence_session_key }}"
+      - --message
       - "{{ dc_competence_prompt }}"
   register: dc_cr_run
   changed_when: true

@@ -1242,9 +1242,17 @@ dc_cli_surface_probes:
   - name: "config patch"
     argv: ["config", "patch", "--help"]
     requires: ["--stdin", "--dry-run"]
-  - name: "agent <id>"
-    argv: ["agent", "{{ dc_agent_id }}", "--help"]
-    requires: ["--session-key"]
+  - name: "agent"
+    argv: ["agent", "--help"]
+    # `openclaw agent` takes NO POSITIONALS -- usage is `agent [options]`. The
+    # message body is --message; passing it positionally yields "Too many
+    # arguments for this command". An earlier probe read `agent <id> --help`
+    # believing the flags lived on a per-agent page; it is the same page, and
+    # the positional was simply tolerated by --help while breaking a real run.
+    #
+    # --model is a per-run MODEL OVERRIDE that supersedes an agent's pin. Listed
+    # here so it stays visible as a model-selection path; the role never uses it.
+    requires: ["--agent", "--session-key", "--message"]
   - name: "sessions"
     argv: ["sessions", "--help"]
     requires: ["list"]
