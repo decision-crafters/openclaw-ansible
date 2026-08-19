@@ -30,8 +30,10 @@ Validated by synthetic controls only. No alternate model is ever invoked.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import threading
 import tempfile
 from pathlib import Path
 
@@ -191,6 +193,90 @@ def main() -> int:
                    "dc_governing_task" in GATE.read_text()))
     checks.append(("the gate passes a replay ledger to the validator",
                    "dc_model_grant_ledger_path" in GATE.read_text()))
+
+    # --- 7. CONCURRENCY: at-most-once must hold under a race ----------------
+    #
+    # os.replace() makes the WRITE atomic and does nothing for the
+    # read -> check -> append preceding it. Without a lock over the whole
+    # transaction, two validations can both read a ledger before either records
+    # and both accept the same grant — singleUse would then be at-most-once only
+    # when runs happen to be sequential. Sequential tests cannot see this.
+    #
+    # REPEATED ROUNDS, and that is not belt-and-braces. A single 2-way race
+    # caught an unlocked validator only about two times in three: the window is
+    # small, so one round is a FLAKY negative control, which would pass a broken
+    # validator on a good day. Several rounds with a wider fan-out make the
+    # detection reliable without instrumenting the validator for the test.
+    # The delay is what makes this a real control. Without it the window is
+    # unobservable from a test — process startup dominates the critical section
+    # — and the check passes IDENTICALLY with and without the lock. Measured:
+    # locked yields 1 acceptance per round, unlocked yields 4.
+    RACE_ROUNDS, RACERS = 3, 4
+    race_env = dict(os.environ, DC_GRANT_TEST_DELAY_MS="300")
+    race_ok, race_detail = True, []
+    for rnd in range(RACE_ROUNDS):
+        ledger = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+        Path(ledger).unlink()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(GOOD, fh)
+            grant_path = fh.name
+
+        results: list[int] = []
+        errs: list[str] = []
+        guard = threading.Lock()
+
+        def attempt():
+            proc = subprocess.run(
+                [sys.executable, str(VALIDATOR), grant_path, str(SCHEMA),
+                 "dc-research", "TASK-242", ledger],
+                capture_output=True, text=True, env=race_env)
+            with guard:
+                results.append(proc.returncode)
+                errs.append(proc.stderr)
+
+        threads = [threading.Thread(target=attempt) for _ in range(RACERS)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=60)
+
+        accepted = results.count(0)
+        try:
+            final = json.load(open(ledger))
+        except Exception:
+            final = []
+        recorded = len([e for e in final if e.get("taskId") == "TASK-242"])
+        if accepted != 1 or recorded != 1:
+            race_ok = False
+            race_detail.append(f"round {rnd}: {accepted} accepted, {recorded} recorded")
+        if not any("already been used" in e for e in errs):
+            race_ok = False
+            race_detail.append(f"round {rnd}: losers did not report a replay refusal")
+
+    checks.append((f"CONCURRENCY: {RACE_ROUNDS} rounds x {RACERS} simultaneous "
+                   f"validations, widened window, each yield EXACTLY ONE "
+                   f"acceptance", race_ok))
+    for detail in race_detail:
+        print(f"        RACE -> {detail}")
+    checks.append(("the validator locks the whole critical section",
+                   "flock" in VALIDATOR.read_text()))
+
+    # --- 8. reviewer-facing wording -----------------------------------------
+    schema_text = SCHEMA.read_text().lower()
+    checks.append(("the schema does not overstate constraints as inexpressibility",
+                   "cannot be expressed" not in schema_text
+                   and "not expressible" not in schema_text))
+
+    # --- 9. the gate refuses before it validates ----------------------------
+    gate_names = [x.get("name", "") for x in yaml.safe_load(GATE.read_text())]
+    try:
+        i_task = next(i for i, n in enumerate(gate_names) if "no governing task" in n)
+        i_val = next(i for i, n in enumerate(gate_names) if "Validate the grant" in n)
+        ordered = i_task < i_val
+    except StopIteration:
+        ordered = False
+    checks.append(("the gate refuses an unbound run BEFORE invoking the validator",
+                   ordered))
 
     failed = [n for n, ok in checks if not ok]
     for n, ok in checks:

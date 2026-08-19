@@ -60,6 +60,20 @@
 # rather than failing — unless fail-closed is on, in which case it refuses
 # outright. Silently downgrading an intended override to the pinned model would
 # be its own surprise.
+# A grant with no governing task to bind to authorises every run, which is the
+# opposite of task-bound. Refused before the validator is even consulted, so the
+# failure names the real problem rather than surfacing as a validation error.
+- name: Refuse a grant with no governing task to bind to
+  ansible.builtin.fail:
+    msg: >-
+      A model-override grant was supplied but dc_governing_task is unset, so the
+      grant's taskId cannot be checked against the task governing this run. A
+      grant that binds to nothing is a standing grant with a label on it.
+  when:
+    - dc_mog_stat.stat.exists | default(false)
+    - (dc_governing_task | default('') | trim | length) == 0
+    - dc_fail_closed | bool
+
 - name: Validate the grant against the schema and this agent
   ansible.builtin.command:
     argv:
@@ -82,20 +96,6 @@
   failed_when: false
   timeout: 60
   when: dc_mog_stat.stat.exists | default(false)
-
-# A grant with no governing task to bind to authorises every run, which is the
-# opposite of task-bound. Refused before the validator is even consulted, so the
-# failure names the real problem rather than surfacing as a validation error.
-- name: Refuse a grant with no governing task to bind to
-  ansible.builtin.fail:
-    msg: >-
-      A model-override grant was supplied but dc_governing_task is unset, so the
-      grant's taskId cannot be checked against the task governing this run. A
-      grant that binds to nothing is a standing grant with a label on it.
-  when:
-    - dc_mog_stat.stat.exists | default(false)
-    - (dc_governing_task | default('') | trim | length) == 0
-    - dc_fail_closed | bool
 
 - name: Refuse a grant that does not validate
   ansible.builtin.fail:

@@ -38,17 +38,44 @@ single-use grant that is never used up is a standing grant with a label.
 Replay prevention is therefore behavioural: the grant's content digest is
 recorded in a ledger on accept, and a digest already present is refused.
 
+That check must be ATOMIC ACROSS THE WHOLE TRANSACTION, not just at the write.
+`os.replace()` makes the final replacement atomic and does nothing for the
+read -> check -> append that precedes it: two concurrent validations can both
+read the ledger before either records, and both conclude the grant is unused.
+`singleUse` would then be at-most-once only when runs happen to be sequential.
+An exclusive lock is held across the entire critical section, and a lock that
+cannot be acquired REFUSES rather than proceeding unlocked.
+
 `taskId` was likewise DECLARATIVE: the pattern proved it LOOKED like a task id
 and nothing compared it to the task actually governing the invocation. A grant
 was task-LABELLED, not task-BOUND. It is now cross-checked against the
 governing task passed by the caller, and a run with no governing task is
 refused rather than treated as universally authorised.
 """
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import sys
 import time
+
+
+LOCK_TIMEOUT_S = 30
+
+# Fault-injection hook, off by default. Widens the read -> check -> append
+# window so a concurrency test can actually observe the race this lock exists
+# to close.
+#
+# Without it the window is unobservable from a test: Python process startup
+# dominates the critical section, so concurrent subprocesses never overlap
+# inside it and the test passes IDENTICALLY with and without the lock. That is
+# a control which cannot fail, which is worse than no control.
+#
+# Safe in production by placement: the delay is taken INSIDE the lock, so the
+# worst it can do is make a run slower. It cannot widen a window that is held
+# exclusively.
+TEST_DELAY_MS = int(os.environ.get("DC_GRANT_TEST_DELAY_MS", "0") or "0")
 
 
 def fail(errors):
@@ -124,41 +151,77 @@ def main():
             f"grant is bound to {grant['taskId']!r} but this invocation is governed "
             f"by {governing_task!r}. A grant for one task does not authorise another.")
 
+    # Anything found so far is fatal before the ledger is touched. Failing here
+    # avoids consuming a grant that was never going to be accepted.
+    if errors:
+        fail(errors)
+
     # REPLAY. Digest the grant CONTENT, not its path: renaming or copying the
     # file must not mint a fresh use.
     raw = open(grant_path, "rb").read()
     digest = hashlib.sha256(raw).hexdigest()
-    ledger = []
-    if os.path.exists(ledger_path):
-        try:
-            ledger = json.load(open(ledger_path))
-        except Exception as exc:
-            fail([f"ledger unreadable ({exc}). Refusing rather than assuming the "
-                  f"grant is unused — an unreadable ledger cannot show a replay."])
-    if any(e.get("digest") == digest for e in ledger):
-        prior = next(e for e in ledger if e["digest"] == digest)
-        errors.append(
-            f"this grant has already been used (digest {digest[:16]}…, consumed "
-            f"{prior.get('usedAt')} for agent {prior.get('agentId')}). singleUse is "
-            f"behavioural, not decorative: issue a new grant.")
 
-    if errors:
-        fail(errors)
+    # THE WHOLE read -> check -> append -> replace IS THE CRITICAL SECTION.
+    # Holding a lock only over the write would leave the window this exists to
+    # close: two validations reading before either records.
+    lock_path = ledger_path + ".lock"
+    deadline = time.time() + LOCK_TIMEOUT_S
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    fail([f"ledger lock error: {exc}"])
+                if time.time() >= deadline:
+                    # Refuse rather than proceed unlocked. A timeout means
+                    # another validation holds the ledger; assuming the grant is
+                    # unused is exactly the race being prevented.
+                    fail([f"could not acquire the ledger lock within "
+                          f"{LOCK_TIMEOUT_S}s ({lock_path}). Another validation "
+                          f"holds it. Refusing rather than proceeding unlocked."])
+                time.sleep(0.05)
 
-    # Consume it. Recorded BEFORE returning success, so a crash after this point
-    # cannot leave a used grant looking fresh.
-    ledger.append({
-        "digest": digest,
-        "agentId": grant["agentId"],
-        "model": grant["model"],
-        "taskId": grant["taskId"],
-        "usedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
-    tmp = ledger_path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(ledger, fh, indent=2)
-    os.replace(tmp, ledger_path)
-    os.chmod(ledger_path, 0o600)
+        ledger = []
+        if os.path.exists(ledger_path):
+            try:
+                ledger = json.load(open(ledger_path))
+            except Exception as exc:
+                fail([f"ledger unreadable ({exc}). Refusing rather than assuming the "
+                      f"grant is unused — an unreadable ledger cannot show a replay."])
+        # Fault-injection point: between reading the ledger and recording the
+        # digest. Zero unless a test asks for it.
+        if TEST_DELAY_MS:
+            time.sleep(TEST_DELAY_MS / 1000.0)
+
+        if any(e.get("digest") == digest for e in ledger):
+            prior = next(e for e in ledger if e["digest"] == digest)
+            fail([f"this grant has already been used (digest {digest[:16]}…, consumed "
+                  f"{prior.get('usedAt')} for agent {prior.get('agentId')}). singleUse "
+                  f"is behavioural, not decorative: issue a new grant."])
+
+        # Consume it. Recorded BEFORE returning success and while still holding
+        # the lock, so a crash after this cannot leave a used grant looking fresh
+        # and no concurrent validation can observe the pre-append state.
+        ledger.append({
+            "digest": digest,
+            "agentId": grant["agentId"],
+            "model": grant["model"],
+            "taskId": grant["taskId"],
+            "usedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        tmp = ledger_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(ledger, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, ledger_path)
+        os.chmod(ledger_path, 0o600)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
     print(f"GRANT ACCEPTED AND CONSUMED | agent={grant['agentId']} "
           f"model={grant['model']} task={grant['taskId']} "

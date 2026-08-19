@@ -1,15 +1,24 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Model override grant",
-  "description": "Authorises ONE governed harness run to pass --model, overriding an agent's pinned model. Fail-closed by construction: absence of a grant is denial, and several fields are const so that an over-broad grant cannot be EXPRESSED rather than merely rejected.",
+  "description": "Authorises ONE governed harness run to pass --model, overriding an agent's pinned model. Fail-closed: absence of a grant is denial, and several fields are const so an over-broad grant is NOT REPRESENTABLE AS VALID. That is a claim about validation, not about what can be written \u2014 anyone can write the bytes; they will not validate. Single-use and task binding are enforced BEHAVIOURALLY by the validator, not by these declarations alone.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["agentId", "model", "taskId", "decisionRecord", "acceptedBy", "reason", "reversal", "singleUse"],
+  "required": [
+    "agentId",
+    "model",
+    "taskId",
+    "decisionRecord",
+    "acceptedBy",
+    "reason",
+    "reversal",
+    "singleUse"
+  ],
   "properties": {
     "agentId": {
       "type": "string",
       "minLength": 1,
-      "description": "The exact agent. A grant naming no agent, or a wildcard, is not expressible."
+      "description": "The exact agent. A grant naming no agent, or a wildcard, does not validate."
     },
     "model": {
       "type": "string",
@@ -20,7 +29,7 @@
     "taskId": {
       "type": "string",
       "pattern": "^TASK-[0-9]+$",
-      "description": "The task the override serves. Task-bound by construction."
+      "description": "The task the override serves. Cross-checked by the validator against the task governing the invocation; the pattern alone would make it task-LABELLED rather than task-BOUND."
     },
     "decisionRecord": {
       "type": "string",
@@ -29,7 +38,7 @@
     },
     "acceptedBy": {
       "const": "Tosin Akinosho",
-      "description": "Sole acceptance authority. A const, so a self-accepted grant cannot be expressed."
+      "description": "Sole acceptance authority. A const, so a self-accepted grant does not validate."
     },
     "reason": {
       "type": "string",
@@ -43,7 +52,7 @@
     },
     "singleUse": {
       "const": true,
-      "description": "A const, so a STANDING override cannot be expressed. One grant, one run."
+      "description": "A const, so a standing override does not validate. Enforcement is behavioural: the validator records the grant's content digest in a ledger under an exclusive lock and refuses a digest already present. This field alone would be a declaration."
     }
   }
 }
