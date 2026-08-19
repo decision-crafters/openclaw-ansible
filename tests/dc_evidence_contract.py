@@ -173,9 +173,14 @@ def main() -> int:
         # toward waiving the rule entirely.
         m = re.search(r"EVIDENCE-ANCHOR:\s*(.+)", text)
         marker = m.group(1).strip() if m else ANCHOR_MARKER
+        # Compare with backslash-escapes removed. YAML may write the marker as
+        # split('\"rule\":\"tools.profile'), which is the same anchor and was
+        # reported as missing by a check that only matched the unescaped form.
+        # A contract that fails on a correct file teaches people to ignore it.
+        flat = text.replace("\\", "")
         checks.append((
             f"{path.name} derives an anchored window (marker: {marker})",
-            f"split('{marker}')" in text or f'split("{marker}")' in text,
+            f"split('{marker}')" in flat or f'split("{marker}")' in flat,
         ))
 
         # --- FLOOR --------------------------------------------------------
