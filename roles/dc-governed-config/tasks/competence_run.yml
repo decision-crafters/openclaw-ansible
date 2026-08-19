@@ -212,11 +212,14 @@
   failed_when: false
   timeout: 60
 
+# `sessions list` ELIDES THE MIDDLE of long keys — `agent:dc-researc...sus7ap`
+# — so a prefix match on the configured key can never hit. Match on the TAIL,
+# which survives the elision.
 - name: Isolate the new session's row
   ansible.builtin.set_fact:
     dc_cr_session_row: >-
       {{ dc_cr_sessions_after.stdout | default('')
-         | regex_findall('(?m)^.*' ~ (dc_competence_session_key | truncate(14, true, '')) ~ '.*$') }}
+         | regex_findall('(?m)^.*' ~ dc_competence_session_key[-6:] ~ '.*$') }}
 
 - name: Read the tool policy applied to this turn
   ansible.builtin.command:
@@ -261,7 +264,10 @@
           'transcript=' ~ dc_competence_report,
           'output_chars=' ~ (dc_cr_run.stdout | default('') | length),
           '--- MODEL ACTUALLY USED (the pin, observed rather than configured) ---']
-         + (dc_cr_session_row | default(['(new session row not found — model UNOBSERVED)']))
+         + (dc_cr_session_row | default(
+              ['SESSION ROW NOT FOUND — MODEL UNOBSERVED. This is INDETERMINATE for
+               the behavioural half: it does NOT mean the pin failed, it means the
+               run did not capture which model was used.'], true))
          + ['--- effective tool policy for this turn ---']
          + (dc_cr_window | regex_findall('(?m)^.*agents/tool-policy.*$') | map('truncate', 260) | list)
          + ['--- any vision/image/auxiliary model line in this window ---']
