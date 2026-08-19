@@ -1206,3 +1206,18 @@ dc_model_path_probes:
   - modelOverrides
   - agents.list
   - session
+
+# --- Closed-corpus competence fixture ----------------------------------------
+#
+# The packet carries RAW ORDERED EVIDENCE and no conclusion. The gold answer and
+# rubric live in a separate file that must never reach the agent workspace; the
+# run refuses if it finds one. An agent that reads the answer and paraphrases it
+# scores as competent while demonstrating only that it can read.
+#
+# Empty by default: the packet is a per-deployment artifact and invoking the
+# agent needs its own founder authorization.
+dc_competence_packet_src: ""
+dc_competence_gold_pattern: "GOLD-*.md"
+dc_competence_session_key: ""
+dc_competence_prompt: ""
+dc_competence_report: "/tmp/openclaw-competence-{{ ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt"

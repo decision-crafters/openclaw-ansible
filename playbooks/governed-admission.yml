@@ -137,3 +137,16 @@
         tasks_from: agent_model_pin
   tags:
     - model-pin
+
+# Closed-corpus competence fixture. INVOKES THE AGENT and therefore needs its
+# own founder authorization; the task refuses without -e dc_apply=true.
+- name: Run the closed-corpus competence fixture
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Install the packet and invoke the agent
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: competence_run
+  tags:
+    - competence
