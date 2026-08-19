@@ -1,0 +1,68 @@
+---
+# The write gate. Included by every play that changes the host, immediately
+# before the backup-and-write, and after all validation has passed.
+#
+# Default is DRY RUN. A play invoked with no flag validates everything, reports
+# exactly what it would change, and stops without touching the host.
+#
+# Why the default runs this way round: the host is under active development, so
+# invocations happen for reasons other than "deploy now" — checking a variable
+# resolved, confirming a guard fires, re-running after an edit. Each of those
+# should cost nothing. Making the safe case the default means every accidental
+# run is free and only the deliberate one has a price, which is one flag.
+#
+# This is the same shape as dc_confirm_stop and dc_agent_accept_list_risk: the
+# awkwardness IS the control. Those exist because stopping the Gateway and
+# writing agents.list for the first time are both irreversible-feeling acts on a
+# runtime someone is depending on. So is rewriting the governed config.
+#
+# The gate sits AFTER validation deliberately. A dry run that skipped the schema
+# check would report "would write" for a config the runtime rejects, which is
+# worse than not running at all — it would build confidence in a change that
+# cannot land.
+
+# The old flag is refused rather than ignored. agent_profile.yml and
+# remove_agent.yml shipped with `dc_dry_run`, whose sense is inverted from this
+# one. Silently ignoring it would mean someone passing `-e dc_dry_run=false`
+# expecting a write gets a dry run instead — a safe outcome reached by a
+# confusing route, and confusing routes get worked around.
+- name: Refuse the superseded dry-run flag
+  ansible.builtin.fail:
+    msg: >-
+      `dc_dry_run` has been replaced by `dc_apply`, whose sense is the opposite:
+      plays now DEFAULT to a dry run and require -e dc_apply=true to write.
+      Re-run without dc_dry_run, adding -e dc_apply=true only if you intend to
+      change the host. Refusing rather than guessing which you meant.
+  when: dc_dry_run is defined
+
+# `target` is per-caller. It was hardcoded to the config path when every caller
+# happened to write the config, and stayed hardcoded when agent_workspace.yml —
+# which writes a workspace DIRECTORY and never touches openclaw.json — became a
+# caller. Its first dry run reported `target=/home/openclaw/.openclaw/
+# openclaw.json`, naming a file it does not open.
+#
+# Nothing was at risk: the play is correct and the overlay beside it said
+# exactly what would happen. But this line is the last thing an operator reads
+# before typing -e dc_apply=true, and a gate that misreports its target teaches
+# people not to read it — which costs on the run where the target is the thing
+# that is wrong.
+- name: Report what this run would change
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'APPLYING' if (dc_apply | bool) else 'DRY RUN — nothing will be written' }} |
+      play={{ dc_apply_what | default('governed config') }} |
+      target={{ dc_apply_target | default(dc_openclaw_config_path) }} |
+      overlay={{ (dc_apply_overlay | default({})) | to_json | truncate(600) }}
+
+- name: Stop before writing unless the change was asked for
+  ansible.builtin.debug:
+    msg: >-
+      DRY RUN COMPLETE — validation passed and nothing was written.
+      Every check up to this point ran against the real host and the real
+      schema, so this result is meaningful: the change is legal and the guards
+      accept it. Re-run with -e dc_apply=true to write it.
+  when: not (dc_apply | bool)
+
+- name: End the play when not applying
+  ansible.builtin.meta: end_play
+  when: not (dc_apply | bool)

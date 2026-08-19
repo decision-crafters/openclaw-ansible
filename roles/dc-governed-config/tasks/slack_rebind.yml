@@ -1,0 +1,439 @@
+---
+# Route the bounded Slack conversations to a named governed agent.
+#
+#   sudo ansible-playbook playbooks/governed-lab.yml \
+#     --tags slack-rebind -e ansible_become=false            # dry run
+#     ... -e dc_apply=true                                   # writes
+#
+# Founder decision 2026-08-17, Option B of the routing decision packet: bind the
+# already-authorized Slack conversations to `dc-research` instead of letting
+# them fall through to `main`.
+#
+# WHAT THIS CHANGES AND WHAT IT DOES NOT
+#
+# It writes ONE key: top-level `bindings`. Nothing under `channels.slack` is
+# touched — same workspace, same app, same bot and app tokens, same single
+# permitted sender, same channel scope, same requireMention, same loop
+# protection. No new app, OAuth grant, scope, credential, channel or sender.
+# None of the board's STOP conditions is triggered.
+#
+# The target agent gains a ROUTE, not a capability. Its deny list, tool surface,
+# read-only workspace and network policy are untouched.
+#
+# THE COST, STATED HERE BECAUSE IT IS EASY TO FORGET AT APPLY TIME
+#
+# The target is run-gated and Prepare-only. After this, an ordinary Slack
+# question with no canonical task record returns BLOCKED. That is AGENTS.md §1a
+# working as designed, and it ends ad-hoc Slack use on the rebound
+# conversations. If that is not what was wanted, the answer is Option C — bind
+# the channel and leave the DM on the default agent — not a weaker gate.
+#
+# THE HAZARD THIS ROLE PREVIOUSLY REFUSED TO TOUCH
+#
+# `bindings` is an ARRAY, so `config patch` REPLACES IT WHOLESALE. That is why
+# the role excluded it from management until now. Any write must read the
+# current value and carry the survivors, or it silently unroutes every agent it
+# did not know about.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a target agent and conversations to bind
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id | length > 0
+      - (dc_slack_route_peers | default([])) | length > 0
+    fail_msg: >-
+      dc_agent_id and dc_slack_route_peers must both be set. They
+      carry no defaults in this public repository — the bindings live in a
+      private inventory's host_vars. Nothing has been changed.
+    success_msg: "binding {{ dc_slack_route_peers | length }} conversation(s) to {{ dc_agent_id }}"
+
+# The target must actually exist. A binding naming an absent agent is legal
+# config that routes messages to nobody — the "looks configured and answers
+# nobody" failure this role guards against everywhere else.
+- name: Read the deployed agents
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_rb_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to bind a conversation to an agent that is not deployed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_id }} is not present in the deployed agents.list. Binding a
+      conversation to an absent agent produces config the runtime accepts and a
+      channel nobody answers. Deploy the profile first
+      (--tags agent-profile). Nothing has been changed.
+  when:
+    - dc_agent_id not in (dc_rb_agents.stdout | default(''))
+    - dc_fail_closed | bool
+
+# The target must be able to READ its own governance, or the route delivers
+# messages to an agent that does not know its own rules — the "bounded but
+# ungoverned" state this workstream named and closed.
+- name: Read the target's workspace
+  ansible.builtin.set_fact:
+    dc_rb_ws: >-
+      {{ ((dc_rb_agents.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_agent_id) | list | first
+          | default({})).workspace | default('') }}
+
+- name: Confirm the target's run gate is installed
+  ansible.builtin.stat:
+    path: "{{ dc_rb_ws }}/AGENTS.md"
+  register: dc_rb_gate
+  when: dc_rb_ws | length > 0
+
+- name: Refuse to route human traffic to an agent with no run gate
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_id }} has no AGENTS.md in its workspace
+      ('{{ dc_rb_ws | default("<none declared>") }}'). Routing the founder's
+      Slack path to an agent with no run gate would move the exposure rather
+      than close it — which is the entire reason this rebind exists. Run
+      --tags agent-workspace first. Nothing has been changed.
+  when:
+    - (dc_rb_ws | length == 0) or (not (dc_rb_gate.stat.exists | default(false)))
+    - dc_fail_closed | bool
+
+# --- read the existing array before replacing it ------------------------------
+- name: Read the current bindings
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'bindings'] }}"
+  register: dc_rb_before
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Parse the current bindings
+  ansible.builtin.set_fact:
+    dc_rb_current: >-
+      {{ (dc_rb_before.stdout | default('[]') | from_json)
+         if (dc_rb_before.rc | default(1)) == 0 else [] }}
+  failed_when: false
+
+# Everything that is not ours is carried forward verbatim. This is the whole
+# reason the play reads before it writes.
+- name: Keep every binding that is not ours to rewrite
+  ansible.builtin.set_fact:
+    dc_rb_kept: >-
+      {{ dc_rb_current | rejectattr('agentId', 'defined') | list
+         + (dc_rb_current | selectattr('agentId', 'defined')
+            | rejectattr('agentId', 'equalto', dc_agent_id) | list) }}
+
+# BINDING SHADOWING — the guard with no analogue elsewhere in this role.
+#
+# Routing resolves most-specific-first: exact peer (tier 1) beats teamId (6)
+# beats accountId (7) beats channel wildcard (8) beats the default agent (9).
+#
+# So a pre-existing peer-scoped binding for a DIFFERENT agent on one of our
+# conversations silently outranks the binding we are about to write. The config
+# would look correct, the audit would show our entry present, and the messages
+# would go somewhere else. That is exactly "a bot that looks configured and
+# answers nobody", arrived at from a new direction.
+- name: Find bindings that would outrank ours
+  ansible.builtin.set_fact:
+    dc_rb_shadow: >-
+      {{ dc_rb_kept | selectattr('match', 'defined')
+         | selectattr('match.peer', 'defined')
+         | selectattr('match.peer.id', 'defined')
+         | selectattr('match.peer.id', 'in', dc_slack_route_peers)
+         | list }}
+
+- name: Refuse when an existing binding shadows the one we would write
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_rb_shadow | length }} existing binding(s) already match a
+      conversation we are about to bind, for a different agent:
+      {{ dc_rb_shadow | map(attribute='agentId', default='<none>') | list }}.
+      Routing is most-specific-wins, so a peer-scoped binding outranks ours and
+      the messages would keep going there — with our entry visibly present in
+      the config. Reconcile the two by hand. Nothing has been changed.
+  when:
+    - (dc_rb_shadow | default([]) | length) > 0
+    - dc_fail_closed | bool
+
+# --- compose --------------------------------------------------------------
+#
+# Built with an explicit loop, not a filter chain.
+#
+# The first three attempts at this were Jinja one-liners using zip/map/regex and
+# a community.general filter that may not even be installed here. They were
+# deleted rather than debugged. A routing array decides which agent receives the
+# founder's messages; it is the last place in this repository that should be
+# clever, and an unreadable expression here fails in the direction of silence.
+#
+# `kind` derives from the Slack id prefix. THE FIRST VERSION OF THIS MAPPING WAS
+# WRONG AND THE ERROR WAS SILENT — the note below is the whole reason this file
+# now has a guard in front of it.
+#
+#   C… public channel      -> kind: channel
+#   G… private channel / MPIM -> kind: group
+#   U… user                -> kind: direct     <- a DM is keyed on the USER
+#   D… IM conversation     -> NEVER USED FOR ROUTING
+#
+# It was applied on 2026-08-17 mapping `^D` to `direct` and passing the D-prefixed
+# IM conversation id as `peer.id`. `config patch` accepted it, `agents bindings`
+# displayed it, and it matched nothing. Verified against the shipped source at the
+# deployed tag: the Slack boundary sets `peer.id` from `message.user` for DMs, so
+# a D… id can never appear on the inbound side to be compared against.
+#
+# Matching is CASE-SENSITIVE on a trim-only comparison, and Slack emits uppercase.
+# Do not lowercase these to match the session keys — session keys are lowercased
+# AFTER routing, during key construction. Lowercasing here breaks matching.
+#
+# A real Ansible loop accumulating real dicts.
+#
+# The previous version used a Jinja {% for %} block to emit JSON text and then
+# concatenated it to a list, which fails with "can only concatenate list (not
+# str) to list". The comment above it already said "an explicit loop, not a
+# filter chain" — the comment was right and the code did not match it. A
+# template that BUILDS TEXT that happens to look like JSON is the same clever
+# move in a different costume.
+# The guard for the defect described above. A D-prefixed id is not merely
+# suboptimal here — it is unroutable, and unroutable is silent.
+- name: Refuse a DM conversation id where a user id is required
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_route_peers contains
+      {{ dc_slack_route_peers | select('match', '^D') | list }},
+      which are Slack IM CONVERSATION ids. Routing never sees them: for a DM the
+      runtime builds peer.id from the sending USER, so a binding on a D… id
+      matches nothing and does so silently — accepted by config patch, displayed
+      by `agents bindings`, and never fired. Replace each with the U… id of the
+      person whose DM should route here. Nothing has been changed.
+  when:
+    - dc_slack_route_peers | select('match', '^D') | list | length > 0
+    - dc_fail_closed | bool
+
+- name: Refuse an unrecognised Slack id prefix
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_route_peers contains
+      {{ dc_slack_route_peers | reject('match', '^[CGU]') | list }},
+      which carry no Slack id prefix this role knows how to type. Supported:
+      C… public channel, G… private channel or MPIM, U… user (DM). A binding
+      whose `kind` is wrong matches nothing, silently, so this refuses rather
+      than defaulting. Nothing has been changed.
+  when:
+    - dc_slack_route_peers | reject('match', '^[CGU]') | list | length > 0
+    - dc_fail_closed | bool
+
+# --- coherence between the two lists ---------------------------------------
+#
+# Splitting reachability from routing removed a silent failure and introduced a
+# drift risk in its place: two lists that must describe the same conversations,
+# with nothing forcing them to agree. These two guards are the price of the
+# split, and they are cheap next to what they replace.
+
+# Routing a channel nobody authorized is EXPANSION wearing a routing costume.
+# Channels are directly comparable between the lists, so this is checkable.
+- name: Refuse to route a channel that is not an authorized conversation
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_route_peers names
+      {{ dc_slack_route_peers | select('match', '^[CG]')
+         | reject('in', dc_slack_required_conversations) | list }},
+      which is not in dc_slack_required_conversations. That list is the record of
+      what access is authorized; routing is meant to redirect an already-permitted
+      conversation, not to reach a new one. Add it there first, with the authority
+      that decision needs. Nothing has been changed.
+  when:
+    - dc_slack_route_peers | select('match', '^[CG]')
+      | reject('in', dc_slack_required_conversations) | list | length > 0
+    - dc_fail_closed | bool
+
+# A U... id cannot be compared to a D... id without asking Slack to resolve the
+# conversation, which this role does not do. So the check is coarse on purpose:
+# it proves the DM was CONSIDERED, not that the right user was named. Stated
+# plainly rather than dressed up as more than it is.
+- name: Refuse when an authorized DM has no routing peer
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_required_conversations authorizes
+      {{ dc_slack_required_conversations | select('match', '^D') | list }}
+      but dc_slack_route_peers names no U... user, so the DM would fall through
+      to the default agent while the channel is bound — a half-applied routing
+      posture that reads as complete. Name the sending user's U... id, or drop
+      the DM from the authorized list deliberately. Nothing has been changed.
+      NOTE this cannot verify WHICH user; it only proves the DM was not
+      forgotten.
+  when:
+    - dc_slack_required_conversations | select('match', '^D') | list | length > 0
+    - dc_slack_route_peers | select('match', '^U') | list | length == 0
+    - dc_fail_closed | bool
+
+- name: Build one binding per required conversation
+  ansible.builtin.set_fact:
+    dc_rb_entries: >-
+      {{ (dc_rb_entries | default([])) + [{
+           'agentId': dc_agent_id,
+           'match': {
+             'channel': 'slack',
+             'accountId': dc_slack_binding_account_id,
+             'peer': {
+               'kind': ('direct' if item is match('^U')
+                        else ('group' if item is match('^G') else 'channel')),
+               'id': item
+             }
+           }
+         }] }}
+  loop: "{{ dc_slack_route_peers }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assemble the array that will be written
+  ansible.builtin.set_fact:
+    dc_rb_payload: "{{ dc_rb_kept + dc_rb_entries }}"
+
+# Both halves are asserted before the runtime is asked. A malformed binding is
+# accepted by config patch and simply never matches, so a shape error here is
+# silent at every later stage.
+- name: Confirm the composed bindings are well formed
+  ansible.builtin.assert:
+    that:
+      - dc_rb_payload | length == (dc_rb_kept | length) + (dc_slack_route_peers | length)
+      - dc_rb_entries | selectattr('match.peer.id', 'defined') | list | length
+        == dc_slack_route_peers | length
+      - dc_rb_entries | selectattr('agentId', 'equalto', dc_agent_id) | list | length
+        == dc_slack_route_peers | length
+      # Every entry carries an accountId. Omitting it does not mean "any
+      # account" -- it normalises to the literal "default", and if the Slack
+      # account is named anything else the peer tier is never evaluated at all.
+      # That is a second way to build a binding that is accepted and never
+      # matches, so it is asserted rather than assumed.
+      - dc_rb_entries | selectattr('match.accountId', 'defined') | list | length
+        == dc_slack_route_peers | length
+      # No D… id survived the guard above into a composed binding.
+      - dc_rb_entries | selectattr('match.peer.id', 'match', '^D') | list | length == 0
+    fail_msg: >-
+      The composed binding array is not the expected shape:
+      {{ dc_rb_payload | to_json | truncate(400) }}.
+      A malformed binding is accepted by the runtime and simply never matches,
+      so this is checked here rather than discovered as silence later.
+    success_msg: >-
+      {{ dc_rb_entries | length }} binding(s) composed,
+      {{ dc_rb_kept | length }} pre-existing preserved
+
+- name: Ask the runtime to validate the binding without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ {'bindings': dc_rb_payload} | to_json }}"
+  register: dc_rb_dryrun
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Report what the runtime said
+  ansible.builtin.debug:
+    msg: "{{ (dc_rb_dryrun.stdout_lines | default([])) + (dc_rb_dryrun.stderr_lines | default([])) }}"
+
+- name: Refuse a binding the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      `config patch --dry-run` rejected the bindings
+      (rc={{ dc_rb_dryrun.rc | default('?') }}). Nothing written.
+      {{ dc_rb_dryrun.stderr | default('') | trim }}
+  when:
+    - (dc_rb_dryrun.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "Slack routing to {{ dc_agent_id }} (--tags slack-rebind)"
+    dc_apply_target: "bindings (top-level array — REPLACED wholesale)"
+    dc_apply_overlay:
+      bindings: "{{ dc_rb_payload }}"
+      preserved_from_existing: "{{ dc_rb_kept | length }}"
+      reversal: '{"bindings": null}'
+      cost: "ad-hoc Slack ends on these conversations; ungated questions return BLOCKED"
+
+- name: Back up the config before rebinding
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-rebind.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+# NOTIFIES THE RESTART HANDLER, and the absence of this line cost a full day.
+#
+# `bindings` is read by the Gateway AT STARTUP. Patching it changes the file and
+# nothing else: the running process keeps the routing table it built when it
+# started. On 2026-08-17 this play wrote the binding, validated it against the
+# live schema, read it back, asserted every conversation was bound, and emitted a
+# success receipt — while every Slack message continued reaching the default
+# agent. Two peer-id theories, an account-bucket theory and a session-pinning
+# theory were investigated before anyone asked whether the process had reloaded.
+# It had not. The binding had been correct from the first apply.
+#
+# agent_profile.yml, remove_agent.yml, slack_bound.yml and main.yml all notify
+# this handler. This play was written as a SEPARATE play so a routing mistake
+# would be independently reversible, and the handler was dropped in the split —
+# the one write task in the role that changed the config and left the process on
+# the old one. handlers/main.yml opens by naming that exact divergence as the
+# worst outcome this role can produce.
+#
+# The handler is the right mechanism rather than an unconditional restart: it
+# fires once, at the end, only if something actually changed.
+- name: Write the bindings
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ {'bindings': dc_rb_payload} | to_json }}"
+  register: dc_rb_patch
+  changed_when: dc_rb_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  notify: Restart openclaw gateway
+
+- name: Refuse when the write failed
+  ansible.builtin.fail:
+    msg: >-
+      `config patch` failed (rc={{ dc_rb_patch.rc | default('?') }}):
+      {{ dc_rb_patch.stderr | default('') | trim }}
+      Recover with --tags slack-unbind, or playbooks/governed-rollback.yml.
+  when:
+    - (dc_rb_patch.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Read the bindings back
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'bindings'] }}"
+  register: dc_rb_after
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Confirm every required conversation is bound to the target
+  ansible.builtin.assert:
+    that:
+      - item in (dc_rb_after.stdout | default(''))
+      - dc_agent_id in (dc_rb_after.stdout | default(''))
+    fail_msg: >-
+      {{ item }} does not appear in the bindings read back from the runtime.
+      The founder's Slack route may be in an unknown state — verify by
+      messaging OpenClaw, and reverse with --tags slack-unbind if it is wrong.
+    success_msg: "{{ item }} bound to {{ dc_agent_id }}"
+  loop: "{{ dc_slack_route_peers }}"
+  when: dc_fail_closed | bool
+
+- name: Emit the rebind receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SLACK-REBIND RECEIPT |
+      target={{ dc_agent_id }} |
+      bound={{ dc_slack_route_peers | join(', ') }} |
+      preserved={{ dc_rb_kept | length }} pre-existing binding(s) |
+      channels.slack UNCHANGED — no new app, OAuth, scope, credential or sender |
+      reverse_with=`--tags slack-unbind` or `config patch {"bindings": null}` |
+      NOT YET PROVEN: that a message now reaches {{ dc_agent_id }}. Config
+      read-back proves the key changed, not that routing works. ASK IN SLACK
+      FOR THE RESPONDER'S AGENT ID — before this it answered `main`. |
+      EXPECT BLOCKED for ordinary questions. The target is run-gated and
+      Prepare-only; an ungated question returning BLOCKED is the control
+      working, not a fault.

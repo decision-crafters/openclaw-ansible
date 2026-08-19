@@ -1,0 +1,99 @@
+---
+# Shared setup for every admission task. Included, not duplicated.
+#
+# Establishes the CLI invocation and confirms the verbs exist before anything
+# calls them. Both were learned expensively:
+#
+#   `bash -lc openclaw` discards appended arguments and is not on a
+#   non-interactive login shell's PATH — rc=127, which reads as "the CLI is
+#   missing" rather than "unreachable from here". The working form derives the
+#   entrypoint from the installed unit and calls node, as tasks/main.yml has
+#   done since 2026-08-15.
+#
+#   `plugins list` was assumed to exist, was not a real subcommand, and hung on
+#   stdin rather than erroring. One --help would have prevented it.
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_audit_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+    dc_life_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+    # The shared restart handler reads dc_openclaw_uid. Omitting it here made
+    # the handler fail with "'dc_openclaw_uid' is undefined" AFTER the config
+    # had been patched and validated — leaving the file changed and the running
+    # process on the previous config, which is the exact divergence the handler
+    # comment at the top of handlers/main.yml calls the worst outcome this role
+    # can produce. Three names for one uid is redundant; renaming them is a
+    # separate change and not one to make while a host is half-applied.
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_agent_entry_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_audit_entrypoint: "{{ dc_agent_entry_probe.stdout | default('') | trim }}"
+
+- name: Refuse without an entrypoint to invoke
+  ansible.builtin.fail:
+    msg: >-
+      Could not derive the OpenClaw entrypoint from
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}.
+      The path embeds a version and a content hash, so it changes on upgrade.
+  when:
+    - dc_audit_entrypoint | length == 0
+    - dc_fail_closed | bool
+
+- name: Confirm the config verbs this build has
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', '--help'] }}"
+  register: dc_agent_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to use config verbs that may not exist
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw config --help` returned nothing usable
+      (rc={{ dc_agent_help.rc | default('?') }}). Refusing to call verbs blindly
+      — an unrecognised subcommand does not necessarily error, it can wait on
+      stdin, which is how the plugin probe hung.
+  when:
+    - (dc_agent_help.rc | default(1)) != 0 or (dc_agent_help.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Require patch, validate and get on this build
+  ansible.builtin.assert:
+    that:
+      - "'patch' in dc_agent_help.stdout"
+      - "'validate' in dc_agent_help.stdout"
+      - "'get' in dc_agent_help.stdout"
+    fail_msg: >-
+      This build lacks one of `config patch`, `config validate` or `config get`.
+      These plays deliberately use the runtime's own validation rather than
+      reimplementing it — the hand-rolled validator shipped three defects,
+      including one that also broke the rollback path.
+    success_msg: "config patch, validate and get are available"
+
+- name: Read the current agents.list
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_agent_list_before
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Record whether agents.list exists yet
+  ansible.builtin.set_fact:
+    dc_agent_list_unset: "{{ (dc_agent_list_before.rc | default(1)) != 0 }}"

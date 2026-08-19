@@ -1,0 +1,53 @@
+---
+# Start, stop, restart and inspect the governed OpenClaw Gateway.
+#
+# Separate from governed-lab.yml because lifecycle is not configuration. Running
+# it must never merge, write or restart as a side effect of asking a question —
+# `--tags status` reads and asserts, and touches nothing.
+#
+#   sudo ansible-playbook playbooks/governed-lifecycle.yml \
+#     --tags status -e ansible_become=false
+#
+#   --tags status    is it up, and is it STABLE (two NRestarts samples)
+#   --tags restart   restart, then prove it came back and stayed
+#   --tags start     start, then prove it came back and stayed
+#   --tags logs      recent journal
+#   --tags stop      refuses unless -e dc_confirm_stop=true
+#
+# `sudo` and the absolute path both matter. ansible-playbook is a uv tool in
+# ~/.local/bin, which is not on sudo's secure_path, so a bare `sudo
+# ansible-playbook` fails with "command not found" — a message that reads like
+# Ansible is missing rather than like a PATH problem.
+#
+# `-e ansible_become=false` avoids a second sudo prompt on a host without
+# passwordless sudo. The role switches to the service account with `runuser`
+# rather than become_user precisely because that flag disables become_user.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Manage the governed OpenClaw gateway
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    # NO `apply:` here, and that is the whole point.
+    #
+    # `apply.tags` does not gate the included tasks — it ADDS those tags to every
+    # one of them. With the union applied, `--tags status` matched the stop
+    # guard, the stop, the logs and the start tasks alike. Every tag except a
+    # confirmed stop would have died on the guard's "Refuse to stop the gateway"
+    # message during a read-only status check, and a status check run with
+    # -e dc_confirm_stop=true would have stopped the Gateway and dropped Slack.
+    #
+    # Without `apply`, the tags below gate whether the include runs at all, and
+    # each included task's own tags then decide whether it executes. Verified by
+    # executing both variants against a mock role rather than reasoning about
+    # them: ansible-lint and --syntax-check both passed the broken version, and
+    # --list-tasks does not expand a dynamic include, so nothing static could
+    # have caught it.
+    - name: Run the lifecycle tasks
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: lifecycle
+      tags: [always, status, start, restart, stop, logs]

@@ -1,0 +1,220 @@
+---
+# TASK-223 test 12b — the sender-denial negative control. MUTATES ONE KEY.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags sender-denial -e ansible_become=false -e dc_apply=true
+#
+# Sibling of authority_injection.yml (12c): both are synthetic admission
+# harnesses, so 12b lives beside 12c rather than in a scratchpad script.
+#
+# WHAT IT DOES: replaces the founder in ONE channel's sender allowlist with a
+# placeholder, restarts the Gateway, and proves from the startup log that a
+# restriction is installed naming someone else.
+#
+# WHAT IT DELIBERATELY DOES NOT TOUCH: channels.slack.allowFrom. That governs
+# DMs, not channels. Leaving it intact keeps the founder's phone route open for
+# the whole test -- if this goes wrong there is still a way into the host.
+# Also untouched: Slack app, tokens, scopes, OAuth, channel membership,
+# bindings, agent config, workspace files, plugins.allow.
+#
+# REPLACE, NEVER EMPTY. On 2026-08-17 this test emptied the list instead.
+# `users: []` installs NO RESTRICTION on 2026.7.1-2 -- the founder's message
+# routed normally -- so the test never presented a non-permitted sender and
+# could only return INDETERMINATE. An empty allowlist FAILS OPEN. Emptying a
+# control while believing you tightened it is the worst available outcome, so
+# this task refuses to write an empty list at all.
+#
+# THE REVERSAL EXISTS ALREADY: sender_denial_restore.yml, driven from the
+# on-host baseline this task writes. It does not depend on any session.
+
+# EVIDENCE-CLASS: cumulative = dc_sd_has_anchor
+# EVIDENCE-CLASS: present = dc_sd_resolved_placeholder, dc_sd_resolved_founder
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a channel and a placeholder
+  ansible.builtin.assert:
+    that:
+      - dc_sender_test_channel | default('') | length > 0
+      - dc_sender_test_placeholder | default('') | length > 0
+      - dc_sender_test_founder | default('') | length > 0
+    fail_msg: >-
+      dc_sender_test_channel, dc_sender_test_founder and
+      dc_sender_test_placeholder must all be set. Nothing has been changed.
+    success_msg: "12b target {{ dc_sender_test_channel | default('?') }}"
+
+# An empty placeholder list would fail open. Refusing the shape outright is
+# cheaper than discovering it from a routed message afterwards.
+- name: Refuse a placeholder that would empty the allowlist
+  ansible.builtin.fail:
+    msg: >-
+      dc_sender_test_placeholder is empty. Writing an empty `users` array
+      installs NO restriction on this build -- it fails OPEN, which is the
+      defect that made the 2026-08-17 run of this test INDETERMINATE.
+      Nothing has been changed.
+  when:
+    - (dc_sender_test_placeholder | default('') | trim | length) == 0
+    - dc_fail_closed | bool
+
+- name: Read the current sender allowlist
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get',
+              'channels.slack.channels.' ~ dc_sender_test_channel ~ '.users'] }}"
+  register: dc_sd_before
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# Never capture a baseline from an already-mutated state -- that would freeze
+# the test condition as the thing to restore to.
+- name: Refuse to mutate from an unexpected baseline
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_sender_test_founder }} is not currently in
+      channels.slack.channels.{{ dc_sender_test_channel }}.users
+      (rc={{ dc_sd_before.rc | default('?') }}, value
+      {{ dc_sd_before.stdout | default('') | trim | truncate(120) }}).
+      Either a previous run of this test was not restored, or the wrong path was
+      read. Capturing a baseline now would record the MUTATED state as the thing
+      to restore to. Nothing has been changed.
+  when:
+    - not (dc_sd_before.stdout | default('') is search(dc_sender_test_founder))
+    - dc_fail_closed | bool
+
+- name: Write the restore point to the host
+  ansible.builtin.copy:
+    content: "{{ {'path': 'channels.slack.channels.' ~ dc_sender_test_channel ~ '.users',
+                  'users': (dc_sd_before.stdout | from_json)} | to_nice_json }}"
+    dest: "{{ dc_sender_test_baseline }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "12b sender-denial negative control (--tags sender-denial)"
+    dc_apply_target: "channels.slack.channels.{{ dc_sender_test_channel }}.users"
+    dc_apply_overlay:
+      from: "{{ dc_sd_before.stdout | default('') | trim }}"
+      to: "[{{ dc_sender_test_placeholder }}]"
+      untouched: "channels.slack.allowFrom — the founder's DM/phone route stays open"
+      restart: "REQUIRED — sender controls are resolved at Gateway startup"
+      reverse_with: "--tags sender-denial-restore"
+
+- name: Replace the founder with the placeholder
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ {'channels': {'slack': {'channels':
+                {dc_sender_test_channel: {'users': [dc_sender_test_placeholder]}}}}} | to_json }}"
+  register: dc_sd_patch
+  changed_when: dc_sd_patch.rc == 0
+  failed_when: false
+  timeout: 120
+
+- name: Refuse when the write failed
+  ansible.builtin.fail:
+    msg: "config patch failed rc={{ dc_sd_patch.rc }}: {{ dc_sd_patch.stderr | default('') | truncate(300) }}"
+  when: (dc_sd_patch.rc | default(1)) != 0
+
+- name: Confirm the DM route is untouched
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'channels.slack.allowFrom'] }}"
+  register: dc_sd_dm
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse if the DM route was disturbed
+  ansible.builtin.fail:
+    msg: >-
+      channels.slack.allowFrom no longer names {{ dc_sender_test_founder }}.
+      This test must never close the founder's DM route. RESTORE IMMEDIATELY
+      with --tags sender-denial-restore.
+  when:
+    - not (dc_sd_dm.stdout | default('') is search(dc_sender_test_founder))
+    - dc_fail_closed | bool
+
+- name: Restart the Gateway so the sender control takes effect
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['gateway', 'restart'] }}"
+  register: dc_sd_restart
+  changed_when: true
+  failed_when: false
+  timeout: 180
+
+# ANCHORED WAIT. `until: stdout is search('socket mode connected')` over the
+# whole log is satisfied by a PREVIOUS restart's line, so it returns on the
+# first poll and waits for nothing — after which every check below runs against
+# a Gateway that may still be starting. Same defect class as the unanchored
+# resolution counts; found by the evidence contract, not by a failing run.
+- name: Wait for the Slack provider to reconnect
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['logs', '--limit', '300', '--plain', '--no-color'] }}"
+  register: dc_sd_up
+  until: >-
+    {{ (dc_sd_up.stdout | default('') | split('starting provider') | last)
+       is search('slack socket mode connected') }}
+  retries: 30
+  delay: 3
+  changed_when: false
+  failed_when: false
+
+# The proof. `slack channel users resolved: <id>` is emitted once per permitted
+# user at provider start. The placeholder must appear and the founder must not.
+# ANCHORED TO THE LAST PROVIDER START. Not optional, and not a refinement.
+#
+# The Gateway file log SPANS RESTARTS -- lines from several restarts coexist in
+# one query. Searching the whole log for "is the founder resolved" therefore
+# matches PRE-MUTATION history and reports it as current state.
+#
+# That exact mistake has now been made three times in this workstream: a
+# scratchpad checker aborted a good test on it, a forensic script scored an
+# empty log as "this gateway never saw the event", and this task reported the
+# founder AND the placeholder both resolving, which is impossible in one start.
+#
+# Splitting on the provider-start marker and keeping the LAST segment removes
+# the question rather than getting the window right once and hoping.
+- name: Note whether the log can be anchored at all
+  ansible.builtin.set_fact:
+    dc_sd_has_anchor: "{{ (dc_sd_up.stdout | default('')) is search('starting provider') }}"
+
+- name: Isolate the most recent provider start
+  ansible.builtin.set_fact:
+    dc_sd_window: "{{ (dc_sd_up.stdout | default('')) | split('starting provider') | last }}"
+
+- name: Refuse to score without a provider start in the log
+  ansible.builtin.fail:
+    msg: >-
+      No 'starting provider' marker found in the Gateway log, so the window
+      cannot be anchored and any resolution count would include pre-mutation
+      history. INSUFFICIENT EVIDENCE — do not send a message.
+      Restore with --tags sender-denial-restore.
+  when:
+    - not dc_sd_has_anchor | bool
+    - dc_fail_closed | bool
+
+- name: Read the post-restart resolution block
+  ansible.builtin.set_fact:
+    dc_sd_resolved_placeholder: >-
+      {{ dc_sd_window | regex_findall('(?m)^.*channel users resolved.*'
+                                      ~ dc_sender_test_placeholder ~ '.*$') }}
+    dc_sd_resolved_founder: >-
+      {{ dc_sd_window | regex_findall('(?m)^.*channel users resolved.*'
+                                      ~ dc_sender_test_founder ~ '.*$') }}
+
+- name: Report the effective sender state
+  ansible.builtin.debug:
+    msg: >-
+      DC-12B EFFECTIVE STATE |
+      placeholder_resolved={{ dc_sd_resolved_placeholder | length }} |
+      founder_resolved={{ dc_sd_resolved_founder | length }} |
+      {{ 'READY — a restriction is installed and names the placeholder, not the
+          founder. Send ONE message, then --tags slack-evidence to score.'
+         if (dc_sd_resolved_placeholder | length) > 0
+            and (dc_sd_resolved_founder | length) == 0
+         else 'NOT READY — DO NOT SEND A MESSAGE. Either the founder is still
+               permitted, or the placeholder did not resolve (an id the runtime
+               cannot resolve is dropped, leaving the list effectively EMPTY and
+               therefore FAIL-OPEN). Restore with --tags sender-denial-restore.' }}

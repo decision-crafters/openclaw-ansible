@@ -1,0 +1,168 @@
+---
+# Start, stop, restart and inspect the OpenClaw Gateway.
+#
+# Exists because the correct incantation is not obvious and getting it wrong
+# reads as a permissions problem rather than the identity problem it is. Every
+# lifecycle command needs three things right at once:
+#
+#   run as root            the playbook must be invoked under sudo
+#   switch with runuser    NOT become — `-e ansible_become=false` disables
+#                          become_user, so tasks silently run as root instead
+#   XDG_RUNTIME_DIR set    root cannot reach another user's systemd session bus
+#                          without it, and the failure says "Operation not
+#                          permitted", which sounds like sudo and is not
+#
+# Four failed attempts on 2026-08-15 were all this. It is now a file.
+#
+# Run:
+#   sudo ansible-playbook playbooks/governed-lifecycle.yml \
+#     --tags status -e ansible_become=false
+#
+# Tags: status (default) | start | restart | stop | logs
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+  tags: [always]
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_life_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+  tags: [always]
+
+# --- stop guard ---------------------------------------------------------------
+# Stopping the Gateway drops every channel, and Slack is the founder's only
+# route to this host: gateway.bind is loopback and Tailscale is not configured.
+# So `stop` is not a routine operation — it is a deliberate outage of the
+# operator's own access, and it should be awkward enough to be intentional.
+#
+# This is the same rule the plugin layer already enforces: a control that
+# removes operability is a different failure, not a safe default.
+- name: Refuse to stop the gateway without explicit confirmation
+  ansible.builtin.fail:
+    msg: >-
+      Stopping {{ dc_openclaw_service }} drops Slack, which is the only route to
+      this host until Tailscale exists — you will not be able to reach OpenClaw
+      from a phone until it is started again. Re-run with
+      -e dc_confirm_stop=true if that is intended. To restart without an
+      access gap, use --tags restart instead.
+  when: not (dc_confirm_stop | bool)
+  tags: [stop]
+
+- name: Stop the gateway
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['stop', dc_openclaw_service] }}"
+  changed_when: true
+  tags: [stop]
+
+# --- start / restart ----------------------------------------------------------
+# reset-failed first: a unit that hit StartLimitBurst refuses to start again and
+# reports a start failure whose real cause is the earlier crash loop.
+- name: Clear any failed state before starting
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['reset-failed', dc_openclaw_service] }}"
+  register: dc_life_reset
+  changed_when: dc_life_reset.rc == 0
+  failed_when: false
+  tags: [start, restart]
+
+- name: Start the gateway
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['start', dc_openclaw_service] }}"
+  changed_when: true
+  tags: [start]
+
+- name: Restart the gateway
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['restart', dc_openclaw_service] }}"
+  changed_when: true
+  tags: [restart]
+
+# --- health -------------------------------------------------------------------
+# Two NRestarts samples, never a single is-active. The unit carries
+# Restart=always with RestartSec=5, so a process dying after 2.3s is genuinely
+# `active` for part of every cycle — a single sample catches an up-phase and
+# reports a healthy service that is crash-looping toward StartLimitBurst.
+- name: Let the gateway settle
+  ansible.builtin.wait_for:
+    timeout: 15
+  tags: [start, restart, status]
+
+- name: Sample unit state
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_life_first
+  changed_when: false
+  failed_when: false
+  tags: [start, restart, status]
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+  tags: [start, restart, status]
+
+- name: Sample unit state again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_life_second
+  changed_when: false
+  failed_when: false
+  tags: [start, restart, status]
+
+- name: Extract both samples
+  ansible.builtin.set_fact:
+    dc_life_a: "{{ dict(dc_life_first.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_life_b: "{{ dict(dc_life_second.stdout_lines | default([]) | map('split', '=') | list) }}"
+  tags: [start, restart, status]
+
+- name: Confirm the gateway is running and stable
+  ansible.builtin.assert:
+    that:
+      - dc_life_b.ActiveState | default('') == 'active'
+      - dc_life_b.SubState | default('') == 'running'
+      - (dc_life_b.NRestarts | default(0) | int) == (dc_life_a.NRestarts | default(0) | int)
+    fail_msg: >-
+      Gateway is not stable.
+      ActiveState={{ dc_life_b.ActiveState | default('?') }}
+      SubState={{ dc_life_b.SubState | default('?') }}
+      NRestarts {{ dc_life_a.NRestarts | default('?') }} -> {{ dc_life_b.NRestarts | default('?') }}
+      ExecMainStatus={{ dc_life_b.ExecMainStatus | default('?') }}.
+      A rising restart count is a crash loop, which reads as 'active' for part of
+      every cycle. Slack is down while this persists. Read the journal with
+      --tags logs, and recover with playbooks/governed-rollback.yml if a config
+      change caused it.
+    success_msg: >-
+      {{ dc_openclaw_service }} active and stable
+      (NRestarts held at {{ dc_life_b.NRestarts | default('0') }} across 15s)
+  tags: [start, restart, status]
+
+- name: Emit the lifecycle receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-OPENCLAW LIFECYCLE |
+      unit={{ dc_openclaw_service }} ({{ dc_openclaw_service_scope }} scope) |
+      user={{ dc_openclaw_user }} (uid {{ dc_life_uid }}) |
+      ActiveState={{ dc_life_b.ActiveState | default('?') }} |
+      SubState={{ dc_life_b.SubState | default('?') }} |
+      NRestarts={{ dc_life_b.NRestarts | default('?') }} (stable across 15s) |
+      ExecMainStatus={{ dc_life_b.ExecMainStatus | default('?') }}
+  tags: [start, restart, status]
+
+# --- logs ---------------------------------------------------------------------
+- name: Read recent gateway logs
+  ansible.builtin.command:
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env',
+          'XDG_RUNTIME_DIR=/run/user/' ~ dc_life_uid, 'journalctl',
+          '--' ~ dc_openclaw_service_scope, '-u', dc_openclaw_service,
+          '-n', dc_life_log_lines | string, '--no-pager'] }}
+  register: dc_life_logs
+  changed_when: false
+  failed_when: false
+  tags: [logs]
+
+- name: Show recent gateway logs
+  ansible.builtin.debug:
+    msg: "{{ dc_life_logs.stdout_lines | default(['<no output>']) }}"
+  tags: [logs]

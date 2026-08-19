@@ -1,0 +1,28 @@
+---
+# Restore the most recent pre-merge OpenClaw config and bring the Gateway back.
+#
+# Separate from governed-lab.yml deliberately. Rollback is the thing you reach
+# for when something is already wrong, and it should not share an entry point
+# with the thing that applies changes — running the wrong tag under pressure is
+# a foreseeable mistake, so the two are different files.
+#
+#   ansible-playbook playbooks/governed-rollback.yml
+#
+# Verifies the backup parses before trusting it, preserves the current config
+# first so the rollback is itself reversible, clears systemd's start-limit
+# failure state, and confirms the unit is still running 15 seconds later rather
+# than accepting a clean restart as proof.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Roll back Decision Crafters governance controls
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Restore the previous config and restart the gateway
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: rollback
+  tags:
+    - rollback

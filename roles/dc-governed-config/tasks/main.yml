@@ -1,0 +1,396 @@
+---
+# Merge the Decision Crafters governance controls into an existing OpenClaw
+# config.
+#
+# This role never creates ~/.openclaw/openclaw.json. `openclaw onboard` owns
+# that file and writes it during setup; a config created here beforehand would
+# be silently overwritten, leaving an operator believing controls were applied
+# when onboarding had replaced them. Refusing is the safer failure.
+
+# Resolved rather than configured. The uid is needed for XDG_RUNTIME_DIR when
+# talking to the service account's user-scope systemd, and a hardcoded value
+# would be correct on exactly one host.
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+# Read out of the unit that is actually installed, so an OpenClaw upgrade does
+# not silently point this at a path that no longer exists.
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_entrypoint_probe
+  changed_when: false
+  failed_when: false
+  when: dc_openclaw_entrypoint | length == 0
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_openclaw_entrypoint: >-
+      {{ dc_openclaw_entrypoint if (dc_openclaw_entrypoint | length > 0)
+         else (dc_entrypoint_probe.stdout | default('') | trim) }}
+
+- name: Refuse to continue without an entrypoint to ask for the schema
+  ansible.builtin.fail:
+    msg: >-
+      Could not derive the OpenClaw entrypoint from
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}.
+      Without it the schema cannot be fetched, and without the schema this role
+      would be writing a config nothing has checked. Set dc_openclaw_entrypoint
+      explicitly.
+  when:
+    - dc_openclaw_entrypoint | length == 0
+    - dc_fail_closed | bool
+
+- name: Confirm the governed config target exists
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_config_path }}"
+  register: dc_config_stat
+
+- name: Refuse to run before onboarding has written the config
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_config_path }} does not exist, so OpenClaw onboarding has
+      not run yet. This role merges governance controls into an existing config
+      and deliberately will not create one: `openclaw onboard` writes this file
+      and would overwrite anything staged here first, leaving the controls
+      absent while appearing applied. Run `openclaw onboard --install-daemon` as
+      {{ dc_openclaw_user }}, then re-run this role.
+  when:
+    - not dc_config_stat.stat.exists
+    - dc_fail_closed | bool
+
+- name: Read the current config
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_config_raw
+
+- name: Parse the current config
+  ansible.builtin.set_fact:
+    dc_config_current: "{{ dc_config_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse to merge into a config that could not be parsed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_config_path }} could not be parsed as JSON. OpenClaw reads
+      JSON5, which permits comments and trailing commas that strict JSON parsing
+      rejects, so a hand-edited config can be valid to OpenClaw and unreadable
+      here. Refusing rather than guessing: a merge built on a failed parse would
+      drop every key it could not see. Resolve by hand, then re-run.
+  when:
+    - dc_config_current is not defined
+    - dc_fail_closed | bool
+
+# Built as a fact rather than a template so the merge is a data operation with
+# one obvious precedence rule, instead of a rendering that has to reproduce
+# every key onboarding wrote.
+- name: Build the governance overlay
+  ansible.builtin.set_fact:
+    dc_governance_overlay:
+      agents:
+        defaults:
+          sandbox:
+            mode: "{{ dc_sandbox_mode }}"
+            scope: "{{ dc_sandbox_scope }}"
+            workspaceAccess: "{{ dc_sandbox_workspace_access }}"
+            docker:
+              network: "{{ dc_sandbox_docker_network }}"
+      tools:
+        allow: "{{ dc_tools_allow }}"
+        deny: "{{ dc_tools_deny }}"
+        exec:
+          mode: "{{ dc_tools_exec_mode }}"
+        elevated:
+          enabled: "{{ dc_tools_elevated_enabled | bool }}"
+      gateway:
+        bind: "{{ dc_gateway_bind }}"
+      plugins:
+        deny: "{{ dc_plugins_deny }}"
+
+# `plugins.allow` is deliberately NOT written when empty, which differs from how
+# this role treats tools.allow.
+#
+# For tools, OpenClaw documents that a non-empty allow-list blocks everything
+# outside it — so empty means inactive, and writing [] to clear an inherited
+# list is safe and necessary. For PLUGINS that behaviour is not documented
+# anywhere verified. The host's config (inspected 2026-08-15) has no
+# plugins.allow at all, so writing [] would introduce a key whose empty-list
+# semantics are an assumption.
+#
+# If OpenClaw read [] as "permit nothing" rather than "no allow-list", it would
+# disable every plugin — including slack, the operator's only route to this
+# Gateway, and ollama, the model provider. That is the exact shape of the
+# gateway.bind failure: a plausible reading of an unverified value, applied to a
+# live daemon.
+#
+# deny wins over allow and over per-plugin enablement, so deny alone is
+# sufficient. An absent key cannot be misread.
+- name: Include a plugin allow-list only when one is deliberately configured
+  ansible.builtin.set_fact:
+    dc_governance_overlay: >-
+      {{ dc_governance_overlay | combine({'plugins': {'allow': dc_plugins_allow}}, recursive=True) }}
+  when: dc_plugins_allow | length > 0
+
+# Checked before the schema gate, because this failure is not a schema failure.
+# `plugins.deny: ["slack"]` is perfectly legal config — the schema would accept
+# it, the merge would apply it, every assertion in verify.yml would pass, and
+# the Gateway would come back up healthy and unreachable.
+#
+# There is no technical signal for this one. The only thing that makes it wrong
+# is a founder decision, so the decision is what gets enforced.
+- name: Refuse to sever a required capability
+  ansible.builtin.fail:
+    msg: >-
+      dc_plugins_deny contains {{ dc_plugins_deny | intersect(dc_plugins_required) }},
+      which is listed in dc_plugins_required. Founder decision 2026-08-15: Slack
+      is the operator's only route to this Gateway until Tailscale exists, and
+      TASK-217 must not disable it to simplify plugin security. Nothing has been
+      written. If this capability genuinely should go, change the decision in
+      PRM-5 first and remove it from dc_plugins_required deliberately — do not
+      route around this by editing the deny list.
+  when:
+    - dc_plugins_deny | intersect(dc_plugins_required) | length > 0
+    - dc_fail_closed | bool
+
+# The same failure by the other route. A populated plugins.allow is an exclusive
+# allowlist covering bundled plugins, so a required plugin missing from it is
+# denied by omission — the quiet version of the task above.
+- name: Refuse an allow-list that omits a required capability
+  ansible.builtin.fail:
+    msg: >-
+      plugins.allow is non-empty and omits
+      {{ dc_plugins_required | difference(dc_plugins_allow) }}.
+      An exclusive allowlist denies by omission, so this would sever operator
+      access while reporting success. Either list every required plugin or leave
+      dc_plugins_allow empty, which is the documented default for this role.
+  when:
+    - dc_plugins_allow | length > 0
+    - dc_plugins_required | difference(dc_plugins_allow) | length > 0
+    - dc_fail_closed | bool
+
+# Governance wins. `combine(recursive=True)` with the overlay second means an
+# existing permissive value is replaced rather than preserved, which is the
+# whole point — this role exists to override whatever onboarding chose.
+- name: Compute the merged config
+  ansible.builtin.set_fact:
+    dc_config_merged: >-
+      {{ dc_config_current | combine(dc_governance_overlay, recursive=True) }}
+
+# The hard gate. Everything above this point verified that values reached the
+# merged structure; nothing verified that OpenClaw would accept it. Those are
+# different claims, and only the first was ever tested — which is how
+# `gateway.bind: "127.0.0.1"` passed every assertion in this role and then
+# crash-looped the daemon, because bind is an enum and not an address.
+#
+# `openclaw config schema` prints the live schema the runtime validates against.
+# Asking the binary beats reading the documentation: the documentation review
+# that followed the outage concluded gateway.bind did not exist at all, and
+# concluded the same about tools.exec.mode. The schema says both exist. Two
+# wrong answers from prose, one right answer from the program.
+- name: Obtain the live config schema from OpenClaw
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - /usr/bin/node
+      - "{{ dc_openclaw_entrypoint }}"
+      - config
+      - schema
+  register: dc_schema_raw
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to write without a schema to check against
+  ansible.builtin.fail:
+    msg: >-
+      Could not obtain the config schema (rc={{ dc_schema_raw.rc | default('?') }}):
+      {{ dc_schema_raw.stderr | default('') | trim }}.
+      Refusing to write an unvalidated config. An ungated write is the state
+      that took the Gateway down, so failing here is the point rather than an
+      inconvenience. Set dc_openclaw_entrypoint if the install path has moved.
+  when:
+    - (dc_schema_raw.rc | default(1)) != 0 or (dc_schema_raw.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+# Written to a file rather than piped. `ansible.builtin.script` has no `stdin`
+# parameter — that belongs to command/shell — and passing one failed at runtime
+# with "Unsupported parameters". Neither `--syntax-check` nor `ansible-lint`
+# catches it: module arguments are validated when the module runs.
+#
+# A file also avoids ferrying ~1.9MB of schema through a module argument.
+- name: Stage the live schema where the validator can read it
+  ansible.builtin.copy:
+    content: "{{ dc_schema_raw.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Check every governed key against the schema
+  ansible.builtin.script:
+    cmd: >-
+      files/validate_overlay.py
+      {{ dc_governance_overlay | to_json | quote }}
+      {{ dc_schema_staging_path | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: dc_schema_check
+  changed_when: false
+  failed_when: false
+
+# Removed whether the check passed or failed, and before the fail task below, so
+# a rejected overlay does not leave the schema lying around.
+- name: Remove the staged schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
+
+- name: Refuse to write a config the schema rejects
+  ansible.builtin.fail:
+    msg: >-
+      The governance overlay does not satisfy OpenClaw's own schema:
+      {{ dc_schema_check.stdout | default('') | trim }}
+      {{ dc_schema_check.stderr | default('') | trim }}
+      Nothing has been written and no backup was taken — the config on disk is
+      untouched.
+  when:
+    - (dc_schema_check.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+# --- preflight: can this control actually RUN here? ---------------------------
+# Added after the failure it would have caught. On 2026-08-15 this role wrote
+# `sandbox.mode: all` to a host whose service account could not reach any
+# container runtime. Everything downstream passed: the config verified from
+# disk, the Gateway came back active and stable across two NRestarts samples,
+# and the receipt was clean. Meanwhile every agent run failed with
+# "permission denied while trying to connect to the docker API", and the
+# founder found out from Slack.
+#
+# Nothing lied. Every check passed and the system was down.
+#
+# The gap is structural rather than unlucky. The merge contract's floors ask two
+# questions — is this value SAFE, is this value LEGAL — and both were satisfied.
+# Neither asks whether the value can be HONOURED on this host. `sandbox.mode`
+# is the first control in this role that depends on something outside the
+# config file existing, and it silently became a promise the runtime could not
+# keep.
+#
+# Two things are checked, because either alone produces the same symptom:
+# a reachable daemon with no image fails identically to no daemon at all, and
+# the error names neither.
+- name: Locate the sandbox runtime socket
+  ansible.builtin.stat:
+    path: "{{ dc_sandbox_docker_host_path }}"
+  register: dc_sandbox_socket
+  when: dc_sandbox_mode != 'off'
+
+- name: Ask the container runtime whether the service account can reach it
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_openclaw_uid }}"
+      - "DOCKER_HOST=unix://{{ dc_sandbox_docker_host_path }}"
+      - /usr/bin/docker
+      - images
+      - -q
+      - "{{ dc_sandbox_image }}"
+  register: dc_sandbox_probe
+  changed_when: false
+  failed_when: false
+  when:
+    - dc_sandbox_mode != 'off'
+    - dc_sandbox_socket.stat.exists | default(false)
+
+- name: Refuse to enable a sandbox this host cannot run
+  ansible.builtin.fail:
+    msg: >-
+      sandbox.mode is '{{ dc_sandbox_mode }}' but the sandbox cannot start here,
+      so writing it would produce a governed config over a runtime that cannot
+      execute anything — which is exactly what happened on 2026-08-15, with a
+      clean receipt over a dead agent.
+      {% if not (dc_sandbox_socket.stat.exists | default(false)) %}
+      No container runtime socket at {{ dc_sandbox_docker_host_path }}.
+      The upstream role deliberately removes {{ dc_openclaw_user }} from the
+      `docker` group because the rootful socket is host-root-equivalent, so the
+      fix is NOT to add it back — that would grant host root and undo
+      roles/openclaw/tasks/docker-security.yml.
+      {% else %}
+      The runtime is reachable but the image {{ dc_sandbox_image }} is absent.
+      OpenClaw refuses to substitute a stock debian image.
+      {% endif %}
+      Run this first:
+        sudo ansible-playbook playbooks/governed-rootless-sandbox.yml -e ansible_become=false
+      Or set dc_sandbox_mode: "off" as a RECORDED governance decision — the
+      merge-contract floors will refuse it until the profile is changed
+      deliberately, which is the point.
+      Nothing has been written and no backup was taken.
+  when:
+    - dc_sandbox_mode != 'off'
+    - not (dc_sandbox_socket.stat.exists | default(false))
+      or (dc_sandbox_probe.stdout | default('') | trim) | length == 0
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "governance overlay (--tags govern)"
+    dc_apply_overlay: "{{ dc_governance_overlay }}"
+
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+# Taken before the write, not after, so rollback is possible even if the write
+# itself is what went wrong.
+- name: Back up the pre-merge config
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Write the governed config
+  ansible.builtin.copy:
+    content: "{{ dc_config_merged | to_nice_json(indent=2) }}\n"
+    dest: "{{ dc_openclaw_config_path }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  notify: Restart openclaw gateway
+
+# Restart NOW rather than at the end of the play.
+#
+# Handlers normally fire after every task, which put the restart AFTER
+# verify.yml. That made the verification dishonest in a specific way: it asked
+# the runtime what it had loaded while the runtime was still the old process
+# holding the old config. The answer was about a state the play had already
+# replaced.
+#
+# Flushing here means verify.yml runs against the config that is actually
+# loaded, which is the only version of that question worth asking.
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the applied controls
+  ansible.builtin.include_tasks: verify.yml

@@ -1,0 +1,447 @@
+---
+# Read-only OpenClaw configuration auditor.
+#
+# Run: sudo ansible-playbook playbooks/governed-audit.yml \
+#        -e ansible_become=false
+#
+# Exists because every piece of evidence in this workstream so far was gathered
+# by pasting ad-hoc commands into a terminal and copying the output back. That
+# works once. It does not produce a receipt anyone can re-run, it cannot be
+# diffed against a previous run, and it silently omits whatever the person
+# typing it did not think to ask for — which is how eleven outbound-write keys
+# and seven session tools stayed invisible for days.
+#
+# WRITES NOTHING. No config change, no restart, no plugin enable/disable. The
+# only file it creates is its own report. That is asserted, not just intended:
+# every command below is `config validate` or `config get`, both read-only, and
+# `changed_when: false` throughout.
+#
+# Uses the runtime's own validator rather than this role's. `openclaw config
+# validate` checks the WHOLE merged config; files/validate_overlay.py only ever
+# checked the keys this role writes. That distinction was recorded as an open
+# residual before anyone ran `openclaw config --help`.
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_audit_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+# Derived from the installed unit rather than trusting PATH. The real path
+# embeds a version and a content hash, so any literal is wrong after the next
+# upgrade — and PATH for a non-interactive login shell does not necessarily
+# include it, which returns rc=127 and reads as "the CLI is missing".
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_audit_entry_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_audit_entrypoint: "{{ dc_audit_entry_probe.stdout | default('') | trim }}"
+
+- name: Refuse to audit without an entrypoint to invoke
+  ansible.builtin.fail:
+    msg: >-
+      Could not derive the OpenClaw entrypoint from
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}.
+      Set dc_audit_entrypoint explicitly if the install path has moved.
+  when:
+    - dc_audit_entrypoint | length == 0
+    - dc_fail_closed | bool
+
+# Verb existence is checked, not assumed. `plugins list` was assumed to exist,
+# was not a real subcommand, and hung on stdin rather than erroring — costing a
+# debugging session and leaving a criterion UNCONFIRMED. One --help would have
+# prevented it, so this asks first.
+- name: Discover the config subcommands this build actually has
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', '--help'] }}"
+  register: dc_audit_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to audit a build whose config verbs are unknown
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw config --help` did not return usable output
+      (rc={{ dc_audit_help.rc | default('?') }}). Refusing to run verbs that may
+      not exist on this build — an unrecognised subcommand does not necessarily
+      error here, it can wait on stdin, which is how the plugin probe hung.
+  when:
+    - (dc_audit_help.rc | default(1)) != 0 or (dc_audit_help.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Record which verbs are available
+  ansible.builtin.set_fact:
+    dc_audit_verbs: >-
+      {{ ['file', 'get', 'patch', 'schema', 'set', 'unset', 'validate']
+         | select('in', dc_audit_help.stdout) | list }}
+
+# --- the whole-config check ---------------------------------------------------
+- name: Validate the entire live config against the schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_audit_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: "'validate' in dc_audit_verbs"
+
+# --- effective values ---------------------------------------------------------
+# `config get` returns the EFFECTIVE value — after merge and after defaults —
+# which is the only thing that answers "what is in force". Reading the config
+# file answers "what was written", and dumping the schema answers "what is
+# legal". Three different questions; only this one is about the running system.
+- name: Read each audited path
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+  register: dc_audit_values
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: "{{ dc_audit_paths }}"
+  loop_control:
+    label: "{{ item }}"
+  when: "'get' in dc_audit_verbs"
+
+# --- per-agent workspace and memory --------------------------------------------
+#
+# EVERY agent, not the one we happened to be looking at.
+#
+# On 2026-08-16 the session-memory hook was traced by hand for `dc-research`:
+# it writes `<workspaceDir>/memory/<filename>` from the Gateway, outside the
+# sandbox, so `workspaceAccess: ro` does not constrain it. Checking one agent by
+# hand answered one agent. This asks the same two questions of all of them.
+#
+# The important case is an agent with NO declared workspace. The hook computes
+# memoryDir from workspaceDir, so where it writes for such an agent is UNKNOWN —
+# and `main`, which has no workspace, is the agent Slack actually reaches and
+# therefore the one that DOES receive /new and /reset.
+#
+# This DETECTS and REPORTS. It provisions nothing: giving an agent a workspace
+# changes what that agent is, which is an admission decision and not an audit's
+# to make.
+- name: Read every deployed agent
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_audit_agents_raw
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Record which agents declare a workspace
+  ansible.builtin.set_fact:
+    dc_audit_agents: >-
+      {{ (dc_audit_agents_raw.stdout | default('[]') | from_json)
+         | map('combine', {}) | list }}
+  failed_when: false
+
+- name: Check each declared workspace for its state directories
+  ansible.builtin.stat:
+    path: "{{ item.workspace }}/memory"
+  register: dc_audit_agent_memory
+  loop: "{{ dc_audit_agents | default([]) | selectattr('workspace', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.id | default('?') }}"
+
+- name: Report the workspace and memory posture of every agent
+  ansible.builtin.set_fact:
+    dc_audit_agent_rows: >-
+      {{ (dc_audit_agents | default([])) | map('dict2items') | list }}
+  failed_when: false
+
+# An agent with no workspace is the finding, and it must not read as a blank
+# row. "No workspace declared" means no governance files are injected AND the
+# hook's write destination is unknown — two different consequences from one
+# omission.
+- name: Summarise per-agent workspace posture
+  ansible.builtin.set_fact:
+    dc_audit_agent_summary: >-
+      {{ (dc_audit_agents | default([])) | map(attribute='id') | zip(
+           (dc_audit_agents | default([])) | map(attribute='workspace', default='<NONE DECLARED>')
+         ) | list }}
+  failed_when: false
+
+# --- scheduled jobs -----------------------------------------------------------
+#
+# `config get cron` reports the SUBSYSTEM's configuration. It does not list the
+# JOBS, which live in Gateway runtime state and survive restarts. Reading only
+# the config would report "cron.enabled: false" or "<unset>" and leave an
+# existing job invisible — an audit that answers a neighbouring question and
+# looks like it answered this one.
+#
+# TASK-225: "a NO_SCHEDULER policy cannot be evidenced solely by
+# tools.deny:['cron']; it also requires proof that no unauthorized Gateway job
+# exists for that workload." This task is that proof, or its absence.
+#
+# Bounded and failure-tolerant on purpose. `cron list` may not exist on every
+# build, and an unrecognised subcommand can wait on stdin — that is how the
+# plugin probe hung on 2026-08-15.
+- name: List the Gateway's scheduled jobs
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_audit_cron
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# rc != 0 is NOT "no jobs". It is "this build did not answer", which is an
+# UNKNOWN and must read as one — an empty list and an unanswered question look
+# identical in a report unless the report says which it is.
+#
+# Emptiness is NOT how you detect "no jobs", and the first version of this got
+# it wrong in a way worth keeping written down. It treated any non-empty stdout
+# as jobs present. But every `openclaw` invocation prints a config-warning
+# preamble, and the runtime answers an empty scheduler with the PROSE
+# "No cron jobs." — so stdout is never empty and the audit reported
+# "SCHEDULED JOBS PRESENT" against a scheduler holding none.
+#
+# It failed safe, which is the right direction and not good enough. A check that
+# cries wolf on the normal case teaches the reader to skim past it, and the run
+# where it is right is the run they skim.
+#
+# So: strip our own preamble, then look for the runtime's own phrasing. Anything
+# neither recognised as empty nor recognised as a job list is UNRECOGNISED —
+# a third state, not folded into either of the first two.
+- name: Isolate the scheduler's own answer from the CLI preamble
+  ansible.builtin.set_fact:
+    dc_audit_cron_body: >-
+      {{ (dc_audit_cron.stdout | default('')).split('\n')
+         | reject('search', '^\\s*(Config warnings:|-\\s|OpenClaw [0-9]|$)')
+         | join(' ') | trim }}
+
+- name: Classify what the scheduler answered
+  ansible.builtin.set_fact:
+    dc_audit_cron_state: >-
+      {{ 'UNKNOWN — `cron list` returned rc=' ~ (dc_audit_cron.rc | default('?'))
+            ~ '; this is NOT evidence that no job exists'
+         if (dc_audit_cron.rc | default(1)) != 0
+         else ('NO SCHEDULED JOBS — the runtime reported none'
+               if (dc_audit_cron_body | length == 0)
+                  or (dc_audit_cron_body is search('(?i)no cron jobs|no jobs|none found'))
+               else 'SCHEDULED JOBS MAY BE PRESENT — read the list below against the accepted grants') }}
+
+# --- report -------------------------------------------------------------------
+# Redacted by value SHAPE, not by key name. None of dc_audit_paths should return
+# a credential, but a future path might, and a key-name denylist misses the key
+# someone named differently. Over-redaction is the safe direction.
+- name: Render the audit report
+  ansible.builtin.copy:
+    dest: "{{ dc_audit_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      OPENCLAW CONFIGURATION AUDIT
+      host={{ ansible_facts['nodename'] }}  generated={{ ansible_facts['date_time'].iso8601 }}
+      read-only: no config written, no restart, no plugin change
+
+      === config verbs available on this build ===
+        {{ dc_audit_verbs | join(', ') }}
+
+      === whole-config validation (runtime's own validator) ===
+      {% if 'validate' in dc_audit_verbs %}
+        rc={{ dc_audit_validate.rc | default('?') }}
+      {{ (dc_audit_validate.stdout | default('')) | trim | indent(2, true) }}
+      {{ (dc_audit_validate.stderr | default('')) | trim | indent(2, true) }}
+      {% else %}
+        `config validate` not available on this build — NOT the same as validated.
+      {% endif %}
+
+      === effective values ===
+      {% for r in dc_audit_values.results | default([]) %}
+      --- {{ r.item }} ---
+      {% if (r.rc | default(1)) != 0 %}
+        <unset, or path not present>  rc={{ r.rc | default('?') }}
+      {% else %}
+      {{ (r.stdout | default('') | trim | regex_replace('(xox[abposr]-[A-Za-z0-9-]+)', '<REDACTED>')
+          | regex_replace('(xapp-[A-Za-z0-9-]+)', '<REDACTED>')
+          | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>')) | indent(2, true) }}
+      {% endif %}
+      {% endfor %}
+
+      === per-agent workspace and memory ===
+      {% for pair in dc_audit_agent_summary | default([]) %}
+      {{ pair[0] }}: workspace={{ pair[1] }}
+      {% endfor %}
+
+      memory directories found:
+      {% for r in dc_audit_agent_memory.results | default([]) %}
+      {{ r.item.id | default('?') }}: {{ r.item.workspace }}/memory
+        exists={{ r.stat.exists | default('?') }}
+        {% if r.stat.exists | default(false) %}
+        owner={{ r.stat.pw_name | default('?') }} mode={{ r.stat.mode | default('?') }}
+        {% endif %}
+      {% endfor %}
+
+      An agent with NO DECLARED WORKSPACE is a finding, not a blank row. It
+      means no workspace bootstrap files are injected — the agent runs with no
+      AGENTS.md and no run gate — AND that the session-memory hook's write
+      destination for that agent is UNKNOWN, because the hook computes
+      memoryDir from workspaceDir.
+
+      A memory directory owned by root would be a DEFECT: the Gateway writes it
+      from outside the sandbox as the service account, so a root-owned
+      directory fails to write silently. Governance files are root-owned by
+      design; state directories must not be.
+
+      === scheduled jobs (persistent operation) ===
+      {{ dc_audit_cron_state | default('not probed') }}
+
+      {{ (dc_audit_cron.stdout | default('') | trim) | indent(2, true) }}
+      {{ (dc_audit_cron.stderr | default('') | trim) | indent(2, true) }}
+
+      Decision Crafters posture is NO_SCHEDULER by default (TASK-229, accepted
+      2026-08-16). Any job listed above must correspond to an accepted
+      workload-specific scheduling grant naming the target agent, cadence,
+      payload, evidence destination and STOP condition. A job with no such
+      grant is a finding, not a configuration.
+
+      A denied `cron` TOOL does not prevent any of this. It stops the AGENT
+      managing schedules; the Gateway scheduler and an operator remain able to
+      create a job that targets that same agent.
+
+      === reading these — IMPORTANT ===
+      `<unset>` DOES NOT MEAN INACTIVE. There is a proven counterexample on this
+      host: channels.slack.streaming reads <unset> here, and was directly
+      observed editing a Slack message on 2026-08-16 (the "(edited)" marker on a
+      reply). The behaviour is running; this tool cannot see it.
+
+      `config get` resolves scalar defaults — messages.ackReactionScope returns
+      "group-mentions" without being present in the config file — but returns
+      rc=1 for object-valued keys whose defaults live in code. So the eleven
+      outbound-write keys reading <unset> tells you they were not CONFIGURED. It
+      tells you nothing about whether they are IN FORCE.
+
+      Under channels.slack exactly four keys declare a schema default, so for
+      most of them the effective behaviour lives in code and documentation.
+      An unset value is a default nobody chose, not an absence of behaviour.
+  changed_when: false
+
+- name: Summarise the audit outcome
+  ansible.builtin.set_fact:
+    dc_audit_ok: >-
+      {{ dc_audit_values.results | default([])
+         | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0)
+         | list | length }}
+    dc_audit_validate_state: >-
+      {{ ('rc=' ~ (dc_audit_validate.rc | default('?')))
+         if 'validate' in dc_audit_verbs else 'UNAVAILABLE' }}
+
+- name: Emit the audit receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-OPENCLAW AUDIT |
+      verbs={{ dc_audit_verbs | join(',') }} |
+      config_validate={{ dc_audit_validate_state }} |
+      paths_read={{ dc_audit_ok }}/{{ dc_audit_paths | length }} |
+      report={{ dc_audit_report }} (0600, {{ dc_audit_report_owner }}) |
+      wrote_no_config=true restarted_nothing=true
+
+# --- is the running process on the config we audited? -------------------------
+#
+# Everything above reads the CONFIG. None of it reads the PROCESS. Those are
+# different questions, and the whole audit silently assumes they agree.
+#
+# handlers/main.yml already names this divergence — a config changed on disk with
+# the running process still on the previous one — as the worst outcome this role
+# can produce. It was written as a warning about the restart handler and left
+# undetected everywhere else.
+#
+# Added 2026-08-17, after a routing binding was written, validated, read back and
+# confirmed bound, and still did not route. Every check the role had said the
+# change was applied. Not one of them asked whether the process had it.
+#
+# This is deliberately NOT a pass/fail gate. A process older than the config is
+# perfectly normal for a key the runtime reads per-request, and failing the audit
+# on it would cry wolf on the ordinary case — the mistake `cron list` made above
+# and the reason it was rewritten. It reports a fact and names its own limits.
+# Both epochs are produced by the TARGET, in one script, as two integers.
+#
+# The first version of this parsed systemd's human timestamp in Jinja with
+# `to_datetime(...) | to_datetime | int`. That format varies by locale and
+# systemd version, and the chain does not mean what it reads like — it would
+# have produced a confident verdict from a silently wrong number. Three separate
+# defects in this workstream came from exactly that move. `date -d` is the tool
+# that already knows how to parse systemd's output; use it.
+#
+# `date -d ""` fails loudly on an unparseable string, which is what we want:
+# rc != 0 becomes UNKNOWN rather than epoch 0 becoming "process is ancient".
+- name: Read the process start and config write times as epochs
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      started=$({{ dc_runuser }} -u {{ dc_openclaw_user }} --
+      env XDG_RUNTIME_DIR=/run/user/{{ dc_audit_uid | default('') }}
+      systemctl --user show {{ dc_openclaw_service | quote }}
+      -p ActiveEnterTimestamp --value) &&
+      test -n "$started" &&
+      printf 'started=%s\nconfig=%s\n'
+      "$(date -d "$started" +%s)"
+      "$(stat -c %Y {{ dc_openclaw_config_path | quote }})"
+  register: dc_audit_ages
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# regex_findall, NOT regex_search with a capture group.
+#
+# `regex_search(p, '\1')` returns None when nothing matches, and `| first` then
+# raises "'NoneType' object is not iterable" — which FAILS THE WHOLE AUDIT. The
+# `| default('')` sits after `first` and never gets the chance to help.
+#
+# That is the wrong failure direction for a check whose entire purpose is to
+# report an unanswerable question as UNKNOWN. An audit that dies while telling
+# you it could not read a timestamp has destroyed thirty other findings to
+# report one absence. regex_findall returns [] on no match, and `[] | first`
+# yields Undefined, which `default('')` does catch.
+- name: Record the two epochs
+  ansible.builtin.set_fact:
+    dc_audit_started_at: >-
+      {{ (dc_audit_ages.stdout | default('')
+          | regex_findall('started=([0-9]+)') | first | default('')) }}
+    dc_audit_config_at: >-
+      {{ (dc_audit_ages.stdout | default('')
+          | regex_findall('config=([0-9]+)') | first | default('')) }}
+  failed_when: false
+
+# Both timestamps or neither. A comparison against a missing value would produce
+# a confident-looking verdict from one real number and one default, which is
+# worse than reporting that the question could not be answered.
+- name: Classify config-versus-process drift
+  ansible.builtin.set_fact:
+    dc_audit_drift: >-
+      {{ 'UNKNOWN — could not read both timestamps (rc='
+           ~ (dc_audit_ages.rc | default('?'))
+           ~ '); this is NOT evidence that the process is current'
+         if (dc_audit_started_at | default('') | length == 0)
+            or (dc_audit_config_at | default('') | length == 0)
+         else ('PROCESS PREDATES CONFIG by '
+               ~ ((dc_audit_config_at | int) - (dc_audit_started_at | int))
+               ~ 's — keys this runtime reads only at startup are NOT live'
+               if (dc_audit_config_at | int) > (dc_audit_started_at | int)
+               else 'process started at or after the last config write') }}
+  failed_when: false
+
+# The comparison above parses a systemd timestamp format that varies by locale
+# and systemd version. If it throws, the fact is simply undefined — so the
+# report must handle that rather than assume a verdict was produced.
+- name: Report config-versus-process drift
+  ansible.builtin.debug:
+    msg: >-
+      DC-AUDIT DRIFT |
+      {{ dc_audit_drift | default('UNKNOWN — the drift comparison did not evaluate') }} |
+      config={{ dc_openclaw_config_path }} |
+      NOTE this compares WHEN, not WHAT. A process newer than the config is not
+      proof it loaded these values, and a process older than the config is not
+      proof it did not — the runtime may re-read a key per request. This narrows
+      the question; it does not close it.

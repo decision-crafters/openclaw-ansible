@@ -1,0 +1,97 @@
+{
+  "_captured": "2026-08-15",
+  "_comment": "Distilled from `openclaw config schema` on host openclaw, OpenClaw 2026.7.1-2, 2026-08-15. Only the paths dc-governed-config writes. Regenerate after an OpenClaw upgrade; the full schema is ~1.9MB and is not committed.",
+  "_openclaw_version": "2026.7.1-2",
+  "_source": "openclaw config schema",
+  "paths": {
+    "agents.defaults.sandbox.docker.network": {
+      "enum": null,
+      "exists": true,
+      "type": "string"
+    },
+    "agents.defaults.sandbox.mode": {
+      "enum": [
+        "off",
+        "non-main",
+        "all"
+      ],
+      "exists": true,
+      "type": null
+    },
+    "agents.defaults.sandbox.scope": {
+      "enum": [
+        "session",
+        "agent",
+        "shared"
+      ],
+      "exists": true,
+      "type": null
+    },
+    "agents.defaults.sandbox.workspaceAccess": {
+      "enum": [
+        "none",
+        "ro",
+        "rw"
+      ],
+      "exists": true,
+      "type": null
+    },
+    "gateway.bind": {
+      "enum": [
+        "auto",
+        "lan",
+        "loopback",
+        "custom",
+        "tailnet"
+      ],
+      "exists": true,
+      "type": null
+    },
+    "gateway.customBindHost": {
+      "enum": null,
+      "exists": true,
+      "type": "string"
+    },
+    "gateway.port": {
+      "enum": null,
+      "exists": true,
+      "type": "integer"
+    },
+    "plugins.allow": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
+    "plugins.deny": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
+    "tools.allow": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
+    "tools.deny": {
+      "enum": null,
+      "exists": true,
+      "type": "array"
+    },
+    "tools.elevated.enabled": {
+      "enum": null,
+      "exists": true,
+      "type": "boolean"
+    },
+    "tools.exec.mode": {
+      "enum": [
+        "deny",
+        "allowlist",
+        "ask",
+        "auto",
+        "full"
+      ],
+      "exists": true,
+      "type": "string"
+    }
+  }
+}

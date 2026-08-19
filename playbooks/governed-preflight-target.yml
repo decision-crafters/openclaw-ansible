@@ -1,0 +1,93 @@
+---
+# Confirm the governed plays have a real inventory host to run against.
+#
+# Imported first by every governed-* playbook. It writes nothing and touches no
+# runtime; it answers one question, loudly, before anything else runs:
+#
+#   does the host pattern these plays target actually match an inventory host?
+#
+# WHY THIS EXISTS
+#
+# Every governed play targeted `hosts: localhost` from the day it was written,
+# copying upstream's install.yml, whose reasoning was sound for itself: the
+# playbook runs on the machine it configures, so there is no control-node split
+# to model.
+#
+# `localhost` is Ansible's IMPLICIT host. It is not an inventory host, and
+# host_vars are keyed to inventory hosts. So when the deployment bindings —
+# Slack channel, sender allowlist, required conversations, agent profile path —
+# were parameterized out of this public repository and into a private
+# inventory's host_vars/openclaw.yml on 2026-08-16, they were loaded by nothing.
+# The inventory existed, ansible.cfg found it, `ansible-config dump` showed the
+# right paths, and every value in it was ignored, because no play ever targeted
+# the host it described.
+#
+# What that cost: `--tags govern` ran to completion and printed "DRY RUN
+# COMPLETE — validation passed". True, and irrelevant — the governance overlay
+# happens to carry no per-deployment values, so it validates identically with
+# the bindings loaded and with them absent. It passed without ever asking where
+# its bindings came from. Only `--tags slack-bound` caught it, and only by
+# accident of needing a value that was missing.
+#
+# That is the failure this file is built against: not a wrong answer, a
+# confident one from a check that never asked the question. A play matching zero
+# hosts is worse still — Ansible prints "skipping: no hosts matched" and exits
+# ZERO, so a rebuild that governs nothing at all reports success.
+#
+# The pattern is overridable for a reason. `openclaw_hosts` is this project's
+# convention, not a requirement; anyone adopting these playbooks names their own
+# group and passes it:
+#
+#   -e dc_target=my_openclaw_boxes
+#
+# It must be an extra-var. `hosts:` is resolved when the play is parsed, before
+# any inventory or group_vars are applied, so a dc_target set in host_vars would
+# be read too late to select the host it is stored on.
+
+- name: Confirm a governed target exists
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # `always` so this survives every --tags invocation in the governed set.
+  # A guard that a tag can skip is a guard that will be skipped on the run that
+  # needed it.
+  tags:
+    - always
+  vars:
+    dc_target_pattern: "{{ dc_target | default('openclaw_hosts') }}"
+  tasks:
+    # `inventory_hostnames` resolves a host PATTERN, so this works whether
+    # dc_target names a group, a single host, or a comma-separated list —
+    # matching what `hosts:` itself will do with the same string.
+    - name: Resolve the target pattern against the inventory
+      ansible.builtin.set_fact:
+        dc_target_hosts: "{{ query('inventory_hostnames', dc_target_pattern) }}"
+
+    - name: Refuse to run governed plays against nothing
+      ansible.builtin.assert:
+        that:
+          - dc_target_hosts | length > 0
+        fail_msg: >-
+          Host pattern '{{ dc_target_pattern }}' matches no host in the
+          inventory ({{ (lookup('config', 'DEFAULT_HOST_LIST') | default(['<none>'], true)) | join(', ') }}).
+          The governed plays would match zero hosts, do nothing, and exit
+          SUCCESSFULLY — so this refuses instead.
+          Run these playbooks from the private inventory directory, whose
+          ansible.cfg supplies both the inventory and roles_path:
+            cd <private-repo> && sudo ansible-playbook ../openclaw-ansible/playbooks/<play>.yml
+          Or name your own group with -e dc_target=<group>. Nothing written.
+        success_msg: >-
+          target '{{ dc_target_pattern }}' resolves to
+          {{ dc_target_hosts | length }} host(s): {{ dc_target_hosts | join(', ') }}
+
+    # The pattern resolving is necessary, not sufficient. A host can exist with
+    # no host_vars behind it, which is exactly the state that looked healthy for
+    # a day — so say which file would carry them, while nothing has run yet.
+    - name: State where the bindings for each target are expected
+      ansible.builtin.debug:
+        msg: >-
+          DC-TARGET | pattern={{ dc_target_pattern }} |
+          hosts={{ dc_target_hosts | join(', ') }} |
+          bindings are read from host_vars/<host>.yml next to the inventory;
+          a host with no host_vars runs on this repository's SAFE DEFAULTS,
+          which are empty and refuse rather than deploy an unbounded posture.

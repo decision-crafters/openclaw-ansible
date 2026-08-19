@@ -1,0 +1,261 @@
+---
+# Bounded read-only verification of ONE named hook, before it is declared.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags hook-verify -e dc_hook_verify=session-memory -e ansible_become=false
+#
+# Reads. Changes nothing: no hook enabled or disabled, no config written, no
+# memory touched, no Gateway state altered, no declaration made.
+#
+# WHY A SEPARATE PLAY FROM hooks_audit.yml
+#
+# The audit ENUMERATES — it answers "what is enabled and was it declared". It
+# truncates each hook's description to 600 characters into a summary line,
+# which is correct for a summary and useless for a decision.
+#
+# Founder direction 2026-08-16: do not declare `session-memory` until a bounded
+# read-only verification answers nine specific questions — trigger, write
+# destination, agent scope, data shape, tool-policy relation, enable/disable
+# control, coordinate risk, rollback, recommendation.
+#
+# Eight of those nine cannot be answered from a truncated line, and none of them
+# should be answered by inference from a hook's NAME. So this play captures
+# everything whole, to a file, and the analysis happens against captured
+# evidence rather than against a scrolling terminal.
+#
+# WHAT IT DELIBERATELY DOES NOT DO
+#
+# It does not fire the hook to see what happens. Triggering `/new` or `/reset`
+# to observe a write would be the most direct evidence and is a CHANGE — it
+# would write session context to memory, which is the exact act under review.
+# Reading the implementation is weaker evidence and the only kind available
+# without doing the thing we are deciding whether to allow.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a hook to verify
+  ansible.builtin.assert:
+    that:
+      - dc_hook_verify | default('') | length > 0
+    fail_msg: >-
+      dc_hook_verify must name one hook. This play verifies a single hook
+      deliberately — a report covering several invites the reader to generalise
+      from one to the others, which is what a declaration must never mean.
+    success_msg: "verifying hook: {{ dc_hook_verify }}"
+
+# --- what the runtime says about it -------------------------------------------
+- name: Ask the runtime to describe the hook
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['hooks', 'info', dc_hook_verify] }}"
+  register: dc_hv_info
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: List every hook the runtime has loaded
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['hooks', 'list'] }}"
+  register: dc_hv_list
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# --- the control that governs it ----------------------------------------------
+#
+# The founder asked for the EXACT live-schema key. Read from the schema rather
+# than from documentation, because this workstream has twice been wrong about a
+# key that documentation described correctly for a DIFFERENT build.
+#
+# Two steps, not a pipeline.
+#
+# The first version rebuilt dc_audit_cli into a shell string and piped it into
+# python. It returned rc=1 and an empty schema section, so the one field the
+# founder asked for by name — the exact live-schema key — came back unanswered.
+#
+# dc_audit_cli is an ARGV LIST for a reason: it goes through runuser and env,
+# and reconstructing it as a shell string re-introduces exactly the quoting the
+# list form exists to avoid. The role already has a working pattern for this —
+# capture with `command`, stage the output, then read the file — and it is used
+# here rather than a cleverer one-liner.
+- name: Capture the live schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'schema'] }}"
+  register: dc_hv_schema_raw
+  changed_when: false
+  failed_when: false
+  timeout: 180
+
+- name: Stage the schema where it can be parsed
+  ansible.builtin.copy:
+    content: "{{ dc_hv_schema_raw.stdout | default('{}') }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+  when: (dc_hv_schema_raw.rc | default(1)) == 0
+
+- name: Extract every hooks-related key the schema declares
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import json, sys
+        try:
+            s = json.load(open(sys.argv[1]))
+        except Exception as e:
+            print(f"schema unreadable: {e}"); raise SystemExit(0)
+        def walk(node, path=""):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    p = f"{path}.{k}" if path else k
+                    if "hook" in k.lower():
+                        d = v.get("description", "") if isinstance(v, dict) else ""
+                        print(f"{p}  {str(d)[:200]}")
+                    walk(v, p)
+            elif isinstance(node, list):
+                for i in node:
+                    walk(i, path)
+        walk(s)
+      - "{{ dc_schema_staging_path }}"
+  register: dc_hv_schema
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  when: (dc_hv_schema_raw.rc | default(1)) == 0
+
+- name: Unstage the schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
+
+- name: Read the memory-related configuration
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+  register: dc_hv_memory
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop:
+    - memory
+    - hooks.internal
+    - agents.defaults.memory
+  loop_control:
+    label: "{{ item }}"
+
+# --- the implementation -------------------------------------------------------
+#
+# The hook reports Source: openclaw-bundled, so its code ships inside the
+# install tree the Gateway runs from. Reading it is the only way to answer WHERE
+# it writes and WHOSE memory it reaches without firing it.
+#
+# Bounded hard: a fixed depth, a capped match count, a timeout. An unbounded
+# grep over a node_modules tree is how a read-only audit becomes a ten-minute
+# hang, and the plugin probe already taught that lesson once.
+- name: Locate the bundled hook implementation
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      timeout 60 grep -rl --include=*.js -F {{ dc_hook_verify | quote }}
+      {{ (dc_audit_entrypoint | dirname) | quote }} 2>/dev/null | head -5
+  register: dc_hv_files
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+# Grep for what the handler DOES, not for its own name.
+#
+# The first version matched lines containing the hook name and returned four
+# lines, none of which said where anything is written. That is the field the
+# whole verification exists to answer — a hook called `session-memory` reads
+# identically whether it writes per-session, to a shared index, or into another
+# agent's memory.
+#
+# So: search for write and path construction instead. Still bounded — capped
+# output, timeout, and only the files already located.
+- name: Extract what the implementation writes and where
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      timeout 60 grep -h -o -E
+      '(writeFile|mkdir|appendFile|createWriteStream|join\(|resolve\(|workspace|memoryDir|sessionKey|agentId)[^;]{0,200}'
+      {{ item | quote }} 2>/dev/null | sort -u | head -c 6000
+  register: dc_hv_source
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  loop: "{{ (dc_hv_files.stdout | default('')).split('\n') | select | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+# --- report -------------------------------------------------------------------
+#
+# To a file, whole. The audit's 600-character summary line is what made this
+# play necessary; repeating that mistake here would make it necessary again.
+- name: Write the verification report
+  ansible.builtin.copy:
+    dest: "{{ dc_hook_verify_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      HOOK VERIFICATION — {{ dc_hook_verify }}
+      host={{ inventory_hostname }} generated={{ ansible_facts['date_time'].iso8601 }}
+      read-only: nothing enabled, disabled, written, triggered or declared
+
+      This report is EVIDENCE, not a decision. It was gathered without firing
+      the hook: triggering /new or /reset to observe a write would perform the
+      exact act under review.
+
+      === hooks info {{ dc_hook_verify }} (rc={{ dc_hv_info.rc | default('?') }}) ===
+      {{ dc_hv_info.stdout | default('') }}
+      {{ dc_hv_info.stderr | default('') }}
+
+      === hooks list (rc={{ dc_hv_list.rc | default('?') }}) ===
+      {{ dc_hv_list.stdout | default('') }}
+
+      === live schema: every hook-related key (rc={{ dc_hv_schema.rc | default('skipped') }}) ===
+      schema capture rc={{ dc_hv_schema_raw.rc | default('?') }}
+      {{ dc_hv_schema.stdout | default('<schema not captured — the key below is from CONFIG, not schema>') }}
+
+      === memory-related configuration ===
+      {% for r in dc_hv_memory.results | default([]) %}
+      --- {{ r.item }} (rc={{ r.rc | default('?') }}) ---
+      {{ r.stdout | default('') | trim | default('<unset, or path not present>', true) }}
+      {% endfor %}
+
+      === bundled implementation — write paths and scoping ===
+      files matched: {{ (dc_hv_files.stdout | default('')).split('\n') | select | list }}
+      {% for r in dc_hv_source.results | default([]) %}
+      --- {{ r.item }} ---
+      {{ r.stdout | default('') }}
+      {% endfor %}
+
+      === how to read this ===
+      A hook's NAME is not evidence of what it does. `session-memory` could
+      write session context to a per-session store, to a shared index, or to
+      another agent's memory, and the name reads the same in all three cases.
+      The questions this report exists to answer are WHERE it writes and WHOSE
+      memory it reaches, and only the schema and the implementation answer them.
+
+      `hooks.internal` reading a value is NOT the same surface as
+      `hooks.enabled`. The first is bundled lifecycle hooks fired inside a
+      session; the second is HTTP webhook ingress reachable from outside. On
+      2026-08-16 these were conflated in a report and a bundled hook was
+      described as a live external event path.
+  changed_when: false
+
+- name: Emit the verification receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-HOOK-VERIFY RECEIPT |
+      hook={{ dc_hook_verify }} |
+      info_rc={{ dc_hv_info.rc | default('?') }} |
+      schema_rc={{ dc_hv_schema.rc | default('?') }} |
+      impl_files={{ (dc_hv_files.stdout | default('')).split('\n') | select | list | length }} |
+      report={{ dc_hook_verify_report }} (0600, {{ dc_audit_report_owner }}) |
+      NOT A DECISION. This gathered evidence for a founder acceptance and
+      changed nothing. The hook is neither declared nor rejected by running it.

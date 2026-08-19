@@ -1,0 +1,300 @@
+---
+# Closed-corpus competence fixture. INVOKES THE AGENT.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags competence -e ansible_become=false -e dc_apply=true
+#
+# REQUIRES ITS OWN FOUNDER AUTHORIZATION. Installing the packet is Prepare;
+# invoking the agent is not, and this play refuses without dc_apply.
+#
+# WHAT IT PROVES, AND THE SECOND THING IT PROVES BY ACCIDENT OF TIMING
+#
+# 1. Whether dc-research can reason across a bounded evidence packet.
+# 2. That the per-agent model pin actually GOVERNS A TURN. All nine existing
+#    dc-research sessions predate the pin and resolve via "OpenClaw Default",
+#    so the pin is verified in configuration and has never been observed
+#    selecting a model. A fresh session is the only way to observe it, which is
+#    why the session key below must not collide with an existing one.
+#
+# CONTAMINATION IS THE FAILURE MODE THAT WASTES THE TEST
+#
+# The packet carries raw ordered evidence and no conclusion. The gold answer
+# and rubric live in a separate file that must never reach the workspace: an
+# agent that reads the answer and paraphrases it scores as competent while
+# demonstrating nothing. This play refuses to run if it finds the gold file
+# anywhere under the agent workspace.
+
+# EVIDENCE-ANCHOR: "rule":"tools.profile
+# EVIDENCE-CLASS: cumulative = dc_cr_log_lines, dc_cr_has_chain
+# EVIDENCE-CLASS: present = dc_cr_window, dc_cr_session_row
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse to invoke the agent without an explicit apply
+  ansible.builtin.fail:
+    msg: >-
+      Installing the packet is Prepare authority; invoking the agent is not.
+      Re-run with -e dc_apply=true only under a founder authorization that
+      names this test. Nothing has been installed or invoked.
+  when: not (dc_apply | default(false) | bool)
+
+- name: Read the target agent's workspace
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_cr_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Record the workspace path
+  ansible.builtin.set_fact:
+    dc_cr_workspace: >-
+      {{ ((dc_cr_agents.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_agent_id) | first).workspace }}
+
+- name: Install the evidence packet, read-only
+  ansible.builtin.copy:
+    src: "{{ dc_competence_packet_src }}"
+    dest: "{{ dc_cr_workspace }}/packet/{{ dc_competence_packet_src | basename }}"
+    owner: root
+    group: root
+    mode: '0444'
+
+# THE CONTAMINATION GUARD. Cheap, and the alternative is a test that returns a
+# confident pass while proving only that the agent can read.
+- name: Search the whole workspace for the gold answer
+  ansible.builtin.find:
+    paths: "{{ dc_cr_workspace }}"
+    patterns: "{{ dc_competence_gold_pattern }}"
+    recurse: true
+  register: dc_cr_contamination
+
+- name: Refuse to run a contaminated fixture
+  ansible.builtin.fail:
+    msg: >-
+      Found {{ dc_cr_contamination.files | map(attribute='path') | list }} under
+      the agent workspace. The gold answer must never be readable by the agent
+      under test — it would score as competent while demonstrating only that it
+      can read. Remove it and re-run. Nothing has been invoked.
+  when:
+    - (dc_cr_contamination.files | default([]) | length) > 0
+    - dc_fail_closed | bool
+
+# A FRESH session. Colliding with one of the nine pre-pin sessions would carry
+# their "OpenClaw Default" model resolution and destroy the second half of what
+# this test is for.
+- name: Confirm the session key is not already in use
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', 'list', '--agent', dc_agent_id] }}"
+  register: dc_cr_sessions_before
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse to reuse an existing session
+  ansible.builtin.fail:
+    msg: >-
+      Session key {{ dc_competence_session_key }} already exists for
+      {{ dc_agent_id }}. Reusing it would inherit that session's model
+      resolution and forfeit the behavioural proof of the model pin, which is
+      half the purpose of this run. Choose an unused key.
+  when:
+    # Exact key against the session STORE, not the elided display table. A
+    # short-tail match here collided across two differently-named keys in the
+    # tool-surface probe and refused a genuinely fresh session.
+    - dc_cr_sessions_before.stdout is search(dc_competence_session_key)
+    - dc_fail_closed | bool
+
+# ASK THE BINARY BEFORE USING THE FLAGS.
+#
+# A previous harness in this workstream took `--session` from documentation for
+# a different command, never checked it against --help, and produced five turns
+# of no output. The evaluator correctly called that INDETERMINATE, which is the
+# only reason a completely broken run did not read as a clean sweep. One --help
+# would have prevented the whole cycle.
+- name: Discover the agent subcommand's flags
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['agent', dc_agent_id, '--help'] }}"
+  register: dc_cr_agent_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Refuse to invoke with flags this build does not have
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw agent {{ dc_agent_id }} --help` did not offer --session-key
+      (rc={{ dc_cr_agent_help.rc | default('?') }}).
+      NOTE the help page: the AGENT ID IS POSITIONAL, and the flags live under
+      `agent <id> --help`, not `agent --help`. The first version of this check
+      read the latter, passed, and let a wrong invocation through — asking the
+      binary is only worth anything if it is the right page.
+      Invoking anyway would produce an empty run that is INDETERMINATE rather
+      than informative. Help output follows:
+      {{ dc_cr_agent_help.stdout | default('') | truncate(900) }}
+  when:
+    - not (dc_cr_agent_help.stdout | default('') is search('--session-key'))
+    - dc_fail_closed | bool
+
+# Per-run --model overrides are mechanically prohibited by default. The gate is
+# the ONLY place in this role permitted to emit that flag, and it defaults to
+# emitting nothing. Founder authorization 2026-08-19.
+- name: Decide whether any model override is authorised
+  ansible.builtin.include_tasks: model_override_gate.yml
+
+- name: Invoke the agent on the frozen packet in a fresh session
+  ansible.builtin.command:
+    # Base argv, then the gate's decision appended. This harness has NO
+    # code path that emits --model on its own: dc_model_override_args is
+    # [] unless a validated, task-bound grant armed it. The prohibition
+    # is structural rather than advisory, and the contract test fails the
+    # build if --model appears literally in any task file but the gate.
+    #
+    # --deliver is still deliberately absent (defaults false), so no test
+    # run posts to Slack.
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env',
+          'XDG_RUNTIME_DIR=/run/user/' ~ dc_openclaw_uid,
+          'HOME=' ~ dc_openclaw_home,
+          '/usr/bin/node', dc_audit_entrypoint,
+          'agent', '--agent', dc_agent_id,
+          '--session-key', dc_competence_session_key,
+          '--message', dc_competence_prompt] + dc_model_override_args }}
+  register: dc_cr_run
+  changed_when: true
+  failed_when: false
+  timeout: 900
+
+# stdout AND stderr. The first version wrote stdout only, so the run that
+# failed with rc=1 and no stdout produced a transcript containing nothing and a
+# refusal message that could not say why. A harness that detects a broken
+# invocation and cannot describe it has done half its job.
+- name: Write the transcript for independent scoring
+  ansible.builtin.copy:
+    content: |
+      === rc={{ dc_cr_run.rc | default('?') }} ===
+      === stdout ===
+      {{ dc_cr_run.stdout | default('') }}
+      === stderr ===
+      {{ dc_cr_run.stderr | default('') }}
+    dest: "{{ dc_competence_report }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+# NO OUTPUT != REFUSAL, and it is not a failed answer either. An empty run is
+# INDETERMINATE and must not be scored against the rubric.
+- name: Refuse to score an empty run
+  ansible.builtin.fail:
+    msg: >-
+      The agent returned no output (rc={{ dc_cr_run.rc | default('?') }}).
+      That is INDETERMINATE — a broken invocation, not a wrong answer, and not
+      a refusal. Do not score it against the rubric.
+      stderr: {{ dc_cr_run.stderr | default('(none captured)') | truncate(700) }}
+      Transcript at {{ dc_competence_report }}.
+  when:
+    - (dc_cr_run.stdout | default('') | trim | length) == 0
+    - dc_fail_closed | bool
+
+# --- behavioural proof of the model pin --------------------------------------
+- name: Read the sessions after the run
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', 'list', '--agent', dc_agent_id] }}"
+  register: dc_cr_sessions_after
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# `sessions list` ELIDES THE MIDDLE of long keys — `agent:dc-researc...ce-001`
+# — so a prefix match cannot hit and a tail match CANNOT DISTINGUISH keys that
+# share their last characters. `dc-research-competence-001` and
+# `dc-research-toolsurface-001` render identically once elided.
+#
+# So this reports EVERY matching row and flags ambiguity rather than silently
+# taking one. Picking arbitrarily would attribute one session's model to
+# another, which is exactly the class of error that makes a report worse than
+# no report.
+- name: Isolate the new session's row
+  ansible.builtin.set_fact:
+    dc_cr_session_row: >-
+      {{ dc_cr_sessions_after.stdout | default('')
+         | regex_findall('(?m)^.*' ~ dc_competence_session_key[-6:] ~ '.*$') }}
+
+- name: Flag an ambiguous session match
+  ansible.builtin.set_fact:
+    dc_cr_session_row: >-
+      {{ ['AMBIGUOUS — ' ~ (dc_cr_session_row | length) ~ ' session rows share this '
+          ~ 'elided suffix, so the model below cannot be attributed to THIS run. '
+          ~ 'Treat as UNOBSERVED and disambiguate from the session store.']
+         + dc_cr_session_row }}
+  when: (dc_cr_session_row | length) > 1
+
+- name: Read the tool policy applied to this turn
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['logs', '--limit', '2000', '--plain', '--no-color'] }}"
+  register: dc_cr_log
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Measure the log before reasoning about it
+  ansible.builtin.set_fact:
+    dc_cr_log_lines: "{{ dc_cr_log.stdout | default('') | regex_findall('(?m)^.*$') | length }}"
+    dc_cr_has_chain: "{{ (dc_cr_log.stdout | default('')) is search('\"rule\":\"tools.profile') }}"
+
+# The run itself succeeded or failed on its own terms above. This floor governs
+# only the RUNTIME EVIDENCE about it — which model was used, which tools applied.
+# A short or chainless log cannot answer those, and reporting them as absent
+# would turn a missing observation into a finding about the turn.
+- name: Refuse to report runtime evidence from an insufficient log
+  ansible.builtin.fail:
+    msg: >-
+      The Gateway log returned {{ dc_cr_log_lines }} line(s) and
+      {{ 'no' if not (dc_cr_has_chain | bool) else 'a' }} tool-policy chain, so
+      the model and tool-policy evidence for this turn cannot be established.
+      INSUFFICIENT EVIDENCE for the behavioural half of this run. The
+      transcript at {{ dc_competence_report }} is unaffected and may still be
+      scored for research quality.
+  when:
+    - (dc_cr_log_lines | int) < (dc_slack_evidence_min_lines | int)
+      or not (dc_cr_has_chain | bool)
+    - dc_fail_closed | bool
+
+- name: Isolate the most recent policy chain
+  ansible.builtin.set_fact:
+    dc_cr_window: "{{ (dc_cr_log.stdout | default('')) | split('\"rule\":\"tools.profile') | last }}"
+
+- name: Report the run and its runtime evidence
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-COMPETENCE RUN — packet ' ~ (dc_competence_packet_src | basename),
+          'session=' ~ dc_competence_session_key ~ ' (fresh)',
+          'transcript=' ~ dc_competence_report,
+          'output_chars=' ~ (dc_cr_run.stdout | default('') | length),
+          '--- MODEL ACTUALLY USED (the pin, observed rather than configured) ---']
+         + (dc_cr_session_row | default(
+              ['SESSION ROW NOT FOUND — MODEL UNOBSERVED. This is INDETERMINATE for
+               the behavioural half: it does NOT mean the pin failed, it means the
+               run did not capture which model was used.'], true))
+         + ['--- effective tool policy for this turn ---']
+         + (dc_cr_window | regex_findall('(?m)^.*agents/tool-policy.*$') | map('truncate', 260) | list)
+         + ['--- any vision/image/auxiliary model line in this window ---']
+         + (dc_cr_window
+            | regex_findall('(?m)^.*(?:visionModel|imageModel|summaryModel|fallback|kimi).*$')
+            | default(['(none)'], true)) }}
+
+- name: Emit the competence receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-COMPETENCE RECEIPT | agent={{ dc_agent_id }} |
+      session={{ dc_competence_session_key }} |
+      SCORING IS NOT DONE HERE and must not be done by the agent under test —
+      the house contract forbids self-verification of a consequential claim.
+      Score the transcript against the separately digested rubric using a
+      different model family or human review. |
+      Ollama Cloud silently discards `format`, so any structure in the output
+      was produced by prompt discipline and must be VALIDATED, never trusted
+      because it was requested. |
+      installed_packet=true invoked_agent=true wrote_no_config=true
+      restarted_nothing=true

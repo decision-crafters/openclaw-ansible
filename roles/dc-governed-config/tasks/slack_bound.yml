@@ -1,0 +1,304 @@
+---
+# Bound the Slack human-access path. TASK-217's remaining criterion.
+#
+# Run: sudo ansible-playbook playbooks/governed-lab.yml \
+#        --tags slack-bound -e ansible_become=false
+#
+# Deliberately a separate tag from `govern`. The governance posture is applied
+# and stable; a mistake here must be reversible on its own rather than forcing a
+# rollback of both. And a mistake here has a specific shape: it locks the
+# founder out of the only route to this host that works from a phone.
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+- name: Locate the OpenClaw entrypoint from the installed unit
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}
+  register: dc_sb_entrypoint_probe
+  changed_when: false
+  failed_when: false
+  when: dc_openclaw_entrypoint | length == 0
+
+- name: Record the OpenClaw entrypoint
+  ansible.builtin.set_fact:
+    dc_openclaw_entrypoint: >-
+      {{ dc_openclaw_entrypoint if (dc_openclaw_entrypoint | length > 0)
+         else (dc_sb_entrypoint_probe.stdout | default('') | trim) }}
+
+- name: Read the current config
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_sb_raw
+
+- name: Parse the current config
+  ansible.builtin.set_fact:
+    dc_sb_current: "{{ dc_sb_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse to merge into a config that could not be parsed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_config_path }} could not be parsed as JSON. Refusing rather
+      than guessing: a merge built on a failed parse would drop every key it
+      could not see, and the keys here include the Slack credentials.
+  when:
+    - dc_sb_current is not defined
+    - dc_fail_closed | bool
+
+- name: Build the Slack boundary overlay
+  ansible.builtin.set_fact:
+    dc_slack_overlay:
+      channels:
+        slack:
+          groupPolicy: "{{ dc_slack_group_policy }}"
+          channels: "{{ dc_slack_channels }}"
+          dmPolicy: "{{ dc_slack_dm_policy }}"
+          allowFrom: "{{ dc_slack_allow_from }}"
+          botLoopProtection:
+            enabled: "{{ dc_slack_loop_protection | bool }}"
+
+# --- the guards, all before the schema gate -----------------------------------
+# None of these are schema failures. Every one of them produces legal config
+# that OpenClaw would accept and that would leave the founder unable to reach
+# his own runtime. The schema cannot help here; only the decision can.
+
+- name: Refuse an allowlist policy with no channels listed
+  ansible.builtin.fail:
+    msg: >-
+      groupPolicy is '{{ dc_slack_group_policy }}' but dc_slack_channels is
+      empty. Under allowlist, a channel absent from the list is blocked — an
+      empty list therefore blocks every channel, silently. This is the
+      `plugins.allow: []` failure in a different key. Nothing has been written.
+  when:
+    - dc_slack_group_policy == 'allowlist'
+    - (dc_slack_channels | default({})) | length == 0
+    - dc_fail_closed | bool
+
+- name: Refuse a channel key that is not a Slack ID
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_channels contains non-ID keys:
+      {{ dc_sb_bad_channels }}.
+      Documented behaviour: name-based keys never match under
+      groupPolicy allowlist, so every message in that channel is SILENTLY
+      blocked. A name here produces a bot that looks configured and answers
+      nobody, with no error anywhere. Use the channel ID — right-click the
+      channel in Slack, Copy link, take the trailing C... value.
+  vars:
+    dc_sb_bad_channels: >-
+      {{ dc_slack_channels.keys() | reject('match', dc_sb_channel_id_re) | list }}
+  when:
+    - dc_sb_bad_channels | length > 0
+    - dc_fail_closed | bool
+
+- name: Refuse a sender allowlist that is not a Slack user ID
+  ansible.builtin.fail:
+    msg: >-
+      dc_slack_allow_from contains entries that are not canonical Slack user IDs:
+      {{ dc_sb_bad_senders }}.
+      Names, slugs, display names and email addresses fail at OpenClaw startup,
+      and lowercase or short lookalikes fail too. A failed startup here means no
+      Slack at all.
+  vars:
+    dc_sb_bad_senders: >-
+      {{ dc_slack_allow_from | reject('match', dc_sb_user_id_re) | list }}
+  when:
+    - dc_sb_bad_senders | length > 0
+    - dc_fail_closed | bool
+
+# The inverse control. Everything above fails when a restriction is malformed;
+# this fails when a required capability would be dropped.
+- name: Refuse to drop a required conversation
+  ansible.builtin.fail:
+    msg: >-
+      These conversations are required but are not reachable under the proposed
+      posture: {{ dc_sb_unreachable }}.
+      C-prefixed entries must appear in dc_slack_channels; D-prefixed entries
+      are DMs and require dmPolicy to admit them.
+      On a loopback-bound gateway with no VPN these conversations are the only
+      route to the host, so dropping one severs operator access entirely while
+      leaving a runtime that looks healthy. Nothing has been written.
+  vars:
+    dc_sb_unreachable: >-
+      {{ dc_slack_required_conversations
+         | reject('in', dc_slack_channels.keys() | list)
+         | reject('match', '^D[A-Z0-9]{8,}$')
+         | list }}
+  when:
+    - dc_sb_unreachable | length > 0
+    - dc_fail_closed | bool
+
+- name: Refuse a DM policy that would sever the founder's DM
+  ansible.builtin.fail:
+    msg: >-
+      dmPolicy is '{{ dc_slack_dm_policy }}', which blocks direct messages, but
+      {{ dc_slack_required_conversations | select('match', '^D[A-Z0-9]{8,}$') | list }}
+      is listed as required. The founder reaches this host by DM from a phone.
+  when:
+    - dc_slack_dm_policy == 'disabled'
+    - dc_slack_required_conversations | select('match', '^D[A-Z0-9]{8,}$') | list | length > 0
+    - dc_fail_closed | bool
+
+- name: Refuse an allowlist DM policy with no permitted senders
+  ansible.builtin.fail:
+    msg: >-
+      dmPolicy is 'allowlist' and dc_slack_allow_from is empty, which admits
+      nobody. allowFrom is the canonical DM allowlist; an empty one is a DM
+      channel that exists and answers no one.
+  when:
+    - dc_slack_dm_policy == 'allowlist'
+    - (dc_slack_allow_from | default([])) | length == 0
+    - dc_fail_closed | bool
+
+# --- schema gate --------------------------------------------------------------
+- name: Compute the merged config
+  ansible.builtin.set_fact:
+    dc_sb_merged: "{{ dc_sb_current | combine(dc_slack_overlay, recursive=True) }}"
+
+- name: Obtain the live config schema from OpenClaw
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - /usr/bin/node
+      - "{{ dc_openclaw_entrypoint }}"
+      - config
+      - schema
+  register: dc_sb_schema
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to write without a schema to check against
+  ansible.builtin.fail:
+    msg: >-
+      Could not obtain the config schema (rc={{ dc_sb_schema.rc | default('?') }}).
+      Refusing to write an unvalidated Slack posture.
+  when:
+    - (dc_sb_schema.rc | default(1)) != 0 or (dc_sb_schema.stdout | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Stage the live schema where the validator can read it
+  ansible.builtin.copy:
+    content: "{{ dc_sb_schema.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Check every Slack key against the schema
+  ansible.builtin.script:
+    cmd: >-
+      files/validate_overlay.py
+      {{ dc_slack_overlay | to_json | quote }}
+      {{ dc_schema_staging_path | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: dc_sb_check
+  changed_when: false
+  failed_when: false
+
+- name: Remove the staged schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
+
+- name: Refuse to write a Slack posture the schema rejects
+  ansible.builtin.fail:
+    msg: >-
+      The Slack overlay does not satisfy OpenClaw's schema:
+      {{ dc_sb_check.stdout | default('') | trim }}
+      {{ dc_sb_check.stderr | default('') | trim }}
+      Nothing written, no backup taken — the config on disk is untouched.
+  when:
+    - (dc_sb_check.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+# --- write --------------------------------------------------------------------
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "Slack boundary (--tags slack-bound)"
+    dc_apply_overlay: "{{ dc_slack_overlay }}"
+
+- name: Back up the pre-Slack-boundary config
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Write the bounded Slack config
+  ansible.builtin.copy:
+    content: "{{ dc_sb_merged | to_nice_json(indent=2) }}\n"
+    dest: "{{ dc_openclaw_config_path }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  notify: Restart openclaw gateway
+
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+# --- verify -------------------------------------------------------------------
+- name: Re-read the config from disk
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_sb_verify_raw
+
+- name: Parse the config as written
+  ansible.builtin.set_fact:
+    dc_sb_verify: "{{ dc_sb_verify_raw.content | b64decode | from_json }}"
+
+- name: Assert the Slack boundary reached disk intact
+  vars:
+    dc_sb_required_channels: "{{ dc_slack_required_conversations | select('match', '^C') | list }}"
+  ansible.builtin.assert:
+    that:
+      - dc_sb_verify.channels.slack.groupPolicy == dc_slack_group_policy
+      - dc_sb_verify.channels.slack.dmPolicy == dc_slack_dm_policy
+      - (dc_sb_verify.channels.slack.allowFrom | default([])) == dc_slack_allow_from
+      - dc_sb_required_channels
+        | reject('in', dc_sb_verify.channels.slack.channels.keys() | list)
+        | list | length == 0
+      # The credentials the operator's own access depends on.
+      - (dc_sb_verify.channels.slack.botToken | default('')) | length > 0
+      - (dc_sb_verify.channels.slack.appToken | default('')) | length > 0
+      - dc_sb_verify.channels.slack.enabled | bool
+    fail_msg: >-
+      The Slack posture on disk is not what was intended, or a credential was
+      lost in the merge. Recover with:
+      ansible-playbook playbooks/governed-rollback.yml
+    success_msg: >-
+      groupPolicy={{ dc_slack_group_policy }},
+      dmPolicy={{ dc_slack_dm_policy }},
+      channels={{ dc_sb_verify.channels.slack.channels.keys() | list }},
+      allowFrom={{ dc_slack_allow_from }}, credentials intact
+
+- name: Emit the Slack boundary receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SLACK-BOUNDARY RECEIPT |
+      groupPolicy={{ dc_sb_verify.channels.slack.groupPolicy }} |
+      channels={{ dc_sb_verify.channels.slack.channels.keys() | list | join(',') }} |
+      requireMention={{ dc_sb_verify.channels.slack.channels[dc_slack_channels.keys() | first].requireMention
+                        | default('unset') }} |
+      permitted_senders={{ dc_sb_verify.channels.slack.allowFrom | join(',') }} |
+      dmPolicy={{ dc_sb_verify.channels.slack.dmPolicy }} |
+      required_preserved={{ dc_slack_required_conversations | join(',') }} |
+      loopProtection={{ dc_sb_verify.channels.slack.botLoopProtection.enabled | default('unset') }} |
+      UNVERIFIED=test-12b (no second sender available to prove a non-permitted
+      sender is refused; multi-agent work is backlogged under TASK-180)

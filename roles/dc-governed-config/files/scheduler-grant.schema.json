@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.decisioncrafters.invalid/openclaw-ansible/scheduler-grant.schema.json",
+  "title": "Scheduling grant",
+  "$comment": "An accepted, workload-specific grant of persistent operation to ONE named worker agent. The default posture is NO_SCHEDULER: admission, tool access, communication binding and the ability to perform the underlying work all confer nothing here. Field set is taken from the TASK-229 schedule-request envelope and Decision Memory amendment B of 2026-08-16, not invented. `additionalProperties: false` throughout, so a field nobody agreed to cannot ride along inside an accepted grant.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "grant_version",
+    "authority",
+    "identity_coordinate",
+    "owning_system",
+    "requesting_role",
+    "target_agent_id",
+    "workload",
+    "mechanism",
+    "schedule",
+    "envelope",
+    "evidence",
+    "lifecycle"
+  ],
+  "properties": {
+    "grant_version": {
+      "const": "1.0",
+      "$comment": "Pinned. A validator written for one shape must refuse another rather than interpret it."
+    },
+
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_id", "decision_memory_page_id", "accepted_by", "accepted_on"],
+      "$comment": "Canonical authorization, and the reason no real grant validates today: no accepted scheduling grant exists in Decision Memory yet. The apply path is complete and cannot pass until the founder creates one. That is the safety property.",
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^TASK-[0-9]{1,5}$",
+          "$comment": "The governing canonical task. Notion is the system of record; this manifest is an execution artifact tied back to it, never a second task store."
+        },
+        "decision_memory_page_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "$comment": "The accepted decision granting persistence for THIS workload. A task id alone is not acceptance."
+        },
+        "accepted_by": {
+          "const": "Tosin Akinosho",
+          "$comment": "Sole acceptance authority. A constant rather than a free string: an agent filling in its own name is the failure this whole contract exists to prevent."
+        },
+        "accepted_on": { "type": "string", "format": "date" }
+      }
+    },
+
+    "identity_coordinate": {
+      "const": "Decision Crafters",
+      "$comment": "One coordinate per grant. Cross-coordinate work routes to Boundary Review, never to a scheduler."
+    },
+    "owning_system": { "type": "string", "minLength": 1 },
+
+    "requesting_role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_id", "authority_class"],
+      "$comment": "Who PREPARED the request. A manager may Observe, Recommend, Prepare and track; it may not create or activate. PRM-28 carries Schedule Enabled: NO in the registry, and this pins that it cannot arrive holding Execute.",
+      "properties": {
+        "prompt_id": { "type": "string", "pattern": "^PRM-[0-9]{1,4}$" },
+        "authority_class": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["Observe", "Recommend", "Prepare"] },
+          "$comment": "Execute is absent from the enum by construction. A requesting role holding Execute cannot be expressed, so it cannot be accepted."
+        }
+      }
+    },
+
+    "target_agent_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$",
+      "$comment": "Exactly one worker. The operator CLI targets it with --agent; the worker keeps `cron` denied and is still a valid target, which TASK-229 verified against pinned v2026.7.1 source."
+    },
+
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workload_id", "description", "payload_class", "payload"],
+      "properties": {
+        "workload_id": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "payload_class": {
+          "enum": ["AGENT_TURN", "COMMAND"],
+          "$comment": "A model-backed turn or a Gateway command payload. Different risks, so named rather than inferred from the payload's shape."
+        },
+        "payload": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "The bounded instruction or command. Screened by the validator for shell metacharacters and operator-administration verbs; the schema cannot express that."
+        }
+      }
+    },
+
+    "mechanism": {
+      "enum": ["AUTOMATION", "HEARTBEAT", "EVENT_TRIGGER"],
+      "$comment": "AUTOMATION = Gateway cron, per-job --agent. HEARTBEAT = per-agent, agents.defaults.heartbeat / agents.list[].heartbeat. EVENT_TRIGGER = hooks, narrowed by hooks.allowedAgentIds and mappings[].agentId. All three target a named worker."
+    },
+
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "$comment": "Shape is checked per-mechanism by the validator, which is where cross-field rules live. JSON Schema can require the key; only code can require that it MATCHES the mechanism.",
+      "properties": {
+        "kind": { "enum": ["CRON", "INTERVAL", "EVENT"] },
+        "cron_expression": { "type": "string", "minLength": 9 },
+        "interval": { "type": "string", "pattern": "^[0-9]{1,4}(m|h)$" },
+        "event_source": { "type": "string", "minLength": 1 },
+        "timezone": {
+          "type": "string",
+          "minLength": 3,
+          "$comment": "Required for CRON and INTERVAL. Omitting it does not mean UTC — it means the Gateway host's timezone, which is invisible and can change under you."
+        }
+      }
+    },
+
+    "envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approved_sources", "prohibited_sources", "permitted_tools", "cost_limit"],
+      "properties": {
+        "approved_sources": { "type": "array", "items": { "type": "string" } },
+        "prohibited_sources": { "type": "array", "items": { "type": "string" } },
+        "permitted_tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "The MINIMUM tool envelope. The validator refuses any tool the target agent's profile denies — a grant may not widen a worker's tool policy as a side effect of scheduling it."
+        },
+        "cost_limit": { "type": "string", "minLength": 1 },
+        "communication_destination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["channel", "conversation_id", "communication_grant"],
+          "$comment": "OPTIONAL, and separately authorized. Delivery to Slack or any channel is its own grant; a scheduling grant does not carry it. Present without communication_grant is a refusal.",
+          "properties": {
+            "channel": { "type": "string", "minLength": 1 },
+            "conversation_id": { "type": "string", "minLength": 1 },
+            "communication_grant": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
+          }
+        },
+        "allowed_session_key_prefixes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "$comment": "EVENT_TRIGGER only."
+        },
+        "allow_request_session_key": {
+          "const": false,
+          "$comment": "EVENT_TRIGGER only, and pinned false. Letting a caller choose the session key lets an external event address a session it was never granted."
+        }
+      }
+    },
+
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination", "failure_behaviour"],
+      "properties": {
+        "destination": { "type": "string", "minLength": 1 },
+        "failure_behaviour": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_condition", "expires_on", "review_trigger", "stop_condition", "disable_command"],
+      "$comment": "STOP and expiry are required, not optional. A schedule fires until somebody removes it: a limit recorded only in the authorization is a limit nothing enforces.",
+      "properties": {
+        "start_condition": { "type": "string", "minLength": 1 },
+        "expires_on": { "type": "string", "format": "date" },
+        "review_trigger": { "type": "string", "minLength": 1 },
+        "stop_condition": { "type": "string", "minLength": 1 },
+        "disable_command": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "The exact reversal, written down before the thing it reverses. An untested stop path is a claim, not a control."
+        }
+      }
+    }
+  }
+}

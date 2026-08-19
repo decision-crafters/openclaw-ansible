@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Model override grant",
+  "description": "Authorises ONE governed harness run to pass --model, overriding an agent's pinned model. Fail-closed: absence of a grant is denial, and several fields are const so an over-broad grant is NOT REPRESENTABLE AS VALID. That is a claim about validation, not about what can be written \u2014 anyone can write the bytes; they will not validate. Single-use and task binding are enforced BEHAVIOURALLY by the validator, not by these declarations alone.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agentId",
+    "model",
+    "taskId",
+    "decisionRecord",
+    "acceptedBy",
+    "reason",
+    "reversal",
+    "singleUse"
+  ],
+  "properties": {
+    "agentId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The exact agent. A grant naming no agent, or a wildcard, does not validate."
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^*]+$",
+      "description": "The exact model. Wildcards are refused by pattern: a grant must name what will run, not a family."
+    },
+    "taskId": {
+      "type": "string",
+      "pattern": "^TASK-[0-9]+$",
+      "description": "The task the override serves. Cross-checked by the validator against the task governing the invocation; the pattern alone would make it task-LABELLED rather than task-BOUND."
+    },
+    "decisionRecord": {
+      "type": "string",
+      "minLength": 8,
+      "description": "The canonical record carrying the acceptance."
+    },
+    "acceptedBy": {
+      "const": "Tosin Akinosho",
+      "description": "Sole acceptance authority. A const, so a self-accepted grant does not validate."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 40,
+      "description": "Why the pinned model is insufficient for this run. Length floor deters a placeholder."
+    },
+    "reversal": {
+      "type": "string",
+      "minLength": 10,
+      "description": "How the run is undone. If it cannot be described, it is not reversible."
+    },
+    "singleUse": {
+      "const": true,
+      "description": "A const, so a standing override does not validate. Enforcement is behavioural: the validator records the grant's content digest in a ledger under an exclusive lock and refuses a digest already present. This field alone would be a declaration."
+    }
+  }
+}

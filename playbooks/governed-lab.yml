@@ -1,0 +1,79 @@
+---
+# Decision Crafters governed OpenClaw lab runtime.
+#
+# Two plays rather than one, because a manual step sits between them.
+# `roles/openclaw` installs and hardens the host but deliberately does not
+# configure OpenClaw or install its daemon — `openclaw onboard --install-daemon`
+# does both, interactively. Governance controls can only be merged into a config
+# that already exists, so play 2 is a separate invocation run after onboarding.
+#
+# Running this file end to end in one pass will stop at play 2 with a message
+# explaining exactly that. That is the intended behaviour, not a defect.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Install and harden the OpenClaw host
+  # An inventory GROUP, not `localhost`. These plays do run on the host they
+  # govern — upstream's install.yml targets localhost for that reason and is
+  # right to — but `localhost` is the implicit host, and host_vars are keyed to
+  # inventory hosts. Targeting it meant the private inventory's bindings were
+  # loaded by nothing at all. See governed-preflight-target.yml.
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  roles:
+    - openclaw
+  tags:
+    - install
+
+- name: Apply Decision Crafters governance controls
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  roles:
+    - dc-governed-config
+  tags:
+    - govern
+
+# Third play, and separate on purpose. The governance posture is applied and
+# stable; a Slack-bounding mistake must be independently reversible rather than
+# forcing a rollback of both. It also has a distinct failure mode — it can lock
+# the founder out of the only route to this host that works from a phone.
+- name: Bound the Slack human-access path
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Apply the Slack boundary
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_bound
+  tags:
+    - slack-bound
+
+# Founder decision 2026-08-17, Option B: route the already-authorized Slack
+# conversations to the governed agent instead of letting them fall through to
+# the default. Writes ONE key -- top-level `bindings`. Nothing under
+# channels.slack changes: no new app, OAuth grant, scope, credential or sender.
+- name: Route the bounded Slack path to the governed agent
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Bind the conversations
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_rebind
+  tags:
+    - slack-rebind
+
+# The reversal, written before the thing it reverses. `bindings` is unset today,
+# so `{"bindings": null}` restores the original state exactly -- and this play
+# refuses to delete an array holding entries it did not write.
+- name: Remove the Slack routing bindings
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Unbind the conversations
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_unbind
+  tags:
+    - slack-unbind

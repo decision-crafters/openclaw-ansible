@@ -1,0 +1,412 @@
+---
+# Give the OpenClaw service account a rootless Docker daemon.
+#
+# Run: sudo ansible-playbook \
+#        playbooks/governed-rootless-sandbox.yml -e ansible_become=false
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_rls_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_rls_uid: "{{ ansible_facts.getent_passwd[dc_rls_user][1] }}"
+
+# --- the guard that matters most ---------------------------------------------
+# The obvious "fix" for a sandbox that cannot reach Docker is to add the service
+# account to the docker group. That grants host-root-equivalent control, undoes
+# roles/openclaw/tasks/docker-security.yml, and breaks its CI assertion. It is
+# strictly worse than running with no sandbox.
+#
+# This role exists precisely to avoid it, so it refuses to run on a host where
+# someone has already done it — otherwise the rootless daemon would come up
+# alongside a root-equivalent grant and the receipt would report a bounded
+# runtime that is not bounded.
+- name: Read docker group membership
+  ansible.builtin.getent:
+    database: group
+    key: docker
+  failed_when: false
+
+- name: Refuse to proceed while the service account holds root-equivalent Docker access
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_rls_user }} is a member of the `docker` group, which is
+      host-root-equivalent. This role provides a ROOTLESS daemon so that group
+      membership is unnecessary; leaving it in place would mean the sandbox runs
+      while the account still holds root, and the governance receipt would
+      overstate the boundary. Remove it first:
+      `ansible-playbook playbook.yml --tags docker-security`, or
+      `gpasswd --delete {{ dc_rls_user }} docker`.
+  when:
+    - ansible_facts.getent_group is defined
+    - "'docker' in (ansible_facts.getent_group | default({}))"
+    - dc_rls_user in ((ansible_facts.getent_group['docker'][2] | default('')).split(',')
+                      | reject('equalto', '') | list)
+    - dc_rls_fail_closed | bool
+
+# --- prerequisites ------------------------------------------------------------
+# Checked rather than assumed. Each of these fails the daemon at a different
+# point, and only this one reports the actual cause.
+- name: Confirm cgroup v2
+  ansible.builtin.command: stat -fc %T /sys/fs/cgroup
+  register: dc_rls_cgroup
+  changed_when: false
+  failed_when: false
+
+- name: Confirm user namespaces are available
+  ansible.builtin.slurp:
+    src: /proc/sys/user/max_user_namespaces
+  register: dc_rls_userns
+  failed_when: false
+
+- name: Confirm systemd lingering is enabled for the service account
+  ansible.builtin.stat:
+    path: "/var/lib/systemd/linger/{{ dc_rls_user }}"
+  register: dc_rls_linger
+
+- name: Refuse without the kernel and systemd prerequisites
+  ansible.builtin.assert:
+    that:
+      - (dc_rls_cgroup.stdout | default('')) is search('cgroup2')
+      - ((dc_rls_userns.content | default('') | b64decode | trim) | int) > 0
+      - dc_rls_linger.stat.exists
+    fail_msg: >-
+      Prerequisites missing.
+      cgroup={{ dc_rls_cgroup.stdout | default('?') }} (need cgroup2fs);
+      max_user_namespaces={{ (dc_rls_userns.content | default('') | b64decode | trim) or '?' }} (need > 0);
+      lingering={{ dc_rls_linger.stat.exists }} (need true — without it the
+      user systemd session is torn down and the rootless daemon dies with it,
+      taking the sandbox with it at the next container create).
+      Enable lingering with: loginctl enable-linger {{ dc_rls_user }}
+    success_msg: "cgroup v2, user namespaces and lingering all present"
+  when: dc_rls_fail_closed | bool
+
+# --- packages -----------------------------------------------------------------
+- name: Install rootless container prerequisites
+  ansible.builtin.apt:
+    name: "{{ dc_rls_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Confirm newuidmap is now present
+  ansible.builtin.stat:
+    path: /usr/bin/newuidmap
+  register: dc_rls_newuidmap
+
+- name: Refuse without newuidmap
+  ansible.builtin.fail:
+    msg: >-
+      /usr/bin/newuidmap is still absent after installing {{ dc_rls_packages }}.
+      rootlesskit cannot map subordinate ids without it and the daemon will not
+      start. Nothing further has been changed.
+  when:
+    - not dc_rls_newuidmap.stat.exists
+    - dc_rls_fail_closed | bool
+
+# --- subordinate id delegation ------------------------------------------------
+# Read before writing. A range that overlaps an existing allocation produces
+# containers whose uids collide with another account's — a quiet correctness
+# problem rather than a loud failure.
+- name: Read existing subuid allocations
+  ansible.builtin.slurp:
+    src: /etc/subuid
+  register: dc_rls_subuid_raw
+  failed_when: false
+
+- name: Find any other account already holding the chosen range
+  ansible.builtin.set_fact:
+    dc_rls_subid_conflicts: >-
+      {{ (dc_rls_subuid_raw.content | default('') | b64decode).splitlines()
+         | reject('match', '^' ~ dc_rls_user ~ ':')
+         | select('search', ':' ~ dc_rls_subid_start ~ ':')
+         | list }}
+
+- name: Refuse when the chosen range collides with an existing allocation
+  ansible.builtin.fail:
+    msg: >-
+      /etc/subuid already allocates {{ dc_rls_subid_start }} to another account:
+      {{ dc_rls_subid_conflicts }}.
+      Overlapping ranges give two accounts containers with colliding uids, which
+      fails quietly rather than loudly. Choose a different dc_rls_subid_start.
+  when:
+    - dc_rls_subid_conflicts | length > 0
+    - dc_rls_fail_closed | bool
+
+- name: Delegate subordinate uids to the service account
+  ansible.builtin.lineinfile:
+    path: /etc/subuid
+    regexp: "^{{ dc_rls_user }}:"
+    line: "{{ dc_rls_user }}:{{ dc_rls_subid_start }}:{{ dc_rls_subid_count }}"
+    create: true
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Delegate subordinate gids to the service account
+  ansible.builtin.lineinfile:
+    path: /etc/subgid
+    regexp: "^{{ dc_rls_user }}:"
+    line: "{{ dc_rls_user }}:{{ dc_rls_subid_start }}:{{ dc_rls_subid_count }}"
+    create: true
+    owner: root
+    group: root
+    mode: '0644'
+
+# --- install the rootless daemon ----------------------------------------------
+- name: Check whether the rootless daemon is already installed
+  ansible.builtin.stat:
+    path: "{{ dc_rls_home }}/.config/systemd/user/docker.service"
+  register: dc_rls_installed
+
+# `--force` because the setup tool aborts when it finds the rootful daemon
+# running, which it always will here: the host daemon stays up for everything
+# else and is simply not reachable by this account.
+- name: Install the rootless docker daemon for the service account
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+      - /usr/bin/dockerd-rootless-setuptool.sh
+      - install
+      - --force
+      - --skip-iptables
+  register: dc_rls_install
+  changed_when: dc_rls_install.rc == 0
+  failed_when: false
+  when: not dc_rls_installed.stat.exists
+
+- name: Report the installer output
+  ansible.builtin.debug:
+    msg: "{{ (dc_rls_install.stdout_lines | default([])) + (dc_rls_install.stderr_lines | default([])) }}"
+  when: ((dc_rls_install.stdout | default('')) ~ (dc_rls_install.stderr | default(''))) | length > 0
+
+- name: Enable and start the rootless daemon
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - systemctl
+      - --user
+      - enable
+      - --now
+      - docker.service
+  register: dc_rls_enable
+  changed_when: dc_rls_enable.rc == 0
+  failed_when: false
+
+- name: Give the daemon a moment to bind its socket
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ dc_rls_uid }}/docker.sock"
+    timeout: 30
+  failed_when: false
+  register: dc_rls_sock_wait
+
+# --- proof, not assumption ----------------------------------------------------
+# A socket existing is not a working runtime. The only thing that proves the
+# sandbox can run is running a container, so that is what this does.
+- name: Verify the service account can actually run a container
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - /usr/bin/docker
+      - version
+      - --format
+      - "{% raw %}{{.Server.Version}}{% endraw %}"
+  register: dc_rls_docker_version
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to report success without a reachable daemon
+  ansible.builtin.fail:
+    msg: >-
+      The rootless daemon is not reachable as {{ dc_rls_user }}
+      (rc={{ dc_rls_docker_version.rc | default('?') }}):
+      {{ dc_rls_docker_version.stderr | default('') | trim }}.
+      The socket alone would not have proved anything, which is why this asks
+      the daemon instead. Inspect with:
+      `runuser -u {{ dc_rls_user }} -- env XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}
+      journalctl --user -u docker.service -n 40`
+  when:
+    - (dc_rls_docker_version.rc | default(1)) != 0
+    - dc_rls_fail_closed | bool
+
+# --- the sandbox image --------------------------------------------------------
+# A reachable daemon is still not a working sandbox. OpenClaw requires a
+# specific image and refuses to substitute a stock one:
+#
+#   Sandbox image not found: openclaw-sandbox:bookworm-slim. Build it with
+#   scripts/sandbox-setup.sh ... OpenClaw will not substitute plain debian:...
+#
+# That instruction cannot be followed on this host, and upstream says so.
+# docs/gateway/sandboxing.md, retrieved 2026-08-16:
+#
+#   "The scripts/sandbox-setup.sh ... helper scripts are only available when
+#    running from a source checkout. They are not included in the npm package.
+#    If you installed OpenClaw via `npm install -g openclaw`, use the inline
+#    `docker build` commands shown below instead."
+#
+# So the runtime names a remedy that does not exist in an npm install, and the
+# documented remedy is an inline build. The Dockerfile below is upstream's,
+# reproduced from that page verbatim — THIRD-PARTY UPSTREAM, not ours.
+#
+# Built from stdin, which is why this is `command` with `stdin:` and not
+# `script:` — the script module has no stdin parameter, as this role's sibling
+# already learned the hard way.
+#
+# DOCKER_HOST is the part that bites: without it the image is built in the
+# ROOTFUL daemon where the service account cannot see it, and the failure is
+# identical to having no image at all while `sudo docker images` shows it
+# present. Two daemons, one image name, and the error names neither.
+- name: Check whether the sandbox image already exists in the rootless daemon
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - /usr/bin/docker
+      - images
+      - -q
+      - "{{ dc_rls_sandbox_image }}"
+  register: dc_rls_image_check
+  changed_when: false
+  failed_when: false
+
+- name: Build the sandbox image inside the rootless daemon
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - "HOME={{ dc_rls_home }}"
+      - /usr/bin/docker
+      - build
+      - -t
+      - "{{ dc_rls_sandbox_image }}"
+      - "-"
+    stdin: "{{ dc_rls_sandbox_dockerfile }}"
+  register: dc_rls_build
+  changed_when: dc_rls_build.rc == 0
+  failed_when: false
+  timeout: 1800
+  when: (dc_rls_image_check.stdout | default('') | trim) | length == 0
+
+- name: Report the build tail
+  ansible.builtin.debug:
+    msg: "{{ ((dc_rls_build.stderr_lines | default([])) + (dc_rls_build.stdout_lines | default([])))[-12:] }}"
+  when: ((dc_rls_build.stdout | default('')) ~ (dc_rls_build.stderr | default(''))) | length > 0
+
+- name: Re-check the image, in the rootless daemon specifically
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - "DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock"
+      - /usr/bin/docker
+      - images
+      - --format
+      - "{% raw %}{{.Repository}}:{{.Tag}} {{.Size}}{% endraw %}"
+      - "{{ dc_rls_sandbox_image }}"
+  register: dc_rls_image_final
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to report a working sandbox without the image present
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_rls_sandbox_image }} is still absent from the rootless daemon.
+      Build tail: {{ (dc_rls_build.stderr | default('')) | trim | truncate(500) }}
+      Check it was not built into the ROOTFUL daemon instead — that produces
+      exactly this symptom while `sudo docker images` shows the image present.
+  when:
+    - (dc_rls_image_final.stdout | default('') | trim) | length == 0
+    - dc_rls_fail_closed | bool
+
+# --- point the Gateway at it --------------------------------------------------
+# A drop-in, not an edit. `openclaw onboard --install-daemon` owns the unit file
+# and would overwrite an edit on the next upgrade without saying so.
+- name: Ensure the gateway drop-in directory exists
+  ansible.builtin.file:
+    path: "{{ dc_rls_dropin_dir }}"
+    state: directory
+    owner: "{{ dc_rls_user }}"
+    group: "{{ dc_rls_user }}"
+    mode: '0755'
+
+- name: Point the gateway at the rootless docker socket
+  ansible.builtin.copy:
+    dest: "{{ dc_rls_dropin_dir }}/10-rootless-docker.conf"
+    owner: "{{ dc_rls_user }}"
+    group: "{{ dc_rls_user }}"
+    mode: '0644'
+    content: |
+      # Managed by roles/dc-rootless-sandbox. Do not edit by hand.
+      #
+      # Points OpenClaw's sandbox at the service account's ROOTLESS daemon.
+      # The rootful socket at /var/run/docker.sock is deliberately unreachable
+      # by this account — see roles/openclaw/tasks/docker-security.yml — because
+      # membership of the `docker` group is host-root-equivalent.
+      #
+      # DOCKER_HOST is the standard Docker client variable. If OpenClaw exposes
+      # its own config key for the socket, prefer that and delete this file;
+      # see SCHEMA note in the role README.
+      [Service]
+      Environment=DOCKER_HOST=unix:///run/user/{{ dc_rls_uid }}/docker.sock
+  notify: Restart openclaw gateway for rootless docker
+
+- name: Reload the service account's systemd
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_rls_runuser }}"
+      - -u
+      - "{{ dc_rls_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_rls_uid }}"
+      - systemctl
+      - --user
+      - daemon-reload
+  register: dc_rls_reload
+  changed_when: dc_rls_reload.rc == 0
+  failed_when: false
+
+- name: Emit the rootless sandbox receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-ROOTLESS-SANDBOX RECEIPT |
+      user={{ dc_rls_user }} (uid {{ dc_rls_uid }}) |
+      docker_group_member=NO (root-equivalent access refused by design) |
+      subuid={{ dc_rls_subid_start }}:{{ dc_rls_subid_count }} |
+      socket=/run/user/{{ dc_rls_uid }}/docker.sock |
+      daemon_reachable={{ 'YES v' ~ (dc_rls_docker_version.stdout | default('?') | trim)
+                          if (dc_rls_docker_version.rc | default(1)) == 0 else 'NO' }} |
+      gateway_dropin={{ dc_rls_dropin_dir }}/10-rootless-docker.conf

@@ -1,0 +1,165 @@
+---
+# Agent admission: deploy a profile, gather evidence, produce a receipt, remove.
+#
+#   --tags agent-profile   deploy the profile as an agents.list entry
+#   --tags remove-agent    remove it again (the rollback; written first)
+#   --tags admit           the synthetic admission evidence harness
+#   --tags receipt         the requested-versus-observed admission receipt
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags agent-profile -e ansible_become=false -e dc_dry_run=true
+#
+# RUN THE DRY RUN FIRST. These plays write to a runtime the founder is actively
+# using from Slack, and `agents.list` is currently unset — meaning the agent
+# serving Slack is implicit and may or may not survive the list being written.
+# agent_profile.yml refuses to proceed on that without explicit acknowledgement.
+#
+# No ADMIT_BOUNDED comes out of any of this. These plays produce evidence; the
+# disposition is a judgement returned to the founder.
+#
+# NOTE the absence of `apply:` on the include below. `apply.tags` ADDS tags to
+# every included task rather than gating them, which made `--tags status` reach
+# the stop tasks in governed-lifecycle.yml. ansible-lint, --syntax-check and
+# --list-tasks all passed that version.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Deploy an agent profile
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Apply the agent profile
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_profile
+  tags:
+    - agent-profile
+
+# Separate from agent-profile, and runnable in either order, because they fail
+# differently. Deploying a profile changes what the runtime enforces and
+# restarts the Gateway; installing a workspace changes what the agent is told
+# and restarts nothing. Binding them together would mean a governance-text edit
+# could only ship by restarting a daemon the founder is talking to.
+- name: Install an agent's governance files into its workspace
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Provision the agent workspace
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_workspace
+  tags:
+    - agent-workspace
+
+# Read-only with respect to configuration, so it carries no apply gate. It does
+# start model turns, which cost tokens and land in session history — that is a
+# cost, not a host change, and gating a read behind a dry run would mean the
+# suite never actually gets run.
+- name: Run the synthetic admission suite
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Execute the suite and capture evidence
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: admit
+  tags:
+    - admit
+
+# Test 12c, runnable alone. Founder direction 2026-08-16: this precedes the
+# admission receipt, because a receipt frozen while an authority-input weakness
+# is untested would have to be re-cut.
+- name: Test whether message text can inject authority (12c)
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the authority-injection variants
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: authority_injection
+  tags:
+    - authority-injection
+
+- name: Remove an agent profile
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Remove the agent profile
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: remove_agent
+  tags:
+    - remove-agent
+
+# TASK-223 test 12b — sender-denial negative control. Sibling of the 12c
+# authority-injection harness. Mutates ONE channel allowlist and restarts;
+# sender controls are resolved at Gateway startup, so a restart is required and
+# is part of the test rather than an afterthought.
+- name: Run the 12b sender-denial negative control
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Install the deny state
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sender_denial_apply
+  tags:
+    - sender-denial
+
+# The reversal, written before the thing it reverses.
+- name: Restore the sender allowlist
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Restore from the on-host baseline
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sender_denial_restore
+  tags:
+    - sender-denial-restore
+
+# Pin the model on a governed agent's own entry. Grants nothing; records the
+# model the agent was admitted with so the envelope stops depending on
+# agents.defaults.model being maintained elsewhere.
+- name: Pin the agent model
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Write the pin
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_model_pin
+  tags:
+    - model-pin
+
+# Closed-corpus competence fixture. INVOKES THE AGENT and therefore needs its
+# own founder authorization; the task refuses without -e dc_apply=true.
+- name: Run the closed-corpus competence fixture
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Install the packet and invoke the agent
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: competence_run
+  tags:
+    - competence
+
+# Verify an agent's effective tool surface after a tools allow/deny change.
+# Invokes the agent; writes no config and restarts nothing.
+- name: Probe the effective tool surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  tasks:
+    - name: Enumerate what the agent can actually call
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: tool_surface_probe
+  tags:
+    - tool-surface

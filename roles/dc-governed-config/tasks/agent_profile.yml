@@ -1,0 +1,345 @@
+---
+# Deploy an agent profile as an `agents.list` entry.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags agent-profile -e ansible_become=false
+#
+# Run the dry run FIRST and read its output. This writes to a runtime the
+# founder is actively using from Slack.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# --- the profile, checked before it is offered to the runtime ------------------
+- name: Read the agent profile
+  ansible.builtin.slurp:
+    src: "{{ dc_agent_profile_path }}"
+  register: dc_agent_profile_raw
+
+- name: Parse the agent profile
+  ansible.builtin.set_fact:
+    dc_agent_profile: "{{ dc_agent_profile_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse a profile that will not parse
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_agent_profile_path }} is not valid JSON. Refusing rather than
+      offering it to the runtime.
+  when:
+    - dc_agent_profile is not defined
+    - dc_fail_closed | bool
+
+- name: Extract the entry being deployed
+  ansible.builtin.set_fact:
+    dc_agent_entry: "{{ (dc_agent_profile.agents.list | default([]) | first) | default({}, true) }}"
+
+# Compose the patch as an UPSERT, not a replacement.
+#
+# `config patch` replaces arrays wholesale rather than merging them, so a patch
+# body containing only this agent REPLACES agents.list — dropping every other
+# entry in it. That matters twice over:
+#
+#   First run, list unset: the founder's Slack agent is implicit and therefore
+#   not in the list to survive. A minimal `main` entry is prepended so the write
+#   is additive in effect. Every documented multi-agent example lists the
+#   default agent explicitly alongside the secondaries; none adds one alone.
+#
+#   SECOND run, list now set: without this, the compose would skip the prepend
+#   (the list exists) and patch with the profile as authored — writing
+#   [dc-research] over [main, dc-research] and removing main. The re-run would
+#   do precisely what the first run was built to prevent. Found on 2026-08-16
+#   when a handler failure forced a re-run.
+#
+# So: keep every existing entry that is not this agent, add this agent, and
+# prepend the default only when there is nothing to keep.
+- name: Read the existing agent list, if any
+  ansible.builtin.set_fact:
+    dc_agent_existing: >-
+      {{ (dc_agent_list_before.stdout | default('[]') | from_json)
+         if not (dc_agent_list_unset | bool) else [] }}
+
+- name: Keep every entry that is not the agent being deployed
+  ansible.builtin.set_fact:
+    dc_agent_kept: "{{ dc_agent_existing | rejectattr('id', 'equalto', dc_agent_id) | list }}"
+
+- name: Compose the patch
+  ansible.builtin.set_fact:
+    dc_agent_patch_body:
+      agents:
+        list: >-
+          {{ (dc_agent_kept if (dc_agent_kept | length > 0)
+              else ([dc_agent_default_entry] if (dc_agent_preserve_default | bool) else []))
+             + [dc_agent_entry] }}
+
+- name: Report what will be patched
+  ansible.builtin.debug:
+    msg: >-
+      patch contains {{ dc_agent_patch_body.agents.list | map(attribute='id') | list }} —
+      kept {{ dc_agent_kept | map(attribute='id') | list }},
+      {{ 'prepended the default agent because there was nothing to keep'
+         if (dc_agent_kept | length == 0) and (dc_agent_preserve_default | bool)
+         else 'no prepend needed' }}.
+      config patch REPLACES arrays, so anything absent from this list is removed.
+
+- name: Confirm the profile clears the admission floors
+  ansible.builtin.assert:
+    that:
+      - dc_agent_entry.id | default('') == dc_agent_id
+      - dc_agent_required_denies | reject('in', dc_agent_entry.tools.deny | default([])) | list | length == 0
+      - dc_agent_entry.sandbox.mode | default('off') != 'off'
+      - dc_agent_entry.sandbox.workspaceAccess | default('rw') in ['none', 'ro']
+      - dc_agent_entry.tools.exec.mode | default('') == 'deny'
+    fail_msg: >-
+      The profile does not clear the admission floors.
+      id={{ dc_agent_entry.id | default('<unset>') }} (expected {{ dc_agent_id }});
+      missing denies={{ dc_agent_required_denies | reject('in', dc_agent_entry.tools.deny | default([])) | list }};
+      sandbox.mode={{ dc_agent_entry.sandbox.mode | default('<unset>') }};
+      workspaceAccess={{ dc_agent_entry.sandbox.workspaceAccess | default('<unset>') }};
+      exec.mode={{ dc_agent_entry.tools.exec.mode | default('<unset>') }}.
+    success_msg: >-
+      profile floors clear: id={{ dc_agent_id }}, seven session tools denied,
+      sandbox {{ dc_agent_entry.sandbox.mode }}/{{ dc_agent_entry.sandbox.workspaceAccess }},
+      exec denied
+
+# Known cross-field constraint, guarded here so the failure is named rather than
+# arriving as a schema error from the runtime. The runtime remains the authority
+# — this just fails earlier and more legibly for the one rule we have hit.
+- name: Refuse exec.mode combined with exec.security or exec.ask
+  vars:
+    dc_exec_conflicts: >-
+      {{ (dc_agent_entry.tools.exec | default({}) | list)
+         | select('in', ['security', 'ask']) | list }}
+  ansible.builtin.fail:
+    msg: >-
+      The profile sets tools.exec.mode alongside {{ dc_exec_conflicts }}.
+      The runtime rejects that combination: "tools.exec.mode cannot be combined
+      with tools.exec.security or tools.exec.ask".
+      Both keys are individually legal and pass a per-key schema check, which is
+      why validate_overlay.py does not catch it — cross-field constraints are a
+      class it structurally cannot express. Keep `mode`, which is what PRM-5
+      specifies and what the Gateway-level config already uses.
+  when:
+    - dc_agent_entry.tools.exec.mode is defined
+    - dc_exec_conflicts | length > 0
+    - dc_fail_closed | bool
+
+# --- THE RISK GUARD -----------------------------------------------------------
+# agents.list is unset on this host, so the agent serving the founder's Slack is
+# IMPLICIT. Writing a list containing only dc-research may add alongside it, or
+# may replace the implicit default and remove the founder's working agent.
+# Which of those happens is UNKNOWN and the schema does not say.
+- name: Refuse to write agents.list for the first time without acknowledgement
+  ansible.builtin.fail:
+    msg: >-
+      agents.list is currently UNSET, which means the agent serving Slack
+      (`main`) is implicit. Writing a list containing only '{{ dc_agent_id }}'
+      may add alongside it — or may replace the implicit default and remove the
+      founder's working agent. That is not established either way.
+      Run it once with no flag first — plays dry-run by default — and read
+      what the runtime reports.
+      Then, if you accept the risk, re-run with
+      -e dc_agent_accept_list_risk=true.
+      Recovery if it goes wrong: --tags remove-agent, or
+      playbooks/governed-rollback.yml.
+  when:
+    - dc_agent_list_unset | bool
+    - not (dc_agent_accept_list_risk | bool)
+    - dc_apply | bool
+    - dc_fail_closed | bool
+
+# --- the runtime's own gate ---------------------------------------------------
+# `config patch --dry-run` validates the proposed change with the runtime's
+# validator before anything is written. This replaces the hand-rolled
+# pre-write check, which shipped three defects including one that also broke
+# the rollback path.
+- name: Ask the runtime to validate the patch without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ dc_agent_patch_body | to_json }}"
+  register: dc_agent_dryrun
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Report what the dry run said
+  ansible.builtin.debug:
+    msg: "{{ (dc_agent_dryrun.stdout_lines | default([])) + (dc_agent_dryrun.stderr_lines | default([])) }}"
+
+- name: Refuse a patch the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      `config patch --dry-run` rejected the profile
+      (rc={{ dc_agent_dryrun.rc | default('?') }}). Nothing written.
+      {{ dc_agent_dryrun.stderr | default('') | trim }}
+  when:
+    - (dc_agent_dryrun.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Confirm the dry run changed nothing
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_agent_list_after_dry
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Assert the dry run was in fact dry
+  ansible.builtin.assert:
+    that:
+      - (dc_agent_list_after_dry.rc | default(1)) == (dc_agent_list_before.rc | default(1))
+    fail_msg: >-
+      agents.list changed during a --dry-run. The dry run was not dry, and
+      nothing further should be trusted from this play.
+    success_msg: "dry run left agents.list unchanged"
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "agent profile deploy (--tags agent-profile)"
+    dc_apply_overlay: "{{ dc_agent_patch_body }}"
+
+# --- write --------------------------------------------------------------------
+# `config patch` does not take a backup. Ours, before the write, so rollback is
+# possible even if the write is what goes wrong.
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+- name: Back up the config before deploying the profile
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Apply the profile
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ dc_agent_patch_body | to_json }}"
+  register: dc_agent_patch
+  changed_when: dc_agent_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  notify: Restart openclaw gateway
+
+- name: Refuse when the patch failed
+  ansible.builtin.fail:
+    msg: >-
+      `config patch` failed (rc={{ dc_agent_patch.rc | default('?') }}):
+      {{ dc_agent_patch.stderr | default('') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_agent_patch.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Validate the whole config after the patch
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_agent_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse when the config no longer validates
+  ansible.builtin.fail:
+    msg: >-
+      The config does not validate after the patch
+      (rc={{ dc_agent_validate.rc | default('?') }}):
+      {{ dc_agent_validate.stdout | default('') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_agent_validate.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+# --- verify from the runtime, not from what we wrote ---------------------------
+- name: Let the gateway settle
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_agent_h1
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_agent_h2
+  changed_when: false
+  failed_when: false
+
+- name: Extract both samples
+  ansible.builtin.set_fact:
+    dc_agent_s1: "{{ dict(dc_agent_h1.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_agent_s2: "{{ dict(dc_agent_h2.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway survived the profile
+  ansible.builtin.assert:
+    that:
+      - dc_agent_s2.ActiveState | default('') == 'active'
+      - dc_agent_s2.SubState | default('') == 'running'
+      - (dc_agent_s2.NRestarts | default(0) | int) == (dc_agent_s1.NRestarts | default(0) | int)
+    fail_msg: >-
+      The gateway is not stable after deploying {{ dc_agent_id }}.
+      NRestarts {{ dc_agent_s1.NRestarts | default('?') }} -> {{ dc_agent_s2.NRestarts | default('?') }}.
+      A rising count is a crash loop, which reads as 'active' for part of every
+      cycle. Slack is down while this persists.
+      Recover with playbooks/governed-rollback.yml.
+    success_msg: >-
+      gateway active and stable
+      (NRestarts held at {{ dc_agent_s2.NRestarts | default('0') }} across 15s)
+
+- name: Read agents.list back from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_agent_list_final
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Confirm the entry landed
+  ansible.builtin.assert:
+    that:
+      - (dc_agent_list_final.rc | default(1)) == 0
+      - dc_agent_id in (dc_agent_list_final.stdout | default(''))
+    fail_msg: >-
+      {{ dc_agent_id }} is not present in agents.list after the patch.
+    success_msg: "{{ dc_agent_id }} present in agents.list"
+
+- name: Emit the deployment receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-AGENT-PROFILE RECEIPT |
+      agent={{ dc_agent_id }} |
+      source={{ dc_agent_profile_path }} |
+      dry_run_validated=yes |
+      config_validate=rc={{ dc_agent_validate.rc | default('?') }} |
+      gateway={{ dc_agent_s2.ActiveState | default('?') }}/{{ dc_agent_s2.SubState | default('?') }}
+      NRestarts={{ dc_agent_s2.NRestarts | default('?') }} (stable 15s) |
+      agents_list_was={{ 'UNSET' if dc_agent_list_unset | bool else 'present' }} |
+      UNVERIFIED=main-agent-survival |
+      {{ 'agents.list was UNSET, so `main` was implicit and NO check here establishes its survival'
+         if dc_agent_list_unset | bool
+         else 'agents.list was already set' }} —
+      CONFIRM BY READING `agents.list` (--tags audit), not by messaging Slack.
+      That advice was correct only while Slack reached the default agent. Since
+      the 2026-08-17 rebind, Slack routes to the governed agent, so a reply
+      confirms THAT agent is alive and establishes nothing whatever about
+      `main`. `config patch` replaces arrays wholesale, so the risk here is a
+      DELETED agent, and only enumerating the list can see one missing.

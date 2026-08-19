@@ -1,0 +1,198 @@
+---
+# Remove a deployed agent profile. The rollback for agent_profile.yml.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags remove-agent -e ansible_become=false
+#
+# Written before the thing it reverses was ever deployed, deliberately. On
+# 2026-08-15 the rollback path carried a defect that would have surfaced only
+# after a bad apply, with the Gateway already down — because it was written
+# alongside the apply rather than exercised before it.
+#
+# `config patch` deletes a path when given null, so removal is the same
+# operation as deployment: same runtime gate, same backup, same stability check.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse when there is no agents.list to remove from
+  ansible.builtin.fail:
+    msg: >-
+      agents.list is unset, so {{ dc_agent_id }} is not deployed and there is
+      nothing to remove. Nothing has been changed.
+  when:
+    - dc_agent_list_unset | bool
+    - dc_fail_closed | bool
+
+- name: Confirm the agent is actually present before removing it
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id in (dc_agent_list_before.stdout | default(''))
+    fail_msg: >-
+      {{ dc_agent_id }} is not present in agents.list. Refusing to patch a
+      removal for an agent that is not there — the result would be a config
+      change with no stated purpose.
+    success_msg: "{{ dc_agent_id }} present; proceeding to remove"
+
+# Whole-key removal rather than surgical list editing.
+#
+# `config patch` replaces arrays wholesale rather than merging them, so there is
+# no supported way to remove one element of agents.list by patching. Setting the
+# key to null deletes it, which restores the pre-deployment state exactly —
+# agents.list unset, `main` implicit again.
+#
+# This is only correct while dc-research is the ONLY entry. The guard below
+# refuses otherwise rather than silently removing someone else's agent.
+- name: Refuse to delete an agents.list holding other agents
+  ansible.builtin.fail:
+    msg: >-
+      agents.list contains entries besides {{ dc_agent_id }}. This play deletes
+      the whole key, which would remove them too. `config patch` replaces arrays
+      wholesale, so removing one element requires rewriting the list with the
+      survivors — a different operation with a different risk, and not this one.
+      Current list:
+      {{ dc_agent_list_before.stdout | default('') | trim | truncate(400) }}
+  vars:
+    dc_other_ids: >-
+      {{ (dc_agent_list_before.stdout | default('[]') | from_json | default([], true))
+         | map(attribute='id', default='') | reject('equalto', dc_agent_id)
+         | reject('equalto', '') | list }}
+  when:
+    - dc_other_ids | length > 0
+    - dc_fail_closed | bool
+
+- name: Ask the runtime to validate the removal without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: '{"agents": {"list": null}}'
+  register: dc_remove_dryrun
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Report what the dry run said
+  ansible.builtin.debug:
+    msg: "{{ (dc_remove_dryrun.stdout_lines | default([])) + (dc_remove_dryrun.stderr_lines | default([])) }}"
+
+- name: Refuse a removal the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      `config patch --dry-run` rejected the removal
+      (rc={{ dc_remove_dryrun.rc | default('?') }}). Nothing written.
+      {{ dc_remove_dryrun.stderr | default('') | trim }}
+  when:
+    - (dc_remove_dryrun.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "agent removal (--tags remove-agent)"
+    dc_apply_overlay: "{{ {'agents': {'list': None}} }}"
+
+- name: Back up the config before removing the profile
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-remove.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Remove the agent entry
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: '{"agents": {"list": null}}'
+  register: dc_remove_patch
+  changed_when: dc_remove_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  notify: Restart openclaw gateway
+
+- name: Refuse when the removal failed
+  ansible.builtin.fail:
+    msg: >-
+      `config patch` failed (rc={{ dc_remove_patch.rc | default('?') }}):
+      {{ dc_remove_patch.stderr | default('') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_remove_patch.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Validate the whole config after removal
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_remove_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+- name: Let the gateway settle
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_remove_h1
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_remove_h2
+  changed_when: false
+  failed_when: false
+
+- name: Extract both samples
+  ansible.builtin.set_fact:
+    dc_remove_s1: "{{ dict(dc_remove_h1.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_remove_s2: "{{ dict(dc_remove_h2.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway is stable after removal
+  ansible.builtin.assert:
+    that:
+      - dc_remove_s2.ActiveState | default('') == 'active'
+      - dc_remove_s2.SubState | default('') == 'running'
+      - (dc_remove_s2.NRestarts | default(0) | int) == (dc_remove_s1.NRestarts | default(0) | int)
+    fail_msg: >-
+      The gateway is not stable after removing {{ dc_agent_id }}.
+      NRestarts {{ dc_remove_s1.NRestarts | default('?') }} -> {{ dc_remove_s2.NRestarts | default('?') }}.
+      Recover with playbooks/governed-rollback.yml.
+    success_msg: "gateway active and stable after removal"
+
+- name: Read agents.list back from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_remove_final
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Confirm the agent is gone
+  ansible.builtin.assert:
+    that:
+      - dc_agent_id not in (dc_remove_final.stdout | default(''))
+    fail_msg: >-
+      {{ dc_agent_id }} is still present in agents.list after the removal patch.
+    success_msg: "{{ dc_agent_id }} removed; agents.list back to its pre-deployment state"
+
+- name: Emit the removal receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-AGENT-REMOVE RECEIPT |
+      agent={{ dc_agent_id }} removed |
+      config_validate=rc={{ dc_remove_validate.rc | default('?') }} |
+      gateway={{ dc_remove_s2.ActiveState | default('?') }}/{{ dc_remove_s2.SubState | default('?') }}
+      NRestarts={{ dc_remove_s2.NRestarts | default('?') }} (stable 15s) |
+      agents_list_now={{ 'unset' if (dc_remove_final.rc | default(1)) != 0 else 'present' }} |
+      CONFIRM by messaging OpenClaw from Slack — the gateway being stable does
+      not by itself prove the founder's agent still answers.

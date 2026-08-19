@@ -1,0 +1,219 @@
+---
+# TASK-242 criterion 2 — every path by which a governed agent's content could
+# reach a model other than its pinned primary.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags model-paths -e ansible_become=false
+#
+# READ-ONLY. No config write, no restart, no agent invocation. The one payload
+# put to the runtime goes through `config patch --dry-run`, which validates and
+# writes nothing — the same method that closed criterion 1.
+#
+# WHY THIS IS WIDER THAN "IS THE FALLBACK STRICT"
+#
+# Pinning `model.primary` pins ONE call path. It says nothing about auxiliary
+# model paths (utility/image/pdf), nor about session-level overrides applied
+# after configuration is resolved. `dc-research` exposes `image`, so "primary is
+# pinned" is not yet "every content-bearing model call is pinned".
+#
+# THE DISTINCTION THIS TASK MUST NOT COLLAPSE
+#
+# `config get` returns the EFFECTIVE value — after merge, after defaults. So an
+# agent whose model object comes back without `fallbacks` is evidence at the
+# CONFIG layer. It is NOT proof about RUNTIME model selection, which could still
+# apply a default at call time. Configuration presence and runtime behaviour
+# came apart once already on this host, for `bindings`, and cost a day. The
+# report labels which layer each finding belongs to and refuses to let the
+# config answer stand in for the behavioural one.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# --- 1. what the live schema DECLARES a model object may contain -------------
+- name: Read the live schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'schema'] }}"
+  register: dc_mpe_schema
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Extract model-related keys the schema declares
+  ansible.builtin.set_fact:
+    dc_mpe_schema_keys: >-
+      {{ dc_mpe_schema.stdout | default('')
+         | regex_findall('"([a-zA-Z]*[Mm]odel[a-zA-Z]*|fallbacks|primary)"')
+         | unique | sort }}
+
+- name: Refuse to reason about a schema that did not print
+  ansible.builtin.fail:
+    msg: >-
+      `config schema` returned nothing usable
+      (rc={{ dc_mpe_schema.rc | default('?') }}). Every answer below would be
+      an inference from silence. INSUFFICIENT EVIDENCE.
+  when:
+    - (dc_mpe_schema.stdout | default('') | length) < 100
+    - dc_fail_closed | bool
+
+# --- 2. effective configuration, per path ------------------------------------
+- name: Read each model-bearing configuration path
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+  register: dc_mpe_values
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: "{{ dc_model_path_probes }}"
+  loop_control:
+    label: "{{ item }}"
+
+# --- 3. does `fallbacks: []` validate? ---------------------------------------
+# Asks the runtime rather than the docs, exactly as criterion 1 was closed.
+# --dry-run writes nothing.
+- name: Read the deployed agents
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_mpe_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Compose a candidate with an explicit empty fallback list
+  ansible.builtin.set_fact:
+    dc_mpe_candidate: >-
+      {{ (dc_mpe_candidate | default([])) + [
+           (item | combine({'model': {'primary': dc_agent_model_pin, 'fallbacks': []}}))
+           if item.id == dc_agent_id else item ] }}
+  loop: "{{ dc_mpe_agents.stdout | default('[]') | from_json }}"
+  loop_control:
+    label: "{{ item.id | default('?') }}"
+
+- name: Ask the runtime whether an explicit empty fallback list is legal
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ {'agents': {'list': dc_mpe_candidate}} | to_json }}"
+  register: dc_mpe_fallback_dry
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+# --- 4. session-level override surface ---------------------------------------
+# A configured primary can be superseded after configuration resolves. Whether
+# this build exposes that, and whether any session currently holds one, is a
+# different question from what the config says.
+- name: Discover the session verbs this build has
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', '--help'] }}"
+  register: dc_mpe_sessions_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# Sessions are stored PER AGENT. The first run read
+# /home/openclaw/.openclaw/agents/main/sessions/sessions.json and said nothing
+# whatever about dc-research, while being reported as the session answer.
+- name: Look for a model override on existing sessions
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', 'list'] }}"
+  register: dc_mpe_sessions
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# --- report -------------------------------------------------------------------
+#
+# EACH FINDING CARRIES ITS OWN SCOPE, in the artifact rather than in a summary
+# written alongside it. A label without a scope is the failure mode this whole
+# workstream keeps hitting: "VERIFIED" read later as broader than what was
+# actually observed. The scope must survive being quoted out of context.
+- name: Look for a model override on the target agent's own sessions
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['sessions', 'list', '--agent', dc_agent_id] }}"
+  register: dc_mpe_agent_sessions
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Label each finding with its evidence class AND its scope
+  ansible.builtin.set_fact:
+    dc_mpe_findings:
+      - >-
+        Q1 PRIMARY STRICT vs INHERITS FALLBACK —
+        {{ 'VERIFIED HOST (CONFIGURATION LAYER ONLY): the effective model object
+            for ' ~ dc_agent_id ~ ' is shown below. This establishes what is
+            CONFIGURED. Runtime failover behaviour remains UNKNOWN: config get
+            cannot show what the runtime selects at call time, and only a
+            bounded behavioural test under model failure could.'
+           if (dc_mpe_agents.rc | default(1)) == 0
+           else 'UNKNOWN — agents.list did not read.' }}
+      - >-
+        Q2 EXPLICIT `fallbacks: []` ACCEPTED —
+        {{ 'VERIFIED HOST, NARROWLY: the pinned runtime schema ACCEPTS this
+            configuration. It says NOTHING about whether the runtime behaves
+            differently from omitted fallbacks. Accepted-by-schema is not
+            distinct-in-behaviour.'
+           if (dc_mpe_fallback_dry.rc | default(1)) == 0
+           else 'VERIFIED HOST: REJECTED by the live schema (rc='
+                ~ (dc_mpe_fallback_dry.rc | default('?')) ~ ').' }}
+      - >-
+        Q3 EFFECTIVE PRIMARY / FALLBACK VALUES —
+        VERIFIED HOST (CONFIGURATION LAYER). This is precisely what `config get`
+        can establish, and precisely its limit: the effective value after merge
+        and defaults, not the model the runtime selects.
+      - >-
+        Q4 SESSION MODEL OVERRIDE —
+        {{ 'VERIFIED HOST AT OBSERVATION TIME ONLY. Not a permanent invariant:
+            a later session can introduce an override, so this finding expires
+            the moment a new session is created.'
+           if (dc_mpe_sessions.rc | default(1)) == 0
+           else 'UNKNOWN — the sessions verb did not answer; absence of output
+                 is not absence of overrides.' }}
+      - >-
+        Q5 AUXILIARY MODEL PATHS (utility / image / pdf) —
+        VERIFIED HOST (CONFIGURED STATE). An unset auxiliary path MUST NOT be
+        promoted to "this model can never be selected" unless schema or runtime
+        semantics support that. {{ dc_agent_id }} exposes `image`, so a pinned
+        `primary` is not yet equivalent to every content-bearing call being
+        pinned.
+
+- name: Render the model-path evidence
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-MODEL-PATHS (TASK-242 criterion 2) — READ-ONLY',
+          'schema_model_keys=' ~ (dc_mpe_schema_keys | join(', ')),
+          'sessions_verb_available=' ~
+            ('yes' if (dc_mpe_sessions_help.rc | default(1)) == 0 else 'no')]
+         + ['--- findings, each with its scope ---']
+         + (dc_mpe_findings | map('regex_replace', '\s+', ' ') | list)
+         + ['--- per-agent model objects (NOT truncated: this is the answer) ---']
+         + ((dc_mpe_agents.stdout | default('[]') | from_json)
+            | map('dict2items') | map('selectattr', 'key', 'in',
+                ['id', 'model']) | map('items2dict') | map('to_json') | list)
+         + ['--- configured values ---']
+         + (dc_mpe_values.results | default([])
+            | map(attribute='item') | zip(
+              dc_mpe_values.results | default([])
+              | map(attribute='stdout', default='') )
+            | map('join', ' = ') | map('truncate', 400) | list)
+         + ['--- sessions: ALL agents ---',
+            (dc_mpe_sessions.stdout | default('(unavailable)') | truncate(1500))]
+         + ['--- sessions: ' ~ dc_agent_id ~ ' only ---',
+            (dc_mpe_agent_sessions.stdout | default('(unavailable)') | truncate(1500))]
+         + ['--- explicit empty fallback list accepted by the schema? ---',
+            ('YES (rc=0)' if (dc_mpe_fallback_dry.rc | default(1)) == 0
+             else 'NO rc=' ~ (dc_mpe_fallback_dry.rc | default('?')))] }}
+
+- name: Emit the model-path receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-MODEL-PATHS RECEIPT | agent={{ dc_agent_id }} |
+      LAYER DISCIPLINE: everything above is the CONFIGURATION layer. `config
+      get` returns the effective value after merge and defaults, which answers
+      what is CONFIGURED — not what the runtime selects at call time. Those came
+      apart on this host once already, for `bindings`, and the config layer was
+      the one that looked right. A configured absence of fallbacks is evidence,
+      not proof, that no fallback is applied. |
+      NOT ANSWERED HERE: whether an auxiliary path actually routes THIS agent's
+      content to another model in practice. That is behavioural and needs a
+      call, which this task does not make. |
+      wrote_no_config=true restarted_nothing=true invoked_no_agent=true

@@ -1,0 +1,148 @@
+---
+# Read-only OpenClaw configuration audit.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     -e ansible_become=false
+#
+# Writes nothing but its own report. No config change, no restart, no plugin
+# change. Safe to run at any time, including while the Gateway is serving Slack.
+#
+# Replaces ad-hoc command pasting. Ad-hoc works once: it produces no re-runnable
+# receipt, cannot be diffed against a previous run, and omits whatever the
+# person typing did not think to ask for — which is how eleven outbound-write
+# keys and seven session tools stayed invisible for days.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Audit the OpenClaw configuration
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run the read-only audit
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: audit
+  tags:
+    - audit
+
+# Read-only, and the only check in this repository that asks what the AGENT
+# sees rather than what the host holds. Those are different claims: the host
+# verification passed for a day while dc-research reported it could not reach
+# its workspace at all.
+- name: Audit the agent sandbox from inside the container
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Inspect the sandbox mount and read through it
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: sandbox_audit
+  tags:
+    - sandbox-audit
+
+# Read-only. Hooks are the EVENT-DRIVEN half of persistent operation, and the
+# half that cannot be caught by watching: an event hook has no cadence and no
+# next-run time, so "is it running?" is answerable only by enumerating it.
+- name: Audit the event-driven hook surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Enumerate hooks and compare against what was declared
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: hooks_audit
+  tags:
+    - hooks-audit
+
+# Read-only, one named hook. Separate from hooks-audit because enumerating and
+# verifying are different jobs: the audit answers "what is enabled and was it
+# declared", this answers "what does this specific one actually do".
+- name: Verify one hook before it is declared
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Gather bounded read-only evidence about a single hook
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: hook_verify
+  tags:
+    - hook-verify
+
+# Zero mutation: reads the live schema and effective config to revalidate the
+# accepted v2026.7.1 sub-agent isolation semantics against the PINNED build. It
+# spawns nothing -- dc-research denies both `subagents` and `sessions_spawn`, so
+# no child can be produced from it without a configuration change.
+- name: Revalidate sub-agent isolation against the pinned build
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read the schema and effective policy
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: subagent_conformance
+  tags:
+    - subagent-conformance
+
+# Read-only Slack ingress evidence, from the OpenClaw FILE log rather than
+# journald. Separate from --tags logs because that reads journald, which carries
+# no Slack lines at all on this host — searching it returns zero and reads as
+# "no events" when it means "wrong sink".
+- name: Capture Slack ingress evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read inbound events and agent turns
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: slack_evidence
+  tags:
+    - slack-evidence
+
+# Runtime tool-policy evidence for admission rows 04/07/08/13. Read-only; reads
+# what the Gateway already logs and grants nothing.
+- name: Capture tool-policy evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Extract the effective removal chain
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: tool_policy_evidence
+  tags:
+    - tool-policy-evidence
+
+# TASK-242 criterion 2. Read-only: schema, effective config, and one --dry-run
+# validation that writes nothing.
+- name: Capture model-path evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Read every model-bearing path
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: model_path_evidence
+  tags:
+    - model-paths
+
+# The CLI surface this build offers, captured as a diffable artifact and
+# asserted against the flags this role invokes. Read-only: every call is --help.
+- name: Capture the CLI surface
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Probe every verb this role uses
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: cli_surface
+  tags:
+    - cli-surface

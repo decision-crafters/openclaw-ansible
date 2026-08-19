@@ -1,0 +1,161 @@
+---
+# Stage 1 — PREPARE. Validate a scheduling grant and render what it would do.
+#
+#   sudo ansible-playbook playbooks/governed-scheduler.yml \
+#     --tags scheduler-prepare -e dc_grant_path=/path/to/grant.json
+#
+# Writes nothing, contacts no scheduler, creates no job. Not behind apply_gate
+# for the same reason admit.yml is not: there is no host change to gate, and a
+# dry-run stop in front of a read only means the check never gets run.
+#
+# WHAT PREPARE MEANS HERE
+#
+# `NO_SCHEDULER` is the accepted default (TASK-229, 2026-08-16). A manager —
+# PRM-28, CEO, PM — may Observe, Recommend and Prepare a scheduling request and
+# track the run that results. It may not create or activate one. This play is
+# the whole of what the manager layer may reach: a validated artifact and a
+# rendered plan, handed to a separately authorized operator path.
+#
+# The separation is not decoration. PRM-28 carries `Schedule Enabled: NO` and
+# `Authority Class: Observe / Recommend / Prepare` in the canonical registry,
+# and its own definition says the role "may not change … schedules … by
+# implication". This play is that boundary expressed as mechanism.
+
+- name: Refuse without a grant to validate
+  ansible.builtin.assert:
+    that:
+      - dc_grant_path | default('') | length > 0
+    fail_msg: >-
+      dc_grant_path must name a scheduling grant. There is no default: a grant
+      is deployment-specific and belongs in a private repository beside the
+      inventory, never in this public one. Nothing has been read.
+    success_msg: "preparing {{ dc_grant_path }}"
+
+- name: Read the grant
+  ansible.builtin.slurp:
+    src: "{{ dc_grant_path }}"
+  register: dc_grant_raw
+  delegate_to: localhost
+  become: false
+
+- name: Parse the grant
+  ansible.builtin.set_fact:
+    dc_grant: "{{ dc_grant_raw.content | b64decode | from_json }}"
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# The grant names a target worker; the runtime says which workers exist and what
+# each denies. Validating the grant against the deployed profile is the only way
+# to catch a grant that would have to WIDEN a worker in order to run — which is
+# the quiet version of granting authority nobody approved.
+- name: Read the deployed agents so the grant can be checked against reality
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_grant_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Stage the grant, the schema and the deployed profile for the validator
+  ansible.builtin.copy:
+    content: "{{ item.content }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0600'
+  loop:
+    - dest: "{{ dc_grant_staging_path }}"
+      content: "{{ dc_grant | to_json }}"
+    - dest: "{{ dc_grant_profile_staging_path }}"
+      content: "{{ dc_grant_agents.stdout | default('[]') }}"
+  loop_control:
+    label: "{{ item.dest }}"
+  changed_when: false
+
+# `ansible.builtin.script`, and every input a PATH rather than stdin. The script
+# module has no `stdin` parameter — that defect shipped once here, broke both an
+# apply and a rollback, and is now pinned by tests/dc_module_args.py.
+- name: Validate the grant
+  ansible.builtin.script:
+    cmd: >-
+      files/validate_grant.py
+      {{ dc_grant_staging_path | quote }}
+      {{ dc_grant_schema_path | quote }}
+      --agent-profile {{ dc_grant_profile_staging_path | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: dc_grant_check
+  changed_when: false
+  failed_when: false
+
+# Unstage BEFORE the fail task, so a refusal does not leave the grant and the
+# deployed profile sitting in /root.
+- name: Remove the staged files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ dc_grant_staging_path }}"
+    - "{{ dc_grant_profile_staging_path }}"
+  changed_when: false
+
+- name: Report what the validator said
+  ansible.builtin.debug:
+    msg: "{{ (dc_grant_check.stdout_lines | default([])) + (dc_grant_check.stderr_lines | default([])) }}"
+
+- name: Refuse a grant that does not validate
+  ansible.builtin.fail:
+    msg: >-
+      The scheduling grant was REFUSED (rc={{ dc_grant_check.rc | default('?') }}).
+      Nothing has been scheduled and NO_SCHEDULER remains in force. Every
+      violation is listed above, not just the first.
+  when:
+    - (dc_grant_check.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+# --- render the plan ----------------------------------------------------------
+#
+# The exact command, so that what an operator would run is visible before anyone
+# is in a position to run it. Rendered from the grant rather than typed, so the
+# plan and the apply cannot drift.
+- name: Render the operation this grant describes
+  ansible.builtin.set_fact:
+    dc_grant_command: >-
+      {{ ['openclaw', 'cron', 'create',
+          '--agent', dc_grant.target_agent_id,
+          '--name', dc_grant.workload.workload_id,
+          '--tz', dc_grant.schedule.timezone | default('<none>'),
+          '--session', 'isolated',
+          ('--command' if dc_grant.workload.payload_class == 'COMMAND' else '--message'),
+          dc_grant.workload.payload | quote,
+          '--no-deliver'] | join(' ')
+         if dc_grant.mechanism == 'AUTOMATION'
+         else ('heartbeat is per-agent config (agents.list[].heartbeat) — '
+               'applied by config patch, not by the cron CLI'
+               if dc_grant.mechanism == 'HEARTBEAT'
+               else 'hooks.mappings[] entry — applied by config patch, not by the cron CLI') }}
+
+- name: Emit the prepared plan
+  ansible.builtin.debug:
+    msg: >-
+      DC-SCHEDULER PREPARE RECEIPT |
+      grant={{ dc_grant_path }} |
+      authority={{ dc_grant.authority.task_id }} /
+      {{ dc_grant.authority.decision_memory_page_id }}
+      accepted_by={{ dc_grant.authority.accepted_by }} |
+      requested_by={{ dc_grant.requesting_role.prompt_id }}
+      ({{ dc_grant.requesting_role.authority_class | join('/') }}) |
+      target_worker={{ dc_grant.target_agent_id }} |
+      mechanism={{ dc_grant.mechanism }} |
+      cadence={{ dc_grant.schedule.cron_expression
+                 | default(dc_grant.schedule.interval)
+                 | default(dc_grant.schedule.event_source) }}
+      tz={{ dc_grant.schedule.timezone | default('n/a') }} |
+      would_run={{ dc_grant_command }} |
+      disable_with={{ dc_grant.lifecycle.disable_command }} |
+      stop_condition={{ dc_grant.lifecycle.stop_condition }} |
+      expires={{ dc_grant.lifecycle.expires_on }} |
+      evidence={{ dc_grant.evidence.destination }} |
+      NOTHING WAS SCHEDULED. This validated a grant and rendered a plan. The
+      apply path is separate, separately gated, and requires an accepted
+      decision record naming this workload.

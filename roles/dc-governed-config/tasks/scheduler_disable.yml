@@ -1,0 +1,104 @@
+---
+# Disable a scheduled job. The reversal for scheduler_apply.yml.
+#
+#   sudo ansible-playbook playbooks/governed-scheduler.yml \
+#     --tags scheduler-disable -e dc_grant_path=... -e dc_apply=true
+#
+# WRITTEN BEFORE THE THING IT REVERSES, deliberately — the same order as
+# remove_agent.yml. On 2026-08-16 the rollback path for the agent profile
+# carried a defect that would have surfaced only after a bad apply, with the
+# Gateway already down, because it was written alongside the apply rather than
+# before it.
+#
+# A schedule is the case where this matters most. `openclaw cron` jobs persist
+# in Gateway runtime state and survive restarts, so an unwanted job is not
+# undone by a restart, a rollback of openclaw.json, or a redeploy. The config
+# rollback path does not reach it. This file is the only reversal.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a job to disable
+  ansible.builtin.assert:
+    that:
+      - dc_scheduler_job_id | default('') | length > 0
+    fail_msg: >-
+      dc_scheduler_job_id must name the job to disable. Nothing has been changed.
+    success_msg: "disabling {{ dc_scheduler_job_id }}"
+
+- name: Read the scheduler state before touching it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_sched_before
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Report what the scheduler holds now
+  ansible.builtin.debug:
+    msg: "{{ (dc_sched_before.stdout_lines | default([])) + (dc_sched_before.stderr_lines | default([])) }}"
+
+# Absent is the goal state, so an absent job is success, not an error. Failing
+# here would make the reversal refuse to run on the one input it should treat as
+# already-correct — and an operator reaching for a disable is usually not in a
+# mood to debug the disable.
+- name: Note when the job is already absent
+  ansible.builtin.debug:
+    msg: >-
+      DC-SCHEDULER DISABLE | {{ dc_scheduler_job_id }} does not appear in
+      `cron list`. Already absent is the goal state, not a failure. Nothing to
+      do. NOTE rc={{ dc_sched_before.rc | default('?') }} — if the command
+      itself failed, absence here is UNKNOWN rather than confirmed.
+  when: dc_scheduler_job_id not in (dc_sched_before.stdout | default(''))
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "disable scheduled job {{ dc_scheduler_job_id }} (--tags scheduler-disable)"
+    dc_apply_target: "Gateway scheduler (runtime state, not openclaw.json)"
+    dc_apply_overlay:
+      action: disable
+      job: "{{ dc_scheduler_job_id }}"
+
+- name: Disable the job
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'disable', dc_scheduler_job_id] }}"
+  register: dc_sched_disable
+  changed_when: dc_sched_disable.rc == 0
+  failed_when: false
+  timeout: 60
+
+- name: Read the scheduler state back
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_sched_after
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# Read back rather than trust the exit code. `cron disable` returning zero means
+# the command believed it succeeded; the list is what the Gateway will act on.
+- name: Confirm the job is no longer enabled
+  ansible.builtin.assert:
+    that:
+      - (dc_sched_disable.rc | default(1)) == 0
+      - (dc_sched_after.rc | default(1)) == 0
+    fail_msg: >-
+      Could not confirm {{ dc_scheduler_job_id }} is disabled.
+      disable rc={{ dc_sched_disable.rc | default('?') }},
+      list rc={{ dc_sched_after.rc | default('?') }}.
+      {{ dc_sched_disable.stderr | default('') | trim }}
+      The job may still be scheduled. Verify by hand with `openclaw cron list`
+      before assuming the reversal worked.
+    success_msg: "{{ dc_scheduler_job_id }} disabled and the scheduler re-read"
+
+- name: Emit the disable receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SCHEDULER DISABLE RECEIPT |
+      job={{ dc_scheduler_job_id }} |
+      disable_rc={{ dc_sched_disable.rc | default('?') }} |
+      scheduler_reread_rc={{ dc_sched_after.rc | default('?') }} |
+      DISABLED IS NOT REMOVED — the job may still exist in a disabled state.
+      Use `cron rm` if the grant has been revoked rather than paused, and record
+      which was intended.

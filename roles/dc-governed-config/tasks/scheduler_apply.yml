@@ -1,0 +1,154 @@
+---
+# Stage 2 — APPLY. Convert an accepted grant into a native OpenClaw job.
+#
+#   sudo ansible-playbook playbooks/governed-scheduler.yml \
+#     --tags scheduler-apply -e dc_grant_path=... \
+#     -e dc_apply=true -e dc_scheduler_accept=true
+#
+# THIS PLAY HAS NEVER BEEN EXECUTED, AND CANNOT BE TODAY.
+#
+# It re-runs the full PREPARE validation, which requires
+# `authority.decision_memory_page_id` to name an accepted scheduling grant. No
+# such grant exists in Decision Memory. Every real manifest is therefore refused
+# before this play reaches a write, by construction rather than by a flag
+# someone remembers to leave unset.
+#
+# That is the intended state. The reversal, the validation, the gate and the
+# rendering are all complete and provable; the only thing missing is the one
+# thing that must come from the founder.
+#
+# WHY TWO GATES
+#
+# `dc_apply` is the repository-wide dry-run default. `dc_scheduler_accept` is a
+# second, scheduler-specific confirmation — the same shape as `dc_confirm_stop`
+# and `dc_agent_accept_list_risk`, where the awkwardness IS the control.
+#
+# A schedule earns the second gate because it is the only thing this repository
+# can create that ACTS ON ITS OWN AFTERWARDS. Every other write here changes
+# what the runtime would do if asked; this one changes what it does unasked, on
+# a clock, until somebody removes it. `openclaw cron` jobs persist in Gateway
+# runtime state and survive restarts, so neither a restart nor a rollback of
+# openclaw.json reverses this. Only tasks/scheduler_disable.yml does.
+#
+# WHAT THIS PLAY IS NOT
+#
+# It is not a scheduler agent, and no agent may invoke it. It is an operator
+# path: run by a human with root on the host, applying an artifact a manager
+# prepared and the founder accepted. TASK-229's separation of duties —
+# manager prepares, scheduler authority applies, worker executes — is expressed
+# here as "a different party runs a different play", which is the only form of
+# separation that a prompt cannot talk its way around.
+
+- name: Validate the grant before considering any write
+  ansible.builtin.include_tasks: scheduler_prepare.yml
+
+- name: Refuse without the scheduler-specific confirmation
+  ansible.builtin.fail:
+    msg: >-
+      This play creates a job that runs on its own afterwards. Beyond the usual
+      -e dc_apply=true it requires -e dc_scheduler_accept=true, stating that a
+      persistence grant for THIS workload has been accepted and that the
+      reversal in tasks/scheduler_disable.yml has been read.
+      Nothing has been scheduled.
+  when:
+    - not (dc_scheduler_accept | default(false) | bool)
+    - dc_fail_closed | bool
+
+- name: Refuse to apply anything but a timed Automation for now
+  ansible.builtin.fail:
+    msg: >-
+      mechanism is {{ dc_grant.mechanism }}. Only AUTOMATION has an apply path
+      in this play. HEARTBEAT is per-agent config (agents.list[].heartbeat) and
+      EVENT_TRIGGER is a hooks.mappings entry; both are `config patch` writes
+      against keys this role does not yet own, and inventing one here would
+      write a governed key with no backup, no schema gate and no rollback.
+      The grant is VALID and its mechanism is RECOGNISED — it simply has no
+      apply path, which is a different answer from being refused.
+  when:
+    - dc_grant.mechanism != 'AUTOMATION'
+    - dc_fail_closed | bool
+
+- name: Read the scheduler state before writing to it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_sched_pre
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+# A job carrying this workload id already exists. Creating a second is how a
+# workload ends up running twice on a cadence nobody doubled.
+- name: Refuse to create a job that already exists
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_grant.workload.workload_id }} already appears in `cron list`.
+      Creating another would double the cadence without doubling the grant.
+      Disable the existing job first (--tags scheduler-disable), or reconcile
+      the two. Nothing has been scheduled.
+  when:
+    - dc_grant.workload.workload_id in (dc_sched_pre.stdout | default(''))
+    - dc_fail_closed | bool
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "scheduled job for {{ dc_grant.target_agent_id }} (--tags scheduler-apply)"
+    dc_apply_target: "Gateway scheduler (runtime state, NOT openclaw.json — a config rollback does not reverse this)"
+    dc_apply_overlay:
+      authority: "{{ dc_grant.authority.decision_memory_page_id }}"
+      target_agent: "{{ dc_grant.target_agent_id }}"
+      workload: "{{ dc_grant.workload.workload_id }}"
+      command: "{{ dc_grant_command }}"
+      disable_with: "{{ dc_grant.lifecycle.disable_command }}"
+      expires: "{{ dc_grant.lifecycle.expires_on }}"
+
+- name: Create the scheduled job
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'create',
+                              '--agent', dc_grant.target_agent_id,
+                              '--name', dc_grant.workload.workload_id,
+                              '--tz', dc_grant.schedule.timezone,
+                              '--session', 'isolated',
+                              '--message', dc_grant.workload.payload,
+                              '--no-deliver'] }}"
+  register: dc_sched_create
+  changed_when: dc_sched_create.rc == 0
+  failed_when: false
+  timeout: 120
+
+- name: Read the scheduler state back
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['cron', 'list'] }}"
+  register: dc_sched_post
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Confirm the job exists and targets the approved worker
+  ansible.builtin.assert:
+    that:
+      - (dc_sched_create.rc | default(1)) == 0
+      - dc_grant.workload.workload_id in (dc_sched_post.stdout | default(''))
+    fail_msg: >-
+      Could not confirm the job was created.
+      create rc={{ dc_sched_create.rc | default('?') }}:
+      {{ dc_sched_create.stderr | default('') | trim }}.
+      If it was PARTIALLY created, disable it with
+      `{{ dc_grant.lifecycle.disable_command }}` before re-running.
+    success_msg: "{{ dc_grant.workload.workload_id }} present in the scheduler"
+
+- name: Emit the apply receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SCHEDULER APPLY RECEIPT |
+      workload={{ dc_grant.workload.workload_id }} |
+      target_worker={{ dc_grant.target_agent_id }} |
+      authority={{ dc_grant.authority.task_id }} /
+      {{ dc_grant.authority.decision_memory_page_id }} |
+      expires={{ dc_grant.lifecycle.expires_on }} |
+      stop={{ dc_grant.lifecycle.stop_condition }} |
+      disable_with={{ dc_grant.lifecycle.disable_command }} |
+      THIS JOB NOW RUNS WITHOUT BEING ASKED. It survives a Gateway restart and
+      is NOT reversed by a config rollback. The expiry above is a date in a
+      manifest, not an enforced limit — nothing removes this job when that date
+      passes except a person. Put the review in Notion now.

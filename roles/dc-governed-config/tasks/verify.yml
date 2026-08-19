@@ -1,0 +1,330 @@
+---
+# Post-apply verification. These assertions are the receipts TASK-217 criteria
+# 5, 6 and 7 require.
+#
+# The file is re-read from disk rather than asserted against `dc_config_merged`.
+# Asserting against the value we just computed would prove only that the
+# computation was self-consistent; re-reading proves the control reached the
+# file. That distinction is the whole difference between "we set it" and "it is
+# set".
+
+- name: Re-read the config from disk
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_verify_raw
+
+- name: Parse the config as written
+  ansible.builtin.set_fact:
+    dc_verify: "{{ dc_verify_raw.content | b64decode | from_json }}"
+
+- name: Assert sandbox is enabled for every agent
+  ansible.builtin.assert:
+    that:
+      - dc_verify.agents.defaults.sandbox.mode == dc_sandbox_mode
+    fail_msg: >-
+      Sandbox mode on disk is
+      '{{ dc_verify.agents.defaults.sandbox.mode | default("<unset>") }}',
+      expected '{{ dc_sandbox_mode }}'. Installing Docker does not enable the
+      sandbox; this key does.
+    success_msg: "sandbox.mode = {{ dc_sandbox_mode }}"
+
+- name: Assert workspace access is not writable
+  ansible.builtin.assert:
+    that:
+      - dc_verify.agents.defaults.sandbox.workspaceAccess == dc_sandbox_workspace_access
+      - dc_verify.agents.defaults.sandbox.workspaceAccess != 'rw'
+    fail_msg: >-
+      workspaceAccess on disk is
+      '{{ dc_verify.agents.defaults.sandbox.workspaceAccess | default("<unset>") }}',
+      expected '{{ dc_sandbox_workspace_access }}' and never 'rw'.
+    success_msg: "sandbox.workspaceAccess = {{ dc_sandbox_workspace_access }}"
+
+# Checked per tool rather than by list equality so a future OpenClaw release
+# adding a tool to the deny list does not fail this assertion, while a tool
+# going missing still does.
+- name: Assert every governed tool is denied
+  ansible.builtin.assert:
+    that:
+      - item in (dc_verify.tools.deny | default([]))
+    fail_msg: >-
+      '{{ item }}' is absent from tools.deny on disk. Deny always wins in
+      OpenClaw, so an absent entry is a permitted tool.
+    success_msg: "tools.deny contains {{ item }}"
+  loop: "{{ dc_tools_deny }}"
+
+# A leftover allow-list from onboarding would make the effective policy partly
+# ours and partly onboarding's. Asserted separately from the deny list because
+# the failure it catches is different: deny going missing permits a tool, while
+# allow surviving silently changes what every other tool is measured against.
+- name: Assert no ungoverned allow-list survived the merge
+  ansible.builtin.assert:
+    that:
+      - (dc_verify.tools.allow | default([])) == dc_tools_allow
+    fail_msg: >-
+      tools.allow on disk is
+      '{{ dc_verify.tools.allow | default("<unset>") }}', expected
+      '{{ dc_tools_allow }}'. A non-empty allow-list blocks everything not in
+      it, so a value this role did not set means the effective tool policy is
+      not the one declared here.
+    success_msg: "tools.allow = {{ dc_tools_allow }} (allow-list inactive; deny is the whole policy)"
+
+- name: Assert elevated execution is disabled
+  ansible.builtin.assert:
+    that:
+      - dc_verify.tools.elevated.enabled | bool == false
+    fail_msg: >-
+      tools.elevated.enabled is
+      '{{ dc_verify.tools.elevated.enabled | default("<unset>") }}', expected
+      false. Elevated affects exec, and exec is denied — both controls are set
+      independently so neither relies on the other.
+    success_msg: "tools.elevated.enabled = false"
+
+- name: Assert the gateway is bound to loopback or an approved address
+  ansible.builtin.assert:
+    that:
+      - dc_verify.gateway.bind == dc_gateway_bind
+      - dc_verify.gateway.bind != '0.0.0.0'
+    fail_msg: >-
+      gateway.bind on disk is
+      '{{ dc_verify.gateway.bind | default("<unset>") }}', expected
+      '{{ dc_gateway_bind }}'. A wildcard bind behind a firewall is defence in
+      depth, not this control.
+    success_msg: "gateway.bind = {{ dc_gateway_bind }}"
+
+- name: Assert every prohibited plugin is denied
+  ansible.builtin.assert:
+    that:
+      - item in (dc_verify.plugins.deny | default([]))
+    fail_msg: >-
+      '{{ item }}' is absent from plugins.deny on disk. Plugins run in-process
+      with the Gateway and are not sandboxed, so an absent entry here is not a
+      permitted tool — it is unsandboxed code with the same trust as core.
+    success_msg: "plugins.deny contains {{ item }}"
+  loop: "{{ dc_plugins_deny }}"
+
+# The inverse assertion, and the one with no technical tell. Everything else in
+# this file fails when a restriction went missing. This fails when a capability
+# did.
+- name: Assert no required capability was denied
+  ansible.builtin.assert:
+    that:
+      - item not in (dc_verify.plugins.deny | default([]))
+      - (dc_verify.plugins.allow | default([])) | length == 0 or item in dc_verify.plugins.allow
+    fail_msg: >-
+      '{{ item }}' is denied on disk, or excluded by a non-empty plugins.allow.
+      It is listed in dc_plugins_required. For slack this means the Gateway is
+      bound to loopback with no channel reaching it — healthy by every other
+      check in this file and reachable only from the host's own shell.
+    success_msg: "{{ item }} is permitted (required capability preserved)"
+  loop: "{{ dc_plugins_required }}"
+
+# Config-level checks above prove what was ASKED FOR. This asks the runtime what
+# it actually LOADED, which is a different claim and the one that has been wrong
+# every time it mattered today.
+#
+# Best-effort by design. `openclaw plugins list` has not been run on this host —
+# the binary sits under a 0700 home and the subcommand surface is unconfirmed —
+# so an unrecognised output must read as "not proven", never as "fine". Guessing
+# a flag and treating a non-zero exit as absence would manufacture exactly the
+# false receipt this role exists to prevent.
+#
+# Bounded by `timeout` and given no stdin, because the first version HUNG on the
+# host (2026-08-15). `plugins list` is not a confirmed subcommand, and an
+# unrecognised argument does not necessarily produce an error — OpenClaw appears
+# to fall through to something that waits on stdin, so the task sat there
+# indefinitely with no output and no failure.
+#
+# The comment above this task already said the subcommand was unconfirmed and
+# that an unrecognised result must read as "not proven". It planned for the
+# command RETURNING something unusable. It did not plan for the command never
+# returning, which is the more common way an unknown CLI surface fails.
+#
+# rc=124 (timeout) and rc=137 (killed) both land in the UNCONFIRMED path below,
+# which is the correct reading: a probe that had to be killed proved nothing.
+- name: Ask the runtime which plugins actually loaded
+  ansible.builtin.shell:
+    cmd: >-
+      timeout --kill-after=5s 20s
+      {{ dc_runuser }} -u {{ dc_openclaw_user }} --
+      /usr/bin/node {{ dc_openclaw_entrypoint | quote }} plugins list
+      </dev/null 2>&1
+  register: dc_plugin_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record whether the runtime could be asked at all
+  ansible.builtin.set_fact:
+    dc_plugin_probe_usable: >-
+      {{ (dc_plugin_probe.rc | default(1)) == 0
+         and (dc_plugin_probe.stdout | default('') | length) > 0 }}
+
+# REPORTED, not asserted, and that is a deliberate downgrade.
+#
+# An assertion here would gate the play on output whose format nobody has
+# confirmed. If `plugins list` is not a real subcommand, OpenClaw may print help
+# text — non-empty, exit 0, and containing none of the plugin names. That would
+# fail the play with "slack is missing" when slack is fine, after the config has
+# already been written. A false alarm at that point is worse than no check.
+#
+# The reverse guard is not available either: treating "no required plugin found"
+# as evidence the probe is unusable would convert a genuine missing-slack into
+# UNCONFIRMED, which is fail-open in the one direction that matters here.
+#
+# The two readings cannot be told apart from the output alone, so this stays a
+# report until the CLI surface is confirmed. The config-level assertions above
+# remain fatal — those check facts we do understand.
+- name: Report what the runtime says it loaded
+  ansible.builtin.debug:
+    msg: >-
+      RUNTIME PLUGIN STATE (reported, not asserted — `plugins list` output
+      format is unconfirmed):
+      required-and-found={{ dc_plugins_required | select('in', dc_plugin_probe.stdout) | list }} |
+      required-not-found={{ dc_plugins_required | reject('in', dc_plugin_probe.stdout) | list }} |
+      denied-but-present={{ dc_plugins_deny | select('in', dc_plugin_probe.stdout) | list }}.
+      If required-not-found is non-empty, read the raw output before believing
+      it — help text also contains no plugin names. Raw:
+      {{ dc_plugin_probe.stdout | default('') | trim | truncate(300) }}
+  when: dc_plugin_probe_usable | bool
+
+- name: Report that runtime load state could not be confirmed
+  ansible.builtin.debug:
+    msg: >-
+      LOAD STATE UNCONFIRMED — `plugins list` returned
+      rc={{ dc_plugin_probe.rc | default('?') }}
+      {{ '(TIMED OUT after 20s — the subcommand is not recognised and the
+      process waited on stdin rather than erroring)'
+         if (dc_plugin_probe.rc | default(0) | int) in [124, 137]
+         else '(' ~ (dc_plugin_probe.stdout | default('') | trim | truncate(160)) ~ ')' }}.
+      The config assertions above still hold: they prove what was written. They
+      do not prove what the Gateway loaded, and those have differed twice today.
+      Treat the plugin criterion as INSUFFICIENT EVIDENCE until an operator runs
+      the inventory by hand. This is not a failure of the apply.
+  when: not (dc_plugin_probe_usable | bool)
+
+# The check this file was missing, and the most important one after a write.
+#
+# Everything above proves the CONFIG is right. None of it proves the daemon
+# survived reading it. `gateway.bind: "127.0.0.1"` was a correct-looking config
+# that crash-looped the Gateway on 2026-08-15, and an apply that writes a
+# poisoned config and reports success is how that outage got its second act.
+#
+# rollback.yml has had this check since that day. The apply path did not, which
+# meant the recovery tool verified stability and the thing that caused the
+# instability did not.
+#
+# NRestarts across a window, not a single is-active: the unit carries
+# Restart=always, so a process dying every few seconds is genuinely `active` for
+# part of each cycle and a single sample catches an up-phase.
+- name: Resolve the service account uid for the health check
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_verify_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+
+- name: Let the gateway settle after the restart
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state and restart counter
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_verify_uid }}"
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - show
+      - "{{ dc_openclaw_service }}"
+      - --property=ActiveState,SubState,NRestarts,ExecMainStatus
+  register: dc_health_first
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state again
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ dc_verify_uid }}"
+      - systemctl
+      - "--{{ dc_openclaw_service_scope }}"
+      - show
+      - "{{ dc_openclaw_service }}"
+      - --property=ActiveState,SubState,NRestarts,ExecMainStatus
+  register: dc_health_second
+  changed_when: false
+  failed_when: false
+
+- name: Extract the two samples
+  ansible.builtin.set_fact:
+    dc_h1: "{{ dict(dc_health_first.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_h2: "{{ dict(dc_health_second.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway survived the new config
+  ansible.builtin.assert:
+    that:
+      - dc_h2.ActiveState | default('') == 'active'
+      - dc_h2.SubState | default('') == 'running'
+      - (dc_h2.NRestarts | default(0) | int) == (dc_h1.NRestarts | default(0) | int)
+    fail_msg: >-
+      The governed config was written but the gateway is not stable on it.
+      ActiveState={{ dc_h2.ActiveState | default('?') }}
+      SubState={{ dc_h2.SubState | default('?') }}
+      NRestarts {{ dc_h1.NRestarts | default('?') }} -> {{ dc_h2.NRestarts | default('?') }}
+      ExecMainStatus={{ dc_h2.ExecMainStatus | default('?') }}.
+      A rising restart count means a crash loop, which reads as 'active' for part
+      of every cycle. Slack and every other channel are down while this persists.
+      Recover with: ansible-playbook playbooks/governed-rollback.yml
+      Then read: journalctl --user -u {{ dc_openclaw_service }} -n 40
+    success_msg: >-
+      gateway active and stable on the governed config
+      (NRestarts held at {{ dc_h2.NRestarts | default('0') }} across 15s)
+
+- name: Assert the config is not group- or world-readable
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_config_path }}"
+  register: dc_verify_stat
+
+- name: Confirm config permissions
+  ansible.builtin.assert:
+    that:
+      - dc_verify_stat.stat.mode == '0600'
+      - dc_verify_stat.stat.pw_name == dc_openclaw_user
+    fail_msg: >-
+      {{ dc_openclaw_config_path }} is mode
+      {{ dc_verify_stat.stat.mode }} owned by {{ dc_verify_stat.stat.pw_name }},
+      expected 0600 owned by {{ dc_openclaw_user }}.
+    success_msg: "config is 0600 {{ dc_openclaw_user }}"
+
+# Emitted as a single structured line so the completion packet can quote a
+# receipt rather than a transcript.
+- name: Emit the governance receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-GOVERNED-CONFIG RECEIPT |
+      path={{ dc_openclaw_config_path }} |
+      sandbox.mode={{ dc_verify.agents.defaults.sandbox.mode }} |
+      workspaceAccess={{ dc_verify.agents.defaults.sandbox.workspaceAccess }} |
+      tools.deny={{ dc_verify.tools.deny | join(',') }} |
+      elevated={{ dc_verify.tools.elevated.enabled }} |
+      gateway.bind={{ dc_verify.gateway.bind }} |
+      plugins.deny={{ dc_verify.plugins.deny | default([]) | join(',') }} |
+      plugins.required={{ dc_plugins_required | join(',') }} (preserved) |
+      plugins.loadstate={{ 'reported-by-runtime' if dc_plugin_probe_usable | bool else 'UNCONFIRMED' }} |
+      gateway.active={{ dc_h2.ActiveState | default('?') }}/{{ dc_h2.SubState | default('?') }} |
+      gateway.NRestarts={{ dc_h2.NRestarts | default('?') }} (stable across 15s) |
+      mode={{ dc_verify_stat.stat.mode }} |
+      owner={{ dc_verify_stat.stat.pw_name }}

@@ -1,0 +1,187 @@
+---
+# Host conformance for sub-agent isolation semantics. ZERO MUTATION.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags subagent-conformance -e ansible_become=false
+#
+# Reads the live schema and the effective config. Spawns nothing, writes
+# nothing, restarts nothing, creates no session.
+#
+# WHAT THIS IS FOR
+#
+# Founder direction 2026-08-17 corrects the evidence state. The accepted
+# position is:
+#
+#   VERIFIED UPSTREAM (v2026.7.1) — targeted sub-agent bootstrap uses the TARGET
+#     agent workspace; child tools are first governed by the applicable agent
+#     policy and then further narrowed by the sub-agent tool-policy layer.
+#   HISTORICAL DEFECT — the wrong-workspace reports (#40825, #15032) occurred on
+#     2026.3.x and are closed. They are not evidence about this build.
+#   HOST REVALIDATION REQUIRED — Decision Crafters still owes evidence that the
+#     pinned 2026.7.1-2 runtime exhibits those semantics.
+#
+# So this play does not re-litigate upstream. It asks THIS HOST what it
+# declares, which is the strongest evidence obtainable without spawning.
+#
+# WHY NOT JUST ASK A CHILD AGENT
+#
+# That test already exists and was correctly classified as SUPPORTED INFERENCE.
+# An agent describing its own tools is a model output about a runtime, not a
+# runtime output about itself. Re-running it would add words, not evidence.
+#
+# The schema is different in kind: it is what the binary will enforce, stated by
+# the binary. Where the schema and any document disagree, the schema wins.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Capture the live schema
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'schema'] }}"
+  register: dc_sc_schema_raw
+  changed_when: false
+  failed_when: false
+  timeout: 180
+
+- name: Refuse to report conformance without a schema
+  ansible.builtin.fail:
+    msg: >-
+      `config schema` returned rc={{ dc_sc_schema_raw.rc | default('?') }}.
+      Every finding in this play is derived from the schema, so without it the
+      result is UNKNOWN rather than negative. Reporting "no subagent keys
+      found" from a failed schema read would be the exact error this workstream
+      keeps making.
+  when:
+    - (dc_sc_schema_raw.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Stage the schema for parsing
+  ansible.builtin.copy:
+    content: "{{ dc_sc_schema_raw.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Stage the conformance reader
+  ansible.builtin.copy:
+    src: subagent_conformance.py
+    dest: "{{ dc_sc_reader_path }}"
+    owner: root
+    group: root
+    mode: '0555'
+  changed_when: false
+
+# Effective config for every path the reader needs to judge precedence. Read
+# separately from the schema because they answer different questions: the schema
+# says what MAY be set, `config get` says what IS set.
+- name: Read the effective sub-agent and auth configuration
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+  register: dc_sc_effective
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: "{{ dc_subagent_conformance_paths }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Assemble the effective values for the reader
+  ansible.builtin.copy:
+    content: >-
+      {{ dict(dc_sc_effective.results
+              | map(attribute='item') | list
+              | zip(dc_sc_effective.results
+                    | map(attribute='stdout') | map('default', '', true) | list))
+         | to_json }}
+    dest: "{{ dc_sc_effective_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Read the deployed agents so policy precedence can be judged
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_sc_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Stage the deployed agents
+  ansible.builtin.copy:
+    content: "{{ dc_sc_agents.stdout | default('[]') }}"
+    dest: "{{ dc_sc_agents_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Judge host conformance
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ dc_sc_reader_path }}"
+      - --schema
+      - "{{ dc_schema_staging_path }}"
+      - --effective
+      - "{{ dc_sc_effective_path }}"
+      - --agents
+      - "{{ dc_sc_agents_path }}"
+      - --agent-id
+      - "{{ dc_agent_id }}"
+  register: dc_sc_result
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+# Unstage before reporting, so a refusal does not leave the schema and the
+# deployed agent list sitting in /root.
+- name: Remove the staged files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ dc_schema_staging_path }}"
+    - "{{ dc_sc_effective_path }}"
+    - "{{ dc_sc_agents_path }}"
+    - "{{ dc_sc_reader_path }}"
+  changed_when: false
+
+- name: Write the conformance report
+  ansible.builtin.copy:
+    dest: "{{ dc_sc_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      SUB-AGENT HOST CONFORMANCE — {{ dc_agent_id }}
+      host={{ inventory_hostname }} generated={{ ansible_facts['date_time'].iso8601 }}
+      ZERO MUTATION: no spawn, no session, no config write, no restart
+
+      Derived from the LIVE SCHEMA and the EFFECTIVE CONFIG of this host.
+      Where a document and the schema disagree, the schema is what the binary
+      will enforce.
+
+      {{ dc_sc_result.stdout | default('<reader produced no output>') }}
+      {{ dc_sc_result.stderr | default('') }}
+  changed_when: false
+
+- name: Show the conformance result
+  ansible.builtin.debug:
+    msg: "{{ dc_sc_result.stdout_lines | default(['<no output>']) }}"
+
+- name: Emit the conformance receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-SUBAGENT-CONFORMANCE RECEIPT |
+      agent={{ dc_agent_id }} |
+      schema_rc={{ dc_sc_schema_raw.rc | default('?') }} |
+      reader_rc={{ dc_sc_result.rc | default('?') }} |
+      report={{ dc_sc_report }} (0600, {{ dc_audit_report_owner }}) |
+      This is HOST DECLARATION evidence. It states what this build's schema
+      declares and what this host has configured. It is NOT a behavioural
+      observation of a running child, which would require a spawn — and
+      {{ dc_agent_id }} denies both `subagents` and `sessions_spawn`, so no
+      spawn is possible from it without a configuration change.
