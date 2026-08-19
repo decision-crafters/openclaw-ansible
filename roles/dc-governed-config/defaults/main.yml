@@ -1170,14 +1170,39 @@ dc_agent_model_pin: ""
 # call path; auxiliary model paths and session overrides are separate surfaces,
 # and an agent exposing `image` has at least one of them.
 dc_model_path_probes:
+  # Derived from the live schema's model-bearing keys, NOT from a shortlist.
+  # The first version probed utilityModel/imageModel/pdfModel — the three named
+  # in the request — and the schema then reported ~15. Reading the three you
+  # were told about and reporting "unset" is how an incomplete answer becomes a
+  # clean-looking one.
   - agents.defaults.model
   - agents.defaults.model.primary
   - agents.defaults.model.fallbacks
+  - agents.defaults.provider
+  # Auxiliary content-bearing paths. summaryModel and visionModel matter most
+  # here: a research agent produces syntheses, and dc-research exposes `image`.
+  - agents.defaults.summaryModel
+  - agents.defaults.visionModel
   - agents.defaults.utilityModel
   - agents.defaults.imageModel
   - agents.defaults.pdfModel
-  - agents.defaults.provider
-  - agents.list
+  - agents.defaults.voiceModel
+  - agents.defaults.imageGenerationModel
+  - agents.defaults.videoGenerationModel
+  - agents.defaults.musicGenerationModel
+  # Separate fallback and override surfaces from `model.fallbacks`.
+  - agents.defaults.modelFallback
+  - agents.defaults.modelFallbackPolicy
+  - agents.defaults.modelOverrides
+  - agents.defaults.allowModelOverride
+  - agents.defaults.allowedModels
+  - agents.defaults.allowModels
+  - agents.defaults.modelAliases
+  # Top-level surfaces that could resolve a model independently of the agent.
+  - defaultModel
   - model
+  - models
+  - modelAliases
+  - modelOverrides
+  - agents.list
   - session
-  - sessions
