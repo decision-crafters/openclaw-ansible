@@ -146,3 +146,17 @@
         tasks_from: cli_surface
   tags:
     - cli-surface
+
+# The runtime's own health check, bounded and read-only. `--fix` is never
+# passed; doctor's fixing mode mutates config at the call site.
+- name: Capture the runtime health check
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Run doctor and record what it says
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: doctor_audit
+  tags:
+    - doctor

@@ -1280,6 +1280,17 @@ dc_cli_surface_probes:
   - name: "pairing"
     argv: ["pairing", "--help"]
     requires: []
+  # Added after `openclaw doctor` HUNG a closeout script on 2026-08-20. It
+  # produced no output and waited on stdin — the same failure `plugins list`
+  # produced when it did not exist. An unrecognised or interactive subcommand
+  # does not necessarily error on this build.
+  #
+  # `--help` is safe to probe; `doctor` itself is not assumed non-interactive
+  # anywhere, and every host invocation in a script must close stdin and bound
+  # its runtime regardless of what --help says.
+  - name: "doctor"
+    argv: ["doctor", "--help"]
+    requires: []
 
 dc_cli_surface_report: >-
   /tmp/openclaw-cli-surface-{{
@@ -1329,3 +1340,18 @@ dc_governing_task: ""
 # this file is what makes it behaviour. Digested by CONTENT, so copying or
 # renaming a grant does not mint a fresh use.
 dc_model_grant_ledger_path: "/root/.dc-model-grant-ledger.json"
+
+# --- Runtime health check -----------------------------------------------------
+#
+# `openclaw doctor` HUNG a closeout script on 2026-08-20: no output, waiting on
+# stdin, holding the terminal until interrupted. Every invocation of it is
+# therefore bounded and has stdin closed, and a timeout is reported as
+# INDETERMINATE rather than as ill health.
+#
+# 120s is generous on purpose. Doctor probes channels and model providers, which
+# are network-bound, and a timeout that fires on a slow provider would teach
+# people to ignore the result.
+dc_doctor_timeout: 120
+dc_doctor_report: >-
+  /tmp/openclaw-doctor-{{
+     ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt

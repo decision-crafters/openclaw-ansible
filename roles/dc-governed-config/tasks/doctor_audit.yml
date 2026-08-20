@@ -1,0 +1,133 @@
+---
+# The runtime's own health check, captured as governed evidence.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags doctor -e ansible_become=false
+#
+# READ-ONLY. `--fix` is never passed and the task asserts it is not.
+#
+# WHY THIS IS A TASK AND NOT A COMMAND SOMEONE TYPES
+#
+# On 2026-08-20 a closeout script invoked `openclaw doctor` directly. It emitted
+# nothing and HUNG, holding the terminal until interrupted — the same failure
+# `plugins list` produced when it did not exist. On this build an unrecognised
+# or interactive subcommand does not reliably error; it waits on stdin.
+#
+# A hang is the worst failure mode available here, because it is indistinguishable
+# from work in progress. Nobody aborts a command they believe is still running.
+#
+# So every invocation below closes stdin and is bounded, and a timeout is
+# reported as INDETERMINATE — it says the check did not complete, NOT that the
+# host is unhealthy. Those are different claims and the report must not merge
+# them.
+#
+# `--fix` IS A MUTATION AND IS NEVER PASSED
+#
+# `doctor` is documented as "Health checks + quick fixes". The fixing mode
+# changes configuration at the call site, outside anything this role's audits
+# would see — the same shape as `agent --model`. This task passes only the bare
+# verb, and asserts on its own argv that no fix-like flag crept in, so the
+# prohibition survives an edit rather than resting on the author remembering.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# Ask the binary what it offers before running it. The role has inferred a CLI
+# shape wrong four times; every one was available from --help.
+- name: Discover what doctor offers
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['doctor', '--help'] }}"
+    stdin: ""
+  register: dc_dr_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Note whether doctor answered its own help
+  ansible.builtin.set_fact:
+    dc_dr_help_ok: "{{ (dc_dr_help.rc | default(1)) == 0 and (dc_dr_help.stdout | default('') | length) > 20 }}"
+    dc_dr_argv: "{{ dc_audit_cli + ['doctor'] }}"
+
+- name: Refuse to run doctor on a build that will not describe it
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw doctor --help` did not answer usably
+      (rc={{ dc_dr_help.rc | default('?') }}). Running the bare verb would risk
+      the hang that motivated this task. INSUFFICIENT EVIDENCE — nothing was run.
+  when:
+    - not (dc_dr_help_ok | bool)
+    - dc_fail_closed | bool
+
+# The prohibition, asserted on the argv actually about to be executed rather
+# than trusted to the author. Same pattern as the model-override gate.
+- name: Refuse any fix-like flag in the invocation
+  ansible.builtin.fail:
+    msg: >-
+      The doctor invocation contains a mutating flag: {{ dc_dr_argv }}.
+      `doctor --fix` changes configuration at the call site, outside what the
+      config audits observe. This task is evidence capture, not repair.
+  when:
+    - dc_dr_argv | select('search', '^--(fix|repair|write|apply)') | list | length > 0
+    - dc_fail_closed | bool
+
+- name: Run the health check
+  ansible.builtin.command:
+    argv: "{{ dc_dr_argv }}"
+    stdin: ""
+  register: dc_dr_run
+  changed_when: false
+  failed_when: false
+  timeout: "{{ dc_doctor_timeout }}"
+
+# A timeout says the CHECK did not complete. It does not say the host is
+# unhealthy, and it must never be reported as though it did.
+- name: Classify what doctor returned
+  ansible.builtin.set_fact:
+    dc_dr_state: >-
+      {{ 'INDETERMINATE — doctor did not complete within '
+         ~ dc_doctor_timeout ~ 's. This says the CHECK did not finish, NOT that
+         the host is unhealthy. On this build the verb can wait on stdin.'
+         if (dc_dr_run.rc | default(1)) == 124
+         else ('COMPLETED rc=' ~ (dc_dr_run.rc | default('?')))
+              ~ (' — doctor reports problems; read them below, they are the
+                 runtime''s own assessment and not this role''s'
+                 if (dc_dr_run.rc | default(0)) != 0 else ' — no problems reported') }}
+
+- name: Write the health report
+  ansible.builtin.copy:
+    content: |
+      # openclaw doctor — host {{ inventory_hostname }}
+      # Captured {{ ansible_facts['date_time'].iso8601 }}
+      # Read-only: --fix was not passed.
+      # State: {{ dc_dr_state }}
+
+      === stdout ===
+      {{ dc_dr_run.stdout | default('(none)') }}
+
+      === stderr ===
+      {{ dc_dr_run.stderr | default('(none)') }}
+    dest: "{{ dc_doctor_report }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Report the health check
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['DC-DOCTOR — ' ~ dc_dr_state,
+          'report=' ~ dc_doctor_report,
+          '--- doctor output ---']
+         + ((dc_dr_run.stdout | default('') | regex_findall('(?m)^.*$'))
+            | reject('match', '^\s*$') | map('truncate', 200) | list
+            | default(['(no output)'], true)) }}
+
+- name: Emit the doctor receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-DOCTOR RECEIPT | {{ dc_dr_state }} | report={{ dc_doctor_report }} |
+      This is the RUNTIME'S OWN assessment, not this role's. A clean doctor does
+      not mean the governed posture is correct — doctor knows nothing about
+      Decision Crafters controls — and a dirty one may flag things this
+      deployment has accepted deliberately. Read it alongside --tags audit,
+      never instead of it. |
+      wrote_no_config=true restarted_nothing=true passed_no_fix_flag=true
