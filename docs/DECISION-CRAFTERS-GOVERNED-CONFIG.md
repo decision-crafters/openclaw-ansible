@@ -114,14 +114,45 @@ that removes the service user from the root-equivalent `docker` group.
 ## Tests
 
 ```bash
-python3 tests/dc_merge_contract.py
+python3 tests/dc_merge_contract.py            # 153 checks
+python3 tests/dc_slack_binding.py             #  27 checks
+python3 tests/dc_scheduler_grant.py           #  20 checks
+python3 tests/dc_evidence_contract.py         #  11 checks
+python3 tests/dc_model_override_contract.py   #  36 checks
 ```
 
-22 checks in two groups. **Contract** checks prove the merge overrides
-permissive values and preserves everything else. **Floor** checks prove the
-configured values are themselves safe — without them the suite would pass with
-`dc_sandbox_mode: "off"`, since every contract check compares the result against
-the role's own defaults.
+**Merge contract.** *Contract* checks prove the merge overrides permissive
+values and preserves everything else. *Floor* checks prove the configured
+values are themselves safe — without them the suite would pass with
+`dc_sandbox_mode: "off"`, since every contract check compares the result
+against the role's own defaults. It also refuses deployment identifiers in
+tracked files, because this repository is public and the role is used with a
+private inventory.
+
+**Slack binding.** Renders the real Jinja expression from the task file rather
+than a copy of it. Asserts the peer-kind mapping, that ids are not case-folded,
+that every `config patch` restarts the Gateway, and that the guards are
+fail-closed and run before the write.
+
+**Evidence contract.** Any check that answers a present-tense question from an
+append-only source must anchor to the marker separating before from after,
+refuse a source too small to be evidence, and declare each derived fact
+*cumulative* or *present*. Unanchored, a log query returns the union of every
+past state, which reads as "everything is true" and is true of no moment.
+
+**Model-override contract.** `openclaw agent --model <id>` overrides an agent's
+configured model at the call site — it lives in the CLI, not in
+`openclaw.json`, so configuration auditing cannot see it. The role default-denies
+it structurally: one gate may emit the flag, it emits nothing unless a
+task-bound single-use grant validates, and no other task file has a code path
+that produces it. Includes a widened-window concurrency control.
+
+### A note on how these were verified
+
+Each was checked by **reintroducing the defect it exists for** and confirming
+the suite fails, then restoring. A control that has never been observed to fail
+has not been tested, only written — and two of these passed identically against
+correct and broken implementations until that step was applied.
 
 ## Provenance
 
