@@ -1,0 +1,254 @@
+---
+# TASK-226 closure evidence — the two required read-only host receipts.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags memory-evidence -e ansible_become=false
+#
+# READ-ONLY. No backend installed or switched, no QMD enablement, no migration,
+# no purge, no credential, no Gateway restart, no config write.
+#
+# WHAT THIS CLOSES
+#
+# TASK-226 is Review / Founder-Accepted. The POSTURE is settled. Its recorded
+# blocker names two receipts, and neither was fully in hand:
+#
+#   `openclaw plugins inspect memory-core`     — never run by this repository
+#   live memory-related `config schema` output — captured in part by
+#                                                --tags schema-evidence
+#
+# "In part" is the whole problem. schema-evidence captured 183 agent-scoped
+# memory paths with type and description. It did NOT capture what this host has
+# CONFIGURED, because no memory path had ever appeared in dc_audit_paths. The
+# schema says what MAY be set; this play asks what IS.
+#
+# THE SHARP EDGE
+#
+# The live schema documents memorySearch.provider as "Defaults to openai". The
+# accepted posture is local-first, with LanceDB and Honcho research-gated
+# PRECISELY BECAUSE their external data path is unproven. If memory search is
+# enabled and provider is unset, embeddings for a governed research agent leave
+# this host — and until this play, nobody had asked.
+#
+# The answer may well be that memory search is off and the default is inert.
+# That is a fine outcome. What was not acceptable is not knowing.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# --- RECEIPT A ----------------------------------------------------------------
+#
+# Delegated to the generic play rather than issued here. TASK-226's receipt is
+# then a USE of a governed capability instead of a bespoke command, and the next
+# plugin needing classification — TASK-227's whole subject — reuses it.
+- name: Capture the plugin inspection receipt
+  ansible.builtin.include_tasks: plugin_inspect.yml
+  vars:
+    dc_plugin_inspect_targets: ["{{ dc_memory_accepted_backend }}"]
+
+- name: Isolate the accepted backend's inspection
+  ansible.builtin.set_fact:
+    # Parenthesised deliberately. `a + [{}] | first` binds `| first` to the
+    # literal, not the sum, and fails with "can only concatenate list (not
+    # dict) to list" at ARG FINALIZATION -- before failed_when can see it.
+    dc_me_inspect: >-
+      {{ (((dc_pi_inspect.results | default([]))
+           | selectattr('item', 'equalto', dc_memory_accepted_backend)
+           | list) + [{}]) | first }}
+
+# --- RECEIPT B ----------------------------------------------------------------
+- name: Read the effective memory configuration
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', item] }}"
+    stdin: ""
+  register: dc_me_effective
+  changed_when: false
+  failed_when: false
+  timeout: 30
+  loop: >-
+    {{ dc_audit_paths | select('search',
+       '^(memory|plugins[.]slots[.]memory|agents[.]defaults[.]memorySearch)') | list }}
+  loop_control:
+    label: "{{ item }}"
+
+- name: Read the deployed agents
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+    stdin: ""
+  register: dc_me_agents
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# agents.list[] may override agents.defaults, so reading only the defaults would
+# report a posture the governed agent does not necessarily run under — the same
+# mistake the model-path work made once by reading `main`'s sessions and
+# reporting the answer as though it covered dc-research.
+- name: Resolve the per-agent memory overrides
+  ansible.builtin.set_fact:
+    dc_me_per_agent: >-
+      {{ dict((dc_me_agents.stdout | default('[]') | from_json)
+              | map(attribute='id') | list
+              | zip((dc_me_agents.stdout | default('[]') | from_json)
+                    | map(attribute='memorySearch', default={}) | list)) }}
+  when: (dc_me_agents.rc | default(1)) == 0
+
+# Which plugin entries the schema declares. Needed for the ABSENCE TRAP: a
+# plugin absent from the schema exposes no configurable entry rather than being
+# absent, and a declared entry is not evidence of installation.
+- name: Read the declared plugin entries
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'plugins.entries'] }}"
+    stdin: ""
+  register: dc_me_entries
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+# Resolved from agents.list[].workspace, the same way competence_run.yml does
+# it. The first version composed the path from an invented
+# `dc_agent_workspace_root` that does not exist in this role -- and an undefined
+# variable in a `path:` fails at ARG FINALIZATION, which runs before
+# `failed_when` can see it. There is no workspace ROOT to compose from: the
+# workspace is a per-agent declared value, and `main` declares none at all.
+- name: Resolve the target agent's workspace
+  ansible.builtin.set_fact:
+    dc_me_workspace: >-
+      {{ (((dc_me_agents.stdout | default('[]') | from_json)
+           | selectattr('id', 'equalto', dc_agent_id)
+           | map(attribute='workspace', default='') | list) + ['']) | first }}
+
+# An agent with NO DECLARED WORKSPACE is a finding, not a blank row -- the
+# audit report already says so. The session-memory hook computes memoryDir from
+# workspaceDir, so an undeclared workspace means the hook's write destination is
+# UNKNOWN rather than absent.
+- name: Report an undeclared workspace
+  ansible.builtin.debug:
+    msg: >-
+      DC-MEMORY-EVIDENCE | {{ dc_agent_id }} declares no workspace, so its
+      memory directory cannot be located. The session-memory hook computes
+      memoryDir from workspaceDir, so its write destination is UNKNOWN — which
+      is a finding about the memory posture, not a missing field.
+  when: (dc_me_workspace | trim | length) == 0
+
+- name: Inspect the agent memory directory
+  ansible.builtin.stat:
+    path: "{{ dc_me_workspace }}/memory"
+  register: dc_me_memdir
+  when: (dc_me_workspace | trim | length) > 0
+
+- name: Assemble the evidence for the reader
+  ansible.builtin.copy:
+    content: >-
+      {{ {'effective': dict(dc_me_effective.results | map(attribute='item') | list
+                            | zip(dc_me_effective.results | map(attribute='stdout')
+                                  | map('default', '', true) | list)),
+          'per_agent': dc_me_per_agent | default({}),
+          'inspect': {'state': ('VERIFIED HOST'
+                                if (dc_me_inspect.rc | default(1)) == 0
+                                else 'inspect returned rc='
+                                     ~ (dc_me_inspect.rc | default('not run'))),
+                      'stdout': dc_me_inspect.stdout | default(''),
+                      'in_enumeration':
+                        dc_memory_accepted_backend in (dc_pi_names | default([]))},
+          'configured_plugin_entries':
+            ((dc_me_entries.stdout | default('{}') | from_json).keys() | list | sort
+             if (dc_me_entries.rc | default(1)) == 0 else []),
+          'memory_dir': {'path': (dc_me_memdir.stat | default({})).get('path', ''),
+                         'exists': (dc_me_memdir.stat | default({})).get('exists', false),
+                         'owner': (dc_me_memdir.stat | default({})).get('pw_name', '?'),
+                         'mode': (dc_me_memdir.stat | default({})).get('mode', '?')}} | to_json }}
+    dest: "{{ dc_memory_evidence_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Stage the posture reader
+  ansible.builtin.copy:
+    src: memory_posture.py
+    dest: "{{ dc_memory_reader_path }}"
+    owner: root
+    group: root
+    mode: '0555'
+  changed_when: false
+
+# failed_when: false is load-bearing. rc=1 means FINDINGS WERE PRESERVED, which
+# is a successful run: TASK-226 closes only if the evidence agrees, and a play
+# that aborted on the first disagreement could never report what disagreed.
+# Only rc=2, INSUFFICIENT EVIDENCE, is a failure — asserted separately below.
+- name: Reconcile the evidence against the accepted posture
+  ansible.builtin.command:
+    argv:
+      - python3
+      - "{{ dc_memory_reader_path }}"
+      - --evidence
+      - "{{ dc_memory_evidence_path }}"
+      - --accepted-backend
+      - "{{ dc_memory_accepted_backend }}"
+      - --provider-default
+      - "{{ dc_memory_provider_documented_default }}"
+      - --local-providers
+      - "{{ dc_memory_local_providers | join(',') }}"
+  register: dc_me_result
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Remove the staged files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ dc_memory_evidence_path }}"
+    - "{{ dc_memory_reader_path }}"
+  changed_when: false
+
+- name: Refuse to report a posture the reader could not reconcile
+  ansible.builtin.fail:
+    msg: >-
+      The posture reader returned rc={{ dc_me_result.rc | default('?') }}:
+      {{ dc_me_result.stderr | default('') | trim }}
+      rc=2 means the evidence was unreadable or a required receipt was missing,
+      so nothing was reconciled. INSUFFICIENT EVIDENCE — this is NOT a finding
+      that the posture is wrong, and TASK-226 must not be closed from it.
+  when:
+    - (dc_me_result.rc | default(2)) not in [0, 1]
+    - dc_fail_closed | bool
+
+- name: Write the memory posture report
+  ansible.builtin.copy:
+    dest: "{{ dc_memory_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      TASK-226 MEMORY POSTURE EVIDENCE
+      host={{ inventory_hostname }} generated={{ ansible_facts['date_time'].iso8601 }}
+      READ-ONLY: no backend switch, no QMD, no migration, no purge, no restart
+
+      Receipt A artifact: {{ dc_plugin_inspect_report }}
+
+      {{ dc_me_result.stdout | default('<reader produced no output>') }}
+      {{ dc_me_result.stderr | default('') }}
+  changed_when: false
+
+- name: Show the posture reconciliation
+  ansible.builtin.debug:
+    msg: "{{ dc_me_result.stdout_lines | default(['<no output>']) }}"
+
+- name: Emit the memory-evidence receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-MEMORY-EVIDENCE RECEIPT (TASK-226) |
+      receipt_A={{ 'captured' if (dc_me_inspect.rc | default(1)) == 0
+                   else 'INDETERMINATE — the check did not complete; NOT a
+                        finding that the plugin is absent' }} |
+      receipt_B=effective config read for
+      {{ dc_me_effective.results | default([]) | length }} memory path(s) |
+      reader_rc={{ dc_me_result.rc | default('?') }}
+      ({{ 'evidence agrees with the accepted posture' if (dc_me_result.rc | default(9)) == 0
+          else 'FINDINGS PRESERVED — read them before closing anything' }}) |
+      report={{ dc_memory_report }} |
+      CRITERION 5 IS NOT SATISFIABLE ON THIS HOST regardless of the above, and a
+      zero-finding run does NOT mean isolation was proven. |
+      THIS IS EVIDENCE, NOT ACCEPTANCE. TASK-226 State is unchanged.

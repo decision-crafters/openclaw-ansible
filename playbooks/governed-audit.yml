@@ -176,3 +176,34 @@
         tasks_from: schema_evidence
   tags:
     - schema-evidence
+
+# Generic, reusable plugin enumeration and inspection. Read-only. Empty target
+# list by default: a play that inspected a built-in set would be classifying a
+# set nobody chose. Replaces the hand-pasted 2026-08-16 inventory with a
+# re-runnable, diffable artifact.
+- name: Enumerate and inspect plugins
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Capture the plugin inventory
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: plugin_inspect
+  tags:
+    - plugin-inspect
+
+# TASK-226 closure evidence. Read-only: both required receipts, plus the
+# effective memory configuration that no audit path had ever read. Criterion 5
+# is answered NOT SATISFIABLE on this host and says so regardless of outcome.
+- name: Capture the memory posture evidence
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Reconcile memory evidence against the accepted posture
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: memory_evidence
+  tags:
+    - memory-evidence

@@ -867,6 +867,37 @@ dc_audit_paths:
   # agents.list[].heartbeat. Recorded because this session initially had it
   # wrong in the other direction.
   - agents.defaults.heartbeat
+  # --- memory surface --------------------------------------------------------
+  #
+  # Absent from this list until 2026-08-25, and the omission is why TASK-226's
+  # second required receipt could not be produced: the SCHEMA for memory was
+  # captured by --tags schema-evidence, but nothing anywhere read what this host
+  # has CONFIGURED. Those are different questions and only the first was asked.
+  #
+  # The sharp edge is `memorySearch.provider`. The live schema documents it as
+  # "Defaults to openai". The accepted TASK-226 posture is local-first, with
+  # LanceDB and Honcho research-gated precisely because their external data path
+  # is unproven. If memory search is enabled and provider is unset, embeddings
+  # for a governed research agent leave this host — and nobody has asked.
+  #
+  # `<unset>` here means NOT CONFIGURED. It does not mean inactive, and for
+  # provider it specifically means the documented default is in force.
+  - memory
+  - memory.backend
+  - plugins.slots.memory
+  - agents.defaults.memorySearch
+  - agents.defaults.memorySearch.enabled
+  - agents.defaults.memorySearch.provider
+  - agents.defaults.memorySearch.model
+  - agents.defaults.memorySearch.fallback
+  - agents.defaults.memorySearch.local.modelPath
+  # The two the TASK-226 Observer return said must default closed. Named so that
+  # "closed" is observed rather than assumed.
+  - agents.defaults.memorySearch.extraPaths
+  - agents.defaults.memorySearch.experimental.sessionMemory
+  # Documented as uploading matching binary content — a second egress path on
+  # the same subsystem.
+  - agents.defaults.memorySearch.multimodal.enabled
 
 dc_audit_report_owner: "{{ lookup('env', 'SUDO_USER') | default('tosin', true) }}"
 dc_audit_report: "/tmp/openclaw-audit-{{ ansible_facts['date_time'].iso8601_basic_short | default('report') }}.txt"
@@ -1274,9 +1305,13 @@ dc_cli_surface_probes:
   - name: "hooks"
     argv: ["hooks", "--help"]
     requires: []
+  # `requires` was empty until 2026-08-25, so nothing confirmed the subverbs
+  # exist -- and TASK-226's required receipt is `plugins inspect memory-core`.
+  # `plugins list` HUNG on this build once and was recorded as the subcommand
+  # not existing, which is exactly the confusion this probe removes.
   - name: "plugins"
     argv: ["plugins", "--help"]
-    requires: []
+    requires: ["list", "inspect"]
   - name: "pairing"
     argv: ["pairing", "--help"]
     requires: []
@@ -1551,3 +1586,62 @@ dc_schema_surface_report: >-
 dc_schema_surface_raw_report: >-
   /tmp/openclaw-schema-raw-{{
      ansible_facts['date_time'].iso8601_basic_short | default('run') }}.json
+
+# --- Plugin enumeration and inspection ----------------------------------------
+#
+# EMPTY BY DEFAULT, and that is the control rather than an oversight. A generic
+# inspection play carrying a built-in target list would be classifying a set
+# nobody chose — the UNCHOSEN DEFAULT pattern this workstream has now recorded
+# seven times. The caller names its targets or gets an enumeration.
+dc_plugin_inspect_targets: []
+
+# `plugins list` HUNG on this build once and was recorded as the subcommand not
+# existing. Bounded so a hang becomes INDETERMINATE rather than an unattended
+# wait, and generous because enumeration reads 50 plugins from disk.
+dc_plugin_inspect_timeout: 90
+
+dc_plugin_inspect_report: >-
+  /tmp/openclaw-plugins-{{
+     ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+
+# --- Memory posture evidence (TASK-226 closure) -------------------------------
+#
+# The accepted posture, restated here as the thing the evidence is reconciled
+# AGAINST. Editing a value here to make a check pass is reconciling by
+# assumption — the same prohibited move TASK-225 criterion 1 names.
+dc_memory_accepted_backend: "memory-core"
+
+# The memory paths read per agent as well as at defaults. `agents.list` entries
+# may override `agents.defaults`, so reading only the defaults would report a
+# posture the governed agent does not necessarily run under.
+dc_memory_agent_paths:
+  - memorySearch
+  - memorySearch.enabled
+  - memorySearch.provider
+  - memorySearch.model
+  - memorySearch.fallback
+  - memorySearch.extraPaths
+  - memorySearch.experimental.sessionMemory
+  - memorySearch.multimodal.enabled
+
+# VERIFIED HOST, from the live schema description of memorySearch.provider:
+#   "Selects the embedding backend used to build/query memory vectors.
+#    Defaults to \"openai\"; set \"openai-compatible\", \"gemini\", \"voyage\", ..."
+#
+# Recorded as data so the reader can distinguish CONFIGURED from
+# UNSET-WITH-DOCUMENTED-DEFAULT. Those are different facts and only the second
+# is an unchosen default.
+dc_memory_provider_documented_default: "openai"
+
+# Providers that keep embeddings on this host. Used to classify the accepted
+# posture's local-first claim, NOT to enforce anything.
+dc_memory_local_providers:
+  - local
+  - ollama
+  - lmstudio
+
+dc_memory_reader_path: "/root/.dc-memory-posture.py"
+dc_memory_evidence_path: "/root/.dc-memory-evidence.json"
+dc_memory_report: >-
+  /tmp/openclaw-memory-posture-{{
+     ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
