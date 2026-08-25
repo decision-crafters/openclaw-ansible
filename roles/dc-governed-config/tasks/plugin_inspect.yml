@@ -1,0 +1,264 @@
+---
+# Governed plugin enumeration and inspection. READ-ONLY.
+#
+#   sudo ansible-playbook playbooks/governed-audit.yml \
+#     --tags plugin-inspect -e ansible_become=false
+#     [-e '{"dc_plugin_inspect_targets":["memory-core"]}']
+#
+# WHY THIS IS GENERIC RATHER THAN A MEMORY-CORE RECEIPT
+#
+# TASK-226 needs one thing from here: `plugins inspect memory-core`. Writing it
+# that way would produce a play that has to be rewritten the next time a plugin
+# needs classifying — and plugin classification is the entire subject of
+# TASK-227's supply-chain posture, so there will be a next time.
+#
+# THE AD-HOC PROBLEM THIS CLOSES
+#
+# This repository has never invoked `openclaw plugins inspect` at all. The
+# 50-plugin inventory recorded on TASK-225 came from a hand-pasted
+# `plugins list --enabled --verbose` on 2026-08-16 — which is exactly what that
+# page condemns elsewhere:
+#
+#   "Ad-hoc works once: it produces no re-runnable receipt, cannot be diffed
+#    against a previous run, and omits whatever the person typing did not think
+#    to ask for."
+#
+# So the enumeration is captured here as a diffable artifact. Agreement with the
+# hand-pasted record retroactively validates it; disagreement is a finding.
+#
+# THE HANG, WHICH IS THE MOST RELEVANT PRECEDENT
+#
+# `plugins list` HUNG on this build once and was recorded as the subcommand not
+# existing. That was wrong; the failure had another cause. On this build an
+# unrecognised or interactive subcommand does not reliably error — it waits on
+# stdin, and a hang is indistinguishable from work in progress.
+#
+# Every invocation therefore closes stdin, is bounded, and reports a timeout as
+# INDETERMINATE: the CHECK did not complete. That is NOT a finding that a plugin
+# is absent, and the report must never merge those two claims.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+# Ask the binary what it offers before running it. This role has inferred a CLI
+# shape wrong five times; every one of them was available from --help.
+- name: Discover what the plugins verb offers
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['plugins', '--help'] }}"
+    stdin: ""
+  register: dc_pi_help
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Record which plugin subverbs this build declares
+  ansible.builtin.set_fact:
+    dc_pi_has_list: >-
+      {{ (dc_pi_help.rc | default(1)) == 0
+         and 'list' in (dc_pi_help.stdout | default('')) }}
+    dc_pi_has_inspect: >-
+      {{ (dc_pi_help.rc | default(1)) == 0
+         and 'inspect' in (dc_pi_help.stdout | default('')) }}
+
+- name: Refuse to run plugin verbs on a build that will not describe them
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw plugins --help` did not answer usably
+      (rc={{ dc_pi_help.rc | default('?') }}). Invoking a subverb blind risks the
+      hang that this play exists to avoid. INSUFFICIENT EVIDENCE — nothing was
+      run, and this says nothing about which plugins are present.
+  when:
+    - (dc_pi_help.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+# --- 1. enumerate -------------------------------------------------------------
+- name: Enumerate the enabled plugins
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['plugins', 'list', '--enabled', '--verbose'] }}"
+    stdin: ""
+  register: dc_pi_list
+  changed_when: false
+  failed_when: false
+  timeout: "{{ dc_plugin_inspect_timeout }}"
+  when: dc_pi_has_list | bool
+
+# A timeout and an empty inventory are indistinguishable in a report unless the
+# report says which it is. This is the same discipline the cron listing applies
+# to "no jobs" versus "no answer".
+# The short name is the PARENTHESISED one, not the package name:
+#
+#   @openclaw/alibaba-provider (alibaba) enabled
+#     format: openclaw
+#     origin: bundled
+#
+# The first version of this regex anchored at line start and matched nothing,
+# because every line begins with `@` or two spaces. It then reported
+# `enumeration=VERIFIED HOST | plugins_enumerated=0` against a host running 50 —
+# a receipt that reads as "no plugins are enabled" when it means "the parser
+# failed". The impossibility guard below exists because of that run.
+- name: Parse the enumeration
+  ansible.builtin.set_fact:
+    dc_pi_names: >-
+      {{ (dc_pi_list.stdout | default('')
+          | regex_findall('\(([a-z0-9][a-z0-9._-]*)\)\s+enabled')
+          | unique | sort) if (dc_pi_list.rc | default(1)) == 0 else [] }}
+    dc_pi_declared_total: >-
+      {{ ((dc_pi_list.stdout | default('')
+           | regex_findall('Plugins \((\d+)/\d+ enabled\)')) + ['?']) | first }}
+
+- name: Classify the enumeration outcome
+  ansible.builtin.set_fact:
+    dc_pi_list_state: >-
+      {{ 'UNAVAILABLE — this build does not declare `plugins list`'
+         if not (dc_pi_has_list | bool)
+         else ('INDETERMINATE — the command did not complete within '
+               ~ dc_plugin_inspect_timeout ~ 's. The CHECK did not finish; this
+               is NOT a finding that no plugins are enabled.'
+               if (dc_pi_list.rc | default(1)) != 0
+               else ('INDETERMINATE — the command SUCCEEDED and no plugin name
+                      could be parsed from its output. That combination is
+                      impossible on a running Gateway, so it means the OUTPUT
+                      FORMAT CHANGED, not that no plugins are enabled.'
+                     if (dc_pi_names | length) == 0
+                     else 'VERIFIED HOST')) }}
+
+# THE IMPOSSIBILITY RULE, applied rather than described. A successful command
+# and an empty inventory cannot both be true of a live Gateway; a report able to
+# state both has not verified itself. The evidence contract already carries this
+# rule for log windows -- this is the same defect on a different source.
+- name: Refuse an enumeration that succeeded and found nothing
+  ansible.builtin.fail:
+    msg: >-
+      `plugins list` returned rc=0 and zero plugin names were parsed from
+      {{ dc_pi_list.stdout | default('') | length }} bytes of output. Those
+      cannot both be true on a running Gateway. The parser is wrong, or the
+      output format changed. INSUFFICIENT EVIDENCE — reporting this as an empty
+      inventory would read as a finding that no plugins are enabled.
+  when:
+    - dc_pi_has_list | bool
+    - (dc_pi_list.rc | default(1)) == 0
+    - (dc_pi_names | length) == 0
+    - dc_fail_closed | bool
+
+# A second, independent count from the runtime's own header. If the parsed names
+# and the runtime's total disagree, the parse is partial -- which is the quiet
+# version of the failure above and would otherwise pass unnoticed.
+- name: Report a partial parse
+  ansible.builtin.debug:
+    msg: >-
+      DC-PLUGIN-INSPECT | PARTIAL PARSE — the runtime reports
+      {{ dc_pi_declared_total }} enabled plugins and
+      {{ dc_pi_names | length }} name(s) were parsed. The inventory below is
+      INCOMPLETE and any "absent from the enumeration" finding derived from it
+      is unsafe.
+  when:
+    - dc_pi_declared_total != '?'
+    - (dc_pi_declared_total | int) != (dc_pi_names | length)
+
+# --- 2. inspect the named targets --------------------------------------------
+#
+# Empty by default. A generic play that inspected a built-in list would be
+# inspecting a set nobody chose — the UNCHOSEN DEFAULT pattern this workstream
+# has recorded seven times. The caller names its targets or gets an enumeration.
+- name: Report when no inspection target was named
+  ansible.builtin.debug:
+    msg: >-
+      DC-PLUGIN-INSPECT | no targets named, so nothing was inspected. This is
+      the enumeration-only mode and is a complete result, not a partial one.
+      Pass dc_plugin_inspect_targets to classify a plugin.
+  when: (dc_plugin_inspect_targets | default([]) | length) == 0
+
+- name: Refuse to inspect on a build that does not declare the subverb
+  ansible.builtin.fail:
+    msg: >-
+      dc_plugin_inspect_targets names
+      {{ dc_plugin_inspect_targets | join(', ') }}, but this build's
+      `plugins --help` does not list an `inspect` subverb. INSUFFICIENT
+      EVIDENCE — no classification is available, and absence of the verb is not
+      absence of the plugin.
+  when:
+    - (dc_plugin_inspect_targets | default([]) | length) > 0
+    - not (dc_pi_has_inspect | bool)
+    - dc_fail_closed | bool
+
+# Checked against the enumeration BEFORE inspecting. An inspection that returns
+# nothing for a name that was never enabled reads identically to one that
+# returns nothing for a name that is — and only the second is a finding.
+- name: Note which targets the enumeration did not list
+  ansible.builtin.set_fact:
+    dc_pi_missing: >-
+      {{ (dc_plugin_inspect_targets | default([]))
+         | reject('in', dc_pi_names | default([])) | list }}
+  when: (dc_pi_list.rc | default(1)) == 0
+
+- name: Report targets absent from the enumeration
+  ansible.builtin.debug:
+    msg: >-
+      DC-PLUGIN-INSPECT | {{ dc_pi_missing | join(', ') }} did not appear in the
+      enabled enumeration. Inspection still runs and its result is reported, but
+      an empty inspection for these names must NOT be read as a classification —
+      it is consistent with the plugin being absent, disabled, or named
+      differently, and this line exists so those are not merged.
+  when: (dc_pi_missing | default([]) | length) > 0
+
+- name: Inspect each named plugin
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['plugins', 'inspect', item] }}"
+    stdin: ""
+  register: dc_pi_inspect
+  changed_when: false
+  failed_when: false
+  timeout: "{{ dc_plugin_inspect_timeout }}"
+  loop: "{{ dc_plugin_inspect_targets | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - (dc_plugin_inspect_targets | default([]) | length) > 0
+    - dc_pi_has_inspect | bool
+
+# --- report -------------------------------------------------------------------
+- name: Write the plugin inventory and inspections
+  ansible.builtin.copy:
+    dest: "{{ dc_plugin_inspect_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+    content: |
+      OPENCLAW PLUGIN INVENTORY AND INSPECTION
+      host={{ inventory_hostname }} generated={{ ansible_facts['date_time'].iso8601 }}
+      READ-ONLY: no plugin installed, enabled, disabled or configured
+
+      subverbs declared by this build: list={{ dc_pi_has_list }} inspect={{ dc_pi_has_inspect }}
+      enumeration: {{ dc_pi_list_state }}
+      plugins named by the enumeration: {{ dc_pi_names | default([]) | length }}
+
+      === enabled plugins (--enabled --verbose) ===
+      {{ dc_pi_list.stdout | default('(not captured — see enumeration state above)') }}
+
+      === inspections ===
+      {% for r in dc_pi_inspect.results | default([]) %}
+      --- {{ r.item }} ---
+      {{ 'INDETERMINATE — inspect did not complete. The CHECK did not finish;
+          this is NOT evidence the plugin is absent.'
+         if (r.rc | default(1)) != 0 else r.stdout | default('(no output)') }}
+
+      {% endfor %}
+      === reading this ===
+      A plugin ABSENT from the enumeration is not proven absent from the host —
+      the enumeration lists ENABLED plugins, and a disabled plugin is installed.
+      A plugin present in the CONFIG SCHEMA is not proven installed either: the
+      schema declares what MAY be configured, not what is loaded.
+  changed_when: false
+
+- name: Emit the plugin-inspect receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-PLUGIN-INSPECT RECEIPT |
+      enumeration={{ dc_pi_list_state }} |
+      plugins_enumerated={{ dc_pi_names | default([]) | length }} |
+      targets={{ dc_plugin_inspect_targets | default([]) | join(', ') | default('(none)', true) }} |
+      not_in_enumeration={{ dc_pi_missing | default([]) | join(', ') | default('(none)', true) }} |
+      report={{ dc_plugin_inspect_report }} |
+      Replaces the hand-pasted 2026-08-16 inventory with a re-runnable, diffable
+      artifact. A difference against that record is a FINDING; agreement
+      retroactively validates it.

@@ -120,6 +120,7 @@ python3 tests/dc_scheduler_grant.py           #  20 checks
 python3 tests/dc_evidence_contract.py         #  11 checks
 python3 tests/dc_model_override_contract.py   #  36 checks
 python3 tests/dc_schema_surface.py             #  51 checks
+python3 tests/dc_memory_evidence.py           #  60 checks
 ```
 
 **Merge contract.** *Contract* checks prove the merge overrides permissive
@@ -153,6 +154,27 @@ So a row may now declare `agent_ref_markers` (exact root keys that route by
 agent id), `narrows_via` (delegation to another row, honoured only when that row
 is itself CONFIRMED), and `exclude_markers`. All four false positives are
 reproduced as regression fixtures.
+
+**Memory evidence.** Closes TASK-226's two required host receipts
+(`--tags memory-evidence`), with `--tags plugin-inspect` as the reusable half:
+this repository had never invoked `openclaw plugins inspect` at all, and the
+50-plugin inventory came from a hand-paste that cannot be diffed.
+
+Three misreads are available here and each produces clean-looking output, so
+each is reproduced as a fixture. `memorySearch.provider` unset is reported as
+**the documented `openai` default**, never as a blank — the accepted posture is
+local-first, and a blank hides an external data path inside it. Absence from the
+config schema means **no configurable entry**, not absence from the host;
+`memory-core` is in neither the schema nor any deny list and was observed
+enabled. A timed-out `plugins inspect` is `INDETERMINATE`, never "plugin
+absent" — `plugins list` hung on this build once and was recorded as the
+subcommand not existing.
+
+Criterion 5 (memory isolation testable in the admission suite) is fixed output:
+**NOT SATISFIABLE** on this host, because cross-coordinate isolation needs two
+coordinates and the second agent is an admission decision. The tests assert it
+says so on a clean run, a finding run, and an indeterminate run alike — a
+zero-finding run is not a proof of isolation.
 
 **Slack binding.** Renders the real Jinja expression from the task file rather
 than a copy of it. Asserts the peer-kind mapping, that ids are not case-folded,
