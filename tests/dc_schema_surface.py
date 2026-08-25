@@ -339,6 +339,28 @@ def main() -> int:
         "the unmapped-roots list states it is a floor and not a ceiling",
         "floor on what is unmapped, never a ceiling" in reader))
 
+    # --- 13. unmapped roots are PROFILED, not just named ---------------------
+    # Deciding whether a surface needs a map row from a one-line description is
+    # how `memory_scope` became a governance field with no runtime key. The
+    # decisive fact is whether an unmapped surface has a PER-AGENT narrowing --
+    # a control the map has never considered, scoped per agent.
+    sch3 = base_schema()
+    sch3["properties"]["acp"] = {"type": "object", "properties": {
+        "backend": {"type": "string"}, "allowedAgents": {"type": "array"}}}
+    sch3["$defs"]["Agent"]["properties"]["runtime"] = {
+        "type": "object", "properties": {"acp": {"type": "object"}}}
+    rc, out, _ = run(sch3, [ROW_TOOLS_YES])
+    checks.append((
+        "an unmapped root reports its sub-path and agent-scoped counts",
+        "sub-paths:" in out and "agent-scoped:" in out))
+    checks.append((
+        "a per-agent narrowing on an UNMAPPED surface is called out explicitly",
+        "PER-AGENT NARROWING EXISTS FOR AN UNMAPPED SURFACE" in out
+        and "agents.list.runtime.acp" in out))
+    checks.append((
+        "an unmapped root lists its immediate child keys for triage",
+        "keys:" in out and "allowedAgents" in out))
+
     failed = [n for n, ok in checks if not ok]
     for n, ok in checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {n}")

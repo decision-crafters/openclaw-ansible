@@ -119,7 +119,7 @@ python3 tests/dc_slack_binding.py             #  27 checks
 python3 tests/dc_scheduler_grant.py           #  20 checks
 python3 tests/dc_evidence_contract.py         #  11 checks
 python3 tests/dc_model_override_contract.py   #  36 checks
-python3 tests/dc_schema_surface.py             #  48 checks
+python3 tests/dc_schema_surface.py             #  51 checks
 ```
 
 **Merge contract.** *Contract* checks prove the merge overrides permissive

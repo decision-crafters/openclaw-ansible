@@ -452,12 +452,42 @@ def main() -> int:
     add("list is therefore a floor on what is unmapped, never a ceiling, and it")
     add("says so rather than letting the omission read as completeness.")
     add("")
+    add("Each root is PROFILED rather than merely named. Deciding whether a")
+    add("surface needs a map row from its one-line description alone is how")
+    add("`memory_scope` became a governance field with no runtime key. The two")
+    add("facts that actually decide it are how much surface is there, and")
+    add("whether any of it is PER-AGENT.")
+    add("")
+    add("`agent-scoped: N` on an unmapped root is the strongest signal in this")
+    add("report. It means the build declares a per-agent narrowing for a")
+    add("subsystem the control-surface map has never considered at all.")
+    add("")
     if unmapped:
         for r in unmapped[:MAX_PATHS_PER_ROW]:
-            d = declared[r]["desc"][:160]
+            d = declared[r]["desc"][:300]
+            sub = sorted(q for q in declared if q.startswith(r + "."))
+            ascoped = sorted(
+                q for q in declared
+                if q.startswith(AGENT_PREFIXES)
+                and r.lower() in q[q.index(".", q.index(".") + 1) + 1:].lower())
             add(f"  [UNMAPPED] {r}  :: {declared[r]['type']}")
             if d:
                 add(f"      {d}")
+            add(f"      sub-paths: {len(sub)}   agent-scoped: {len(ascoped)}")
+            if ascoped:
+                add("      PER-AGENT NARROWING EXISTS FOR AN UNMAPPED SURFACE:")
+                for q in ascoped[:8]:
+                    add(f"        [VERIFIED HOST] {q}")
+                if len(ascoped) > 8:
+                    add(f"        ... {len(ascoped) - 8} more NOT shown — cap reached.")
+            # Immediate children only. The full tree is in the raw artifact; what
+            # a triage needs is the shape, not every leaf.
+            kids = [q for q in sub if q.count(".") == r.count(".") + 1]
+            if kids:
+                shown = ", ".join(q.split(".")[-1] for q in kids[:12])
+                more = f" (+{len(kids) - 12} more)" if len(kids) > 12 else ""
+                add(f"      keys: {shown}{more}")
+            add("")
         if len(unmapped) > MAX_PATHS_PER_ROW:
             add(f"  ... {len(unmapped) - MAX_PATHS_PER_ROW} further unmapped root(s) "
                 "NOT shown — cap reached.")
