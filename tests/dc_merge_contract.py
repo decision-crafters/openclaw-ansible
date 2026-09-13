@@ -855,6 +855,35 @@ def _inject_exit(mod, work: list[str], transcript: bool = False) -> int:
             sys.argv = argv
 
 
+def _when_regex_search_is_boolean(tasks_dir) -> bool:
+    """Walk every task file; for each `when` item containing regex_search, require an
+    explicit boolean comparison (`is not none`, `is none`) or negation (`not (`)."""
+    import yaml  # noqa: PLC0415
+
+    def items(node):
+        if isinstance(node, dict):
+            w = node.get("when")
+            if w is not None:
+                for x in (w if isinstance(w, list) else [w]):
+                    if isinstance(x, str):
+                        yield x
+            for v in node.values():
+                yield from items(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from items(v)
+
+    for f in sorted(tasks_dir.glob("*.yml")):
+        try:
+            doc = yaml.safe_load(f.read_text(errors="ignore"))
+        except yaml.YAMLError:
+            return False
+        for w in items(doc):
+            if "regex_search" in w and not ("is not none" in w or "is none" in w or "not (" in w):
+                return False
+    return True
+
+
 def scheduler_floors() -> list[tuple[str, bool]]:
     """The accepted NO_SCHEDULER posture, expressed as things that must hold.
 
@@ -1030,6 +1059,14 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          d.get("dc_mcp_command_mode") == "0700"
          and "!= dc_mcp_command_mode" in (tasks / "mcp_register.yml").read_text(errors="ignore")
          and "gr_name | default('')) != dc_openclaw_user" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        # A `when` item that ends in regex_search yields str/None, which this
+        # Ansible build rejects as a broken conditional ("Conditionals must
+        # have a boolean result") — observed live on 2026-09-13 in both MCP
+        # plays: the refusal never fired, the play crashed instead. Every
+        # regex_search inside a `when` must be compared with `is not none` /
+        # `is none` (or negated), so the gate is a boolean by construction.
+        ("CONDITIONALS every regex_search inside a when clause yields a boolean",
+         _when_regex_search_is_boolean(tasks)),
         ("MCP-WRAPPER no artifact path is baked into this public repo",
          d.get("dc_mcp_wrapper_path") == ""),
         ("MCP-WRAPPER the placement play exists, is tagged, installs nothing and never reads the env file",

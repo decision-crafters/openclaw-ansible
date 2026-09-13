@@ -109,7 +109,7 @@
       artifact by a person; an unfilled template cannot be applied.
       Nothing has been changed.
   when:
-    - dc_mcp_add.server | to_json | regex_search('<[^>]*>')
+    - (dc_mcp_add.server | to_json | regex_search('<[^>]*>')) is not none
     - dc_fail_closed | bool
 
 - name: Refuse an artifact that carries anything shaped like a secret
@@ -121,8 +121,8 @@
       0600 env file and never in a repository artifact. Nothing has been changed.
   when:
     - >-
-      (dc_mcp_add.server | to_json | regex_search('[A-Za-z0-9_-]{40,}'))
-      or (dc_mcp_add.server | to_json | regex_search('(secret_|ntn_)[A-Za-z0-9]'))
+      ((dc_mcp_add.server | to_json | regex_search('[A-Za-z0-9_-]{40,}')) is not none)
+      or ((dc_mcp_add.server | to_json | regex_search('(secret_|ntn_)[A-Za-z0-9]')) is not none)
     - dc_fail_closed | bool
 
 - name: Refuse a filter that is not an explicit, bounded include

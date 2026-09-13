@@ -95,7 +95,7 @@
   when:
     - >-
       ({'wrapper': dc_mcpw.wrapper, 'env_file': dc_mcpw.env_file, 'server_package': dc_mcpw.server_package}
-       | to_json | regex_search('<[^>]*>'))
+       | to_json | regex_search('<[^>]*>')) is not none
     - dc_fail_closed | bool
 
 # --- the wrapper source: the reviewed bytes, and nothing secret in them --------
