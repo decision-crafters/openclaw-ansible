@@ -151,7 +151,9 @@
   register: dc_mcp_cmd
   become: true
   become_user: "{{ dc_openclaw_user }}"
-  when: (dc_mcp_add.server.transport | default('stdio')) == 'stdio' and (dc_mcp_add.server.command | default('') | length) > 0
+  when:
+    - (dc_mcp_add.server.transport | default('stdio')) == 'stdio'
+    - (dc_mcp_add.server.command | default('') | length) > 0
 
 - name: Refuse a stdio server whose command is absent, not executable, or not the service account's
   ansible.builtin.fail:
