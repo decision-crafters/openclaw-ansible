@@ -163,3 +163,20 @@
         tasks_from: tool_surface_probe
   tags:
     - tool-surface
+
+# Add tool denies to ONE deployed agent's entry, additively — the founder's
+# `main` agent has no `tools` block and agent_profile.yml would replace it.
+# Every field outside tools.deny is asserted preserved before the dry run;
+# the whole list is written back with the target replaced in place. Restarts
+# the Gateway. Dry run by default; -e dc_apply=true to write.
+- name: Add tool denies to a deployed agent
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Apply the additive deny
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: agent_deny_add
+  tags:
+    - deny-add

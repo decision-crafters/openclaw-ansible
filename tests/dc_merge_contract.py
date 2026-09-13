@@ -932,6 +932,27 @@ def scheduler_floors() -> list[tuple[str, bool]]:
               "agents.defaults.heartbeat"))),
         ("SCHEDULER both Automation tools are on the worker floor",
          "cron" in required and "heartbeat_respond" in required),
+        # Same gap, one surface over. `mcp.servers.<name>` is Gateway-wide and
+        # a registered server is callable by every agent that does not deny it
+        # (TASK-225). The 2026-09-13 TASK-323 host baseline needed "no MCP
+        # server is registered" as an observation and this audit could not
+        # produce it: 57 paths read, none of them `mcp`. Reading it changes
+        # what the audit SEES and nothing about what the host RUNS.
+        ("MCP the MCP registration surface is audited",
+         all(p in audit_paths for p in ("mcp", "mcp.servers"))),
+        # The additive deny play exists, refuses an artifact baked into this
+        # public repo, and carries the proof that makes it additive rather than
+        # a rewrite of the founder's agent — asserted by the string the assert
+        # emits when preservation fails, so a copy of the play that dropped the
+        # proof would fail this check.
+        ("DENY-ADD no artifact path is baked into this public repo",
+         d.get("dc_deny_add_path") == ""),
+        ("DENY-ADD the additive deny play proves field-for-field preservation",
+         (tasks / "agent_deny_add.yml").is_file()
+         and "ADDITIVE PRESERVATION NOT PROVEN" in
+         (tasks / "agent_deny_add.yml").read_text(errors="ignore")
+         and "rejectattr('key', 'equalto', 'tools')" in
+         (tasks / "agent_deny_add.yml").read_text(errors="ignore")),
         # The apply play must state, in the file, that a config rollback does
         # not reverse a scheduled job. Getting that wrong on a bad day is how a
         # job outlives the grant that authorised it.

@@ -1,0 +1,409 @@
+---
+# Add tool denies to ONE deployed agent's entry, additively.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags deny-add -e dc_deny_add_path=/path/to/deny-add.json \
+#     -e ansible_become=false [-e dc_apply=true]
+#
+# WHY THIS EXISTS, AND WHY agent_profile.yml CANNOT DO IT
+#
+# `main` — the agent the founder's Slack reaches — is deployed as exactly
+# `{id: main, default: true}`. It has no workspace, no sandbox block and no
+# `tools` block, and it inherits everything else from agents.defaults. That is
+# its accepted shape; nothing here is allowed to change it.
+#
+# TASK-323 needs one thing from `main`: that a Gateway-wide MCP server
+# registered for a different worker is NOT callable from `main`. MCP
+# registration is Gateway-wide and `agents.list[].tools.deny` is the only
+# agent-local narrowing (TASK-225, verified on 2026.7.1-2), so the deny has to
+# land on `main`'s own entry.
+#
+# agent_profile.yml is an UPSERT: it REPLACES the target entry with the profile
+# as authored, and it asserts the admission floors — exec denied, the seven
+# session tools denied, sandbox on, workspace read-only. A `main` profile that
+# clears those floors is a different agent from the one the founder talks to,
+# and a profile that does not clear them is refused. Neither is "add one deny".
+#
+# So this play does the one narrow thing: read the live entry, append the
+# requested denies to its tools.deny, prove that NOTHING ELSE about the entry
+# or the list changed, and only then offer the result to the runtime.
+#
+# THE PROOF IS THE POINT. Every assertion below compares the composed entry
+# against the entry read from the runtime with the deny list masked out. If the
+# runtime's entry is not preserved field-for-field, the play stops before the
+# dry run — a deny that arrives by rewriting the founder's agent is the
+# failure this file exists to prevent.
+#
+# `config patch` replaces arrays wholesale, so the whole agents.list is
+# written back. The list is composed from the LIVE read with the target
+# replaced IN PLACE — same order, same other entries — and that too is
+# asserted before anything is written.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a deny-add artifact
+  ansible.builtin.assert:
+    that:
+      - dc_deny_add_path | default('') | length > 0
+    fail_msg: >-
+      dc_deny_add_path must name a deny-add artifact
+      ({"agent_id": ..., "add_deny": [...], "authority": {...}}). There is no
+      default: which agent, which tools and under which task are deployment
+      bindings and belong in a private repository beside the inventory.
+      Nothing has been read.
+    success_msg: "reading {{ dc_deny_add_path }}"
+
+- name: Read the deny-add artifact
+  ansible.builtin.slurp:
+    src: "{{ dc_deny_add_path }}"
+  register: dc_deny_raw
+  delegate_to: localhost
+  become: false
+
+- name: Parse the deny-add artifact
+  ansible.builtin.set_fact:
+    dc_deny_add: "{{ dc_deny_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse an artifact that will not parse or names no agent
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_deny_add_path }} is not valid JSON, or lacks a non-empty
+      `agent_id` and a non-empty `add_deny` list. Nothing has been changed.
+  when:
+    - >-
+      dc_deny_add is not defined
+      or (dc_deny_add.agent_id | default('') | length) == 0
+      or (dc_deny_add.add_deny | default([]) | length) == 0
+    - dc_fail_closed | bool
+
+# A deny-add is a governed change to a named agent and must cite its authority.
+# The play does not verify the record — it cannot reach Notion — but it refuses
+# an artifact that does not name one, so a deny cannot arrive authority-free.
+- name: Refuse an artifact that names no canonical authority
+  ansible.builtin.fail:
+    msg: >-
+      The artifact carries no authority.task_id / authority.decision_memory_page_id.
+      A per-agent policy change is a governed act; name the task and the
+      accepted decision it implements. Nothing has been changed.
+  when:
+    - >-
+      (dc_deny_add.authority.task_id | default('') | length) == 0
+      or (dc_deny_add.authority.decision_memory_page_id | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Refuse when there is no agents.list to add to
+  ansible.builtin.fail:
+    msg: >-
+      agents.list is unset, so no agent entry exists to receive a deny.
+      This play never CREATES an entry — that is agent_profile.yml's job and
+      carries its own risk guard. Nothing has been changed.
+  when:
+    - dc_agent_list_unset | bool
+    - dc_fail_closed | bool
+
+- name: Parse the live agents.list
+  ansible.builtin.set_fact:
+    dc_deny_live: "{{ dc_agent_list_before.stdout | default('[]') | from_json }}"
+
+- name: Locate the target entry in the live list
+  ansible.builtin.set_fact:
+    dc_deny_target: >-
+      {{ dc_deny_live | selectattr('id', 'equalto', dc_deny_add.agent_id)
+         | list | first | default({}, true) }}
+
+- name: Refuse when the target agent is not deployed
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_deny_add.agent_id }} is not present in agents.list
+      ({{ dc_deny_live | map(attribute='id') | list }}). A deny cannot be added
+      to an entry that does not exist. Nothing has been changed.
+  when:
+    - dc_deny_target | length == 0
+    - dc_fail_closed | bool
+
+# --- compose the new entry: the live entry plus the requested denies ----------
+- name: Compose the deny list and the new entry
+  ansible.builtin.set_fact:
+    dc_deny_before: "{{ dc_deny_target.tools.deny | default([]) }}"
+    dc_deny_after: >-
+      {{ (dc_deny_target.tools.deny | default([]))
+         + (dc_deny_add.add_deny | difference(dc_deny_target.tools.deny | default([]))) }}
+
+- name: Compose the entry with only its deny list changed
+  ansible.builtin.set_fact:
+    dc_deny_new_entry: >-
+      {{ dc_deny_target | combine(
+           {'tools': (dc_deny_target.tools | default({})) | combine({'deny': dc_deny_after})}) }}
+
+# --- ADDITIVE PROOF ------------------------------------------------------------
+#
+# Compare with the deny list masked. Equality of everything else is the claim
+# "this is the same agent with one more deny", and it is asserted rather than
+# assumed because `combine` is recursive by default only when asked, and a
+# wrong flag here would silently replace the tools block.
+- name: Prove the entry is preserved field-for-field outside tools.deny
+  ansible.builtin.assert:
+    that:
+      - (dc_deny_new_entry | dict2items | rejectattr('key', 'equalto', 'tools') | items2dict)
+        == (dc_deny_target | dict2items | rejectattr('key', 'equalto', 'tools') | items2dict)
+      - ((dc_deny_new_entry.tools | default({})) | dict2items | rejectattr('key', 'equalto', 'deny') | items2dict)
+        == ((dc_deny_target.tools | default({})) | dict2items | rejectattr('key', 'equalto', 'deny') | items2dict)
+      - dc_deny_before | difference(dc_deny_after) | length == 0
+      - (dc_deny_after | symmetric_difference(dc_deny_before + dc_deny_add.add_deny)) | length == 0
+      - dc_deny_after | length == (dc_deny_after | unique | length)
+    fail_msg: >-
+      ADDITIVE PRESERVATION NOT PROVEN for {{ dc_deny_add.agent_id }}.
+      Either a field outside tools.deny would change, an existing deny would be
+      dropped, or the new list is not exactly old + requested. Refusing before
+      the dry run. Nothing has been changed.
+    success_msg: >-
+      {{ dc_deny_add.agent_id }}: every field outside tools.deny preserved;
+      deny {{ dc_deny_before | length }} -> {{ dc_deny_after | length }} entries,
+      added {{ dc_deny_add.add_deny | difference(dc_deny_before) }}
+
+- name: Note when every requested deny is already present
+  ansible.builtin.debug:
+    msg: >-
+      DC-DENY-ADD | {{ dc_deny_add.agent_id }} already denies
+      {{ dc_deny_add.add_deny }}. Already-denied is the goal state; nothing to
+      write. (The play continues so the dry run still proves the list would
+      round-trip, but the patch is a no-op.)
+  when: dc_deny_after == dc_deny_before
+
+# --- compose the list: the live list with the target replaced IN PLACE --------
+- name: Find the target's position in the live list
+  ansible.builtin.set_fact:
+    dc_deny_idx: "{{ (dc_deny_live | map(attribute='id') | list).index(dc_deny_add.agent_id) }}"
+
+- name: Compose the new agents.list
+  ansible.builtin.set_fact:
+    dc_deny_new_list: >-
+      {{ dc_deny_live[:(dc_deny_idx | int)] + [dc_deny_new_entry]
+         + dc_deny_live[(dc_deny_idx | int) + 1:] }}
+
+- name: Prove every other entry and the order are preserved
+  ansible.builtin.assert:
+    that:
+      - (dc_deny_new_list | map(attribute='id') | list) == (dc_deny_live | map(attribute='id') | list)
+      - (dc_deny_new_list | rejectattr('id', 'equalto', dc_deny_add.agent_id) | list)
+        == (dc_deny_live | rejectattr('id', 'equalto', dc_deny_add.agent_id) | list)
+      - (dc_deny_new_list | selectattr('id', 'equalto', dc_deny_add.agent_id) | list | length) == 1
+    fail_msg: >-
+      The composed agents.list does not preserve the other entries or their
+      order. `config patch` replaces the array wholesale, so writing it would
+      change agents nobody named. Nothing has been changed.
+    success_msg: >-
+      agents.list composed: {{ dc_deny_new_list | map(attribute='id') | list }},
+      only {{ dc_deny_add.agent_id }} differs
+
+- name: Compose the patch
+  ansible.builtin.set_fact:
+    dc_deny_patch_body:
+      agents:
+        list: "{{ dc_deny_new_list }}"
+
+# --- the runtime's own gate ---------------------------------------------------
+- name: Ask the runtime to validate the patch without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ dc_deny_patch_body | to_json }}"
+  register: dc_deny_dryrun
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Report what the dry run said
+  ansible.builtin.debug:
+    msg: "{{ (dc_deny_dryrun.stdout_lines | default([])) + (dc_deny_dryrun.stderr_lines | default([])) }}"
+
+- name: Refuse a patch the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      `config patch --dry-run` rejected the deny-add
+      (rc={{ dc_deny_dryrun.rc | default('?') }}). Nothing written.
+      {{ dc_deny_dryrun.stderr | default('') | trim }}
+  when:
+    - (dc_deny_dryrun.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Confirm the dry run changed nothing
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_deny_after_dry
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Assert the dry run was in fact dry
+  ansible.builtin.assert:
+    that:
+      - (dc_deny_after_dry.stdout | default('[]') | from_json) == dc_deny_live
+    fail_msg: >-
+      agents.list changed during a --dry-run. The dry run was not dry, and
+      nothing further should be trusted from this play.
+    success_msg: "dry run left agents.list unchanged"
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "additive tools.deny on {{ dc_deny_add.agent_id }} (--tags deny-add)"
+    dc_apply_overlay:
+      authority: "{{ dc_deny_add.authority }}"
+      agent: "{{ dc_deny_add.agent_id }}"
+      deny_before: "{{ dc_deny_before }}"
+      deny_after: "{{ dc_deny_after }}"
+      other_agents_untouched: >-
+        {{ dc_deny_live | rejectattr('id', 'equalto', dc_deny_add.agent_id)
+           | map(attribute='id') | list }}
+      note: "Gateway restarts; Slack is unreachable for a few seconds"
+
+# --- write --------------------------------------------------------------------
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+- name: Back up the config before the deny-add
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-deny-add.{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Apply the deny-add
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ dc_deny_patch_body | to_json }}"
+  register: dc_deny_patch
+  changed_when: dc_deny_patch.rc == 0
+  failed_when: false
+  timeout: 120
+  notify: Restart openclaw gateway
+
+- name: Refuse when the patch failed
+  ansible.builtin.fail:
+    msg: >-
+      `config patch` failed (rc={{ dc_deny_patch.rc | default('?') }}):
+      {{ dc_deny_patch.stderr | default('') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_deny_patch.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Validate the whole config after the patch
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_deny_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse when the config no longer validates
+  ansible.builtin.fail:
+    msg: >-
+      The config does not validate after the patch
+      (rc={{ dc_deny_validate.rc | default('?') }}):
+      {{ dc_deny_validate.stdout | default('') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_deny_validate.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+- name: Let the gateway settle
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_deny_h1
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_deny_h2
+  changed_when: false
+  failed_when: false
+
+- name: Extract both samples
+  ansible.builtin.set_fact:
+    dc_deny_s1: "{{ dict(dc_deny_h1.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_deny_s2: "{{ dict(dc_deny_h2.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway survived the deny-add
+  ansible.builtin.assert:
+    that:
+      - dc_deny_s2.ActiveState | default('') == 'active'
+      - dc_deny_s2.SubState | default('') == 'running'
+      - (dc_deny_s2.NRestarts | default(0) | int) == (dc_deny_s1.NRestarts | default(0) | int)
+    fail_msg: >-
+      The gateway is not stable after the deny-add on {{ dc_deny_add.agent_id }}.
+      NRestarts {{ dc_deny_s1.NRestarts | default('?') }} -> {{ dc_deny_s2.NRestarts | default('?') }}.
+      Slack is down while this persists. Recover with playbooks/governed-rollback.yml.
+    success_msg: >-
+      gateway active and stable
+      (NRestarts held at {{ dc_deny_s2.NRestarts | default('0') }} across 15s)
+
+# --- verify from the runtime, not from what we wrote ---------------------------
+- name: Read agents.list back from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'agents.list'] }}"
+  register: dc_deny_final
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Confirm the runtime holds exactly the composed list
+  ansible.builtin.assert:
+    that:
+      - (dc_deny_final.rc | default(1)) == 0
+      - >-
+        ((dc_deny_final.stdout | default('[]') | from_json)
+          | selectattr('id', 'equalto', dc_deny_add.agent_id) | list | first | default({}, true))
+        == dc_deny_new_entry
+      - >-
+        ((dc_deny_final.stdout | default('[]') | from_json)
+          | rejectattr('id', 'equalto', dc_deny_add.agent_id) | list)
+        == (dc_deny_live | rejectattr('id', 'equalto', dc_deny_add.agent_id) | list)
+    fail_msg: >-
+      The runtime's agents.list after the patch is not the composed list.
+      Either {{ dc_deny_add.agent_id }} differs from what was proven additive,
+      or another entry changed. Recover with playbooks/governed-rollback.yml.
+    success_msg: >-
+      runtime read-back: {{ dc_deny_add.agent_id }} carries the composed entry;
+      every other agent is byte-identical to the pre-patch read
+
+- name: Emit the deny-add receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-DENY-ADD RECEIPT |
+      agent={{ dc_deny_add.agent_id }} |
+      authority={{ dc_deny_add.authority.task_id }} /
+      {{ dc_deny_add.authority.decision_memory_page_id }} |
+      deny_before={{ dc_deny_before | length }} deny_after={{ dc_deny_after | length }} |
+      added={{ dc_deny_add.add_deny | difference(dc_deny_before) }} |
+      others_untouched={{ dc_deny_live | rejectattr('id', 'equalto', dc_deny_add.agent_id)
+                          | map(attribute='id') | list }} |
+      config_validate=rc={{ dc_deny_validate.rc | default('?') }} |
+      gateway={{ dc_deny_s2.ActiveState | default('?') }}/{{ dc_deny_s2.SubState | default('?') }}
+      NRestarts={{ dc_deny_s2.NRestarts | default('?') }} (stable 15s) |
+      NOT PROVEN HERE: that the denied names match how this build exposes the
+      MCP server's tools. A deny of a name the runtime never uses is inert.
+      Run --tags tool-surface on this agent with the server registered and
+      confirm the tools are ABSENT from its enumeration.

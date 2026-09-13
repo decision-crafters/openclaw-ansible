@@ -447,6 +447,11 @@ dc_confirm_stop: false
 dc_agent_profile_path: ""
 dc_agent_id: ""
 
+# Additive per-agent deny (tasks/agent_deny_add.yml). Names which agent, which
+# tools and under which authority — a deployment binding, so it lives beside
+# the private inventory, never here.
+dc_deny_add_path: ""
+
 # Tools that MUST be denied on the deployed profile. Checked against, not
 # written — the profile is the source of truth and this is the floor it has to
 # clear. The seven session tools appear in no PRM-5 revision and were permitted
@@ -867,6 +872,26 @@ dc_audit_paths:
   # agents.list[].heartbeat. Recorded because this session initially had it
   # wrong in the other direction.
   - agents.defaults.heartbeat
+  # --- MCP registration surface ----------------------------------------------
+  #
+  # Absent from this list until 2026-09-13, and found the same way every other
+  # gap here was found: the TASK-323 host baseline needed to state whether ANY
+  # MCP server was registered, and this audit could not answer. 57 paths were
+  # read and not one of them was `mcp`.
+  #
+  # `mcp.servers.<name>` is GATEWAY-WIDE (TASK-225, verified on 2026.7.1-2):
+  # a registered server is callable by every agent unless each agent's own
+  # tools.deny removes it. Its `toolFilter` is server-global, not per-agent.
+  # So an MCP server nobody admitted is the exact shape of finding this audit
+  # exists to surface, and "no server registered" must be OBSERVED before a
+  # NO-MCP claim is made — the same rule TASK-225 set for NO_SCHEDULER.
+  #
+  # Reading the registration and filter shape only. Server env/headers may
+  # carry a credential; `config get mcp.servers` returns the whole object, so
+  # the report's redaction of long tokens applies — but do not widen this to
+  # a per-server `env` path, and treat the report as sensitive as it already is.
+  - mcp
+  - mcp.servers
   # --- memory surface --------------------------------------------------------
   #
   # Absent from this list until 2026-08-25, and the omission is why TASK-226's
