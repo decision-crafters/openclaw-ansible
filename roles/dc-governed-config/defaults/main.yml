@@ -472,6 +472,16 @@ dc_deny_add_path: ""
 # deployment binding for the private repository. The play refuses without it.
 dc_mcp_register_path: ""
 
+# The one mode a stdio MCP server's command may have. It is the service
+# account's wrapper around its own 0600 credential file, so it is executable by
+# that account and unreadable by anyone else. Exactly this, not "at most this".
+dc_mcp_command_mode: "0700"
+
+# tasks/mcp_wrapper_place.yml (--tags mcp-wrapper): the artifact naming the
+# wrapper source/dest/digest, the credential file (stat only), and the server
+# package identity to attest. Empty by default; deployment binding.
+dc_mcp_wrapper_path: ""
+
 # Tools that MUST be denied on the deployed profile. Checked against, not
 # written — the profile is the source of truth and this is the floor it has to
 # clear. The seven session tools appear in no PRM-5 revision and were permitted

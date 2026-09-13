@@ -199,3 +199,19 @@
         tasks_from: mcp_register
   tags:
     - mcp-register
+
+# Place the stdio wrapper an MCP server registration will name, and attest the
+# server package it execs (name, version, entrypoint digest) and the presence
+# and mode of the service account's credential file — stat only, never read.
+# Installs no package; registers nothing; restarts nothing. Dry run by default.
+- name: Place an MCP stdio wrapper and attest its server package
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Apply the wrapper artifact
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: mcp_wrapper_place
+  tags:
+    - mcp-wrapper

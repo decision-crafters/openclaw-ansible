@@ -1026,6 +1026,26 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          (tasks / "mcp_register.yml").is_file()
          and "Prove every other server is preserved" in (tasks / "mcp_register.yml").read_text(errors="ignore")
          and "Confirm the runtime holds exactly the composed object" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER the stdio command must be exactly the accepted mode (0700), owned by the service account",
+         d.get("dc_mcp_command_mode") == "0700"
+         and "!= dc_mcp_command_mode" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and "gr_name | default('')) != dc_openclaw_user" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-WRAPPER no artifact path is baked into this public repo",
+         d.get("dc_mcp_wrapper_path") == ""),
+        ("MCP-WRAPPER the placement play exists, is tagged, installs nothing and never reads the env file",
+         (tasks / "mcp_wrapper_place.yml").is_file()
+         and "- mcp-wrapper" in (ROLE.parent.parent / "playbooks" / "governed-admission.yml").read_text(errors="ignore")
+         and "get_checksum: false" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
+         and "slurp:\n    src: \"{{ dc_mcpw.env_file.path" not in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
+         and "installed_nothing=true" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")),
+        ("MCP-WRAPPER the source digest, secret shape and package identity are asserted before the write gate",
+         (tasks / "mcp_wrapper_place.yml").is_file()
+         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when the server package is not the attested one")
+         < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")
+         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("carries a secret shape")
+         < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")),
+        ("MCP-REGISTER the play's own documentation does not offer ${VAR} credential references",
+         "${VAR}" not in (tasks / "mcp_register.yml").read_text(errors="ignore")),
         ("MCP-REGISTER a stdio command that is absent or not the service account's executable is refused before the dry run",
          (tasks / "mcp_register.yml").is_file()
          and "Refuse a stdio server whose command is absent" in (tasks / "mcp_register.yml").read_text(errors="ignore")

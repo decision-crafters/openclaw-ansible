@@ -19,11 +19,16 @@
 # WHAT THE ARTIFACT MAY AND MAY NOT CARRY
 #
 # It names the server, the phase, the tools its filter may include, and the
-# server block itself. It may reference a credential ONLY by environment
-# variable name (`${VAR}`); any value shaped like a token — a 40+ character
-# run, a `secret_`/`ntn_` prefix — is refused before the runtime sees it, and
-# so is any `<placeholder>` left from a template. The patch and the dry run run
-# under no_log; the apply gate is shown key NAMES, not values. The audit's
+# server block itself. The server block carries NO credential in any form:
+# the schema of 2026.7.1-2 declares `env`/`headers` but no variable
+# substitution, so a value there would have to be literal, and a literal token
+# in openclaw.json is the thing this role exists to prevent. `env`, `headers`,
+# `oauth`, `clientKey` are therefore refused by name; any value shaped like a
+# token — a 40+ character run, a `secret_`/`ntn_` prefix — is refused before
+# the runtime sees it, and so is any `<placeholder>` left from a template. A
+# stdio server's `command` must be the service account's own 0700 executable
+# (a wrapper that reads its 0600 env file itself). The patch and the dry run
+# run under no_log; the apply gate is shown key NAMES, not values. The audit's
 # report redaction covers `config get mcp.servers` afterwards.
 #
 # ADDITIVE, AND PROVEN
@@ -155,27 +160,29 @@
     - (dc_mcp_add.server.transport | default('stdio')) == 'stdio'
     - (dc_mcp_add.server.command | default('') | length) > 0
 
-- name: Refuse a stdio server whose command is absent, not executable, or not the service account's
+- name: Refuse a stdio server whose command is absent, not the service account's, or not exactly the accepted mode
   ansible.builtin.fail:
     msg: >-
-      {{ dc_mcp_add.server.command | default('<none>') }} must exist, be executable,
-      and be owned by {{ dc_openclaw_user }} with no group/other write bit before
-      it is registered as a stdio MCP server
+      {{ dc_mcp_add.server.command | default('<none>') }} must exist as a regular
+      file owned by {{ dc_openclaw_user }}:{{ dc_openclaw_user }} with mode exactly
+      {{ dc_mcp_command_mode }} before it is registered as a stdio MCP server
       (exists={{ dc_mcp_cmd.stat.exists | default(false) }},
-      executable={{ dc_mcp_cmd.stat.executable | default(false) }},
-      owner={{ dc_mcp_cmd.stat.pw_name | default('?') }},
-      mode={{ dc_mcp_cmd.stat.mode | default('?') }}). A wrapper that does not
-      exist yet means the server package has not been placed or its provenance
-      recorded. Nothing has been changed.
+      regular={{ dc_mcp_cmd.stat.isreg | default(false) }},
+      owner={{ dc_mcp_cmd.stat.pw_name | default('?') }}:{{ dc_mcp_cmd.stat.gr_name | default('?') }},
+      mode={{ dc_mcp_cmd.stat.mode | default('?') }}). The wrapper reads the
+      service account's credential file, so it is the service account's alone —
+      not merely "no group/other write". A wrapper that does not exist yet means
+      the server package has not been placed or its provenance recorded
+      (--tags mcp-wrapper). Nothing has been changed.
   when:
     - (dc_mcp_add.server.transport | default('stdio')) == 'stdio'
     - >-
       (dc_mcp_add.server.command | default('') | length) == 0
       or not (dc_mcp_cmd.stat.exists | default(false))
-      or not (dc_mcp_cmd.stat.executable | default(false))
+      or not (dc_mcp_cmd.stat.isreg | default(false))
       or (dc_mcp_cmd.stat.pw_name | default('')) != dc_openclaw_user
-      or (dc_mcp_cmd.stat.wgrp | default(true))
-      or (dc_mcp_cmd.stat.woth | default(true))
+      or (dc_mcp_cmd.stat.gr_name | default('')) != dc_openclaw_user
+      or (dc_mcp_cmd.stat.mode | default('')) != dc_mcp_command_mode
     - dc_fail_closed | bool
 
 - name: Refuse a credential-bearing key in the server block

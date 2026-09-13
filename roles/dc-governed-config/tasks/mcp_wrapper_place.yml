@@ -1,0 +1,267 @@
+---
+# Place the stdio wrapper for ONE MCP server and attest the server package it
+# execs — from an artifact, without installing anything and without reading a
+# credential.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags mcp-wrapper -e dc_mcp_wrapper_path=/path/to/wrapper.json \
+#     -e ansible_become=false [-e dc_apply=true]
+#
+# WHY THIS EXISTS
+#
+# mcp_register.yml refuses a stdio `command` that is not the service account's
+# own 0700 file. Something has to put that file there in a governed way, and
+# the file execs a server package that is a NEW first-party/community artifact
+# on the host — it needs identity and provenance evidence before it is wired
+# to the Gateway (TASK-323 admission packet, supply-chain residual).
+#
+# WHAT THIS PLAY DOES, AND DOES NOT
+#
+#   does:   proves the wrapper SOURCE is the reviewed one (sha256), carries no
+#           token-shaped value and no placeholder; proves the server package is
+#           present at the declared root with the declared name/version and an
+#           entrypoint whose sha256 matches the artifact; proves the env file
+#           exists as the service account's 0600 file; then (apply) writes the
+#           wrapper 0700 owner:group service account, reads its stat back, and
+#           emits a receipt that IS the provenance line.
+#   does not: install the package (a separate act with its own receipt), read
+#           the env file (stat only, never slurp), register anything, restart
+#           anything.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without a wrapper artifact
+  ansible.builtin.assert:
+    that:
+      - dc_mcp_wrapper_path | default('') | length > 0
+    fail_msg: >-
+      dc_mcp_wrapper_path must name a wrapper artifact ({"wrapper": {...},
+      "env_file": {...}, "server_package": {...}, "authority": {...}}).
+      Nothing has been read.
+    success_msg: "reading {{ dc_mcp_wrapper_path }}"
+
+- name: Read the wrapper artifact
+  ansible.builtin.slurp:
+    src: "{{ dc_mcp_wrapper_path }}"
+  register: dc_mcpw_raw
+  delegate_to: localhost
+  become: false
+
+- name: Parse the artifact
+  ansible.builtin.set_fact:
+    dc_mcpw: "{{ dc_mcpw_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse an artifact that will not parse or is incomplete
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_mcp_wrapper_path }} is not valid JSON or lacks wrapper.source,
+      wrapper.dest, wrapper.expected_sha256, env_file.path, server_package.entrypoint,
+      server_package.entrypoint_sha256, server_package.package_json,
+      server_package.name or server_package.version. Nothing has been changed.
+  when:
+    - >-
+      dc_mcpw is not defined
+      or (dc_mcpw.wrapper.source | default('') | length) == 0
+      or (dc_mcpw.wrapper.dest | default('') | length) == 0
+      or (dc_mcpw.wrapper.expected_sha256 | default('') | length) == 0
+      or (dc_mcpw.env_file.path | default('') | length) == 0
+      or (dc_mcpw.server_package.entrypoint | default('') | length) == 0
+      or (dc_mcpw.server_package.entrypoint_sha256 | default('') | length) == 0
+      or (dc_mcpw.server_package.package_json | default('') | length) == 0
+      or (dc_mcpw.server_package.name | default('') | length) == 0
+      or (dc_mcpw.server_package.version | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Refuse an artifact that names no canonical authority
+  ansible.builtin.fail:
+    msg: >-
+      The artifact carries no authority.task_id / authority.decision_memory_page_id.
+      Nothing has been changed.
+  when:
+    - >-
+      (dc_mcpw.authority.task_id | default('') | length) == 0
+      or (dc_mcpw.authority.decision_memory_page_id | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Refuse an artifact that still carries template placeholders
+  ansible.builtin.fail:
+    msg: >-
+      The artifact contains a <placeholder> in wrapper, env_file or server_package.
+      The package identity, version, entrypoint digest and provenance are recorded
+      by the person who placed the package; an unfilled artifact cannot attest.
+      Nothing has been changed.
+  when:
+    - >-
+      ({'wrapper': dc_mcpw.wrapper, 'env_file': dc_mcpw.env_file, 'server_package': dc_mcpw.server_package}
+       | to_json | regex_search('<[^>]*>'))
+    - dc_fail_closed | bool
+
+# --- the wrapper source: the reviewed bytes, and nothing secret in them --------
+- name: Read the wrapper source from beside the artifact
+  ansible.builtin.slurp:
+    src: "{{ (dc_mcp_wrapper_path | dirname) }}/{{ dc_mcpw.wrapper.source | basename }}"
+  register: dc_mcpw_src
+  delegate_to: localhost
+  become: false
+
+- name: Refuse a wrapper source that is not the reviewed one or carries a secret shape
+  ansible.builtin.assert:
+    that:
+      - (dc_mcpw_src.content | b64decode | hash('sha256')) == dc_mcpw.wrapper.expected_sha256
+      - not (dc_mcpw_src.content | b64decode | regex_search('[A-Za-z0-9_-]{40,}'))
+      - not (dc_mcpw_src.content | b64decode | regex_search('(secret_|ntn_)[A-Za-z0-9]'))
+      - (dc_mcpw_src.content | b64decode) is search('^#!/')
+    fail_msg: >-
+      The wrapper source does not hash to wrapper.expected_sha256, or contains a
+      token-shaped value, or is not a script. The placed file must be the reviewed
+      one and must carry no credential. Nothing has been changed.
+    success_msg: >-
+      wrapper source is the reviewed file ({{ dc_mcpw.wrapper.expected_sha256[:16] }}…)
+      and carries no secret shape
+
+# --- attestations on the host, as the service account, never reading the env file ---
+- name: Stat the env file (existence, owner, mode only)
+  ansible.builtin.stat:
+    path: "{{ dc_mcpw.env_file.path }}"
+    get_mime: false
+    get_checksum: false
+  register: dc_mcpw_env
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+
+- name: Refuse when the credential file is absent or not the service account's 0600 file
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_mcpw.env_file.path }} must exist as a regular file owned by
+      {{ dc_openclaw_user }}:{{ dc_openclaw_user }} with mode {{ dc_mcpw.env_file.mode | default('0600') }}
+      (exists={{ dc_mcpw_env.stat.exists | default(false) }},
+      owner={{ dc_mcpw_env.stat.pw_name | default('?') }}, mode={{ dc_mcpw_env.stat.mode | default('?') }}).
+      Its content was not read and never is. Nothing has been changed.
+  when:
+    - >-
+      not (dc_mcpw_env.stat.exists | default(false))
+      or not (dc_mcpw_env.stat.isreg | default(false))
+      or (dc_mcpw_env.stat.pw_name | default('')) != dc_openclaw_user
+      or (dc_mcpw_env.stat.mode | default('')) != (dc_mcpw.env_file.mode | default('0600'))
+    - dc_fail_closed | bool
+
+- name: Stat the server entrypoint
+  ansible.builtin.stat:
+    path: "{{ dc_mcpw.server_package.entrypoint }}"
+    checksum_algorithm: sha256
+    get_mime: false
+  register: dc_mcpw_entry
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+
+- name: Read the server package.json (identity only)
+  ansible.builtin.slurp:
+    src: "{{ dc_mcpw.server_package.package_json }}"
+  register: dc_mcpw_pkg_raw
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  failed_when: false
+
+- name: Parse the package identity
+  ansible.builtin.set_fact:
+    dc_mcpw_pkg: >-
+      {{ (dc_mcpw_pkg_raw.content | default('e30=') | b64decode | from_json)
+         if (dc_mcpw_pkg_raw.content is defined) else {} }}
+  failed_when: false
+
+- name: Refuse when the server package is not the attested one
+  ansible.builtin.assert:
+    that:
+      - dc_mcpw_entry.stat.exists | default(false)
+      - dc_mcpw_entry.stat.isreg | default(false)
+      - (dc_mcpw_entry.stat.pw_name | default('')) == dc_openclaw_user
+      - not (dc_mcpw_entry.stat.wgrp | default(true))
+      - not (dc_mcpw_entry.stat.woth | default(true))
+      - (dc_mcpw_entry.stat.checksum | default('')) == dc_mcpw.server_package.entrypoint_sha256
+      - (dc_mcpw_pkg.name | default('')) == dc_mcpw.server_package.name
+      - (dc_mcpw_pkg.version | default('')) == dc_mcpw.server_package.version
+    fail_msg: >-
+      The server package on the host is not the one the artifact attests:
+      entrypoint exists={{ dc_mcpw_entry.stat.exists | default(false) }}
+      owner={{ dc_mcpw_entry.stat.pw_name | default('?') }}
+      sha256={{ (dc_mcpw_entry.stat.checksum | default('missing'))[:16] }}… vs
+      {{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…;
+      package.json name/version={{ dc_mcpw_pkg.name | default('?') }}/{{ dc_mcpw_pkg.version | default('?') }}
+      vs {{ dc_mcpw.server_package.name }}/{{ dc_mcpw.server_package.version }}.
+      A server whose identity is not proven is not wired to the Gateway. Placing
+      the package is a separate act with its own receipt; this play installs
+      nothing. Nothing has been changed.
+    success_msg: >-
+      server package attested: {{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }},
+      entrypoint sha256 {{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…, owner {{ dc_openclaw_user }}
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "stdio wrapper {{ dc_mcpw.wrapper.dest }} (--tags mcp-wrapper)"
+    dc_apply_target: "{{ dc_mcpw.wrapper.dest }} (a file in the service account's home, NOT openclaw.json)"
+    dc_apply_overlay:
+      authority: "{{ dc_mcpw.authority }}"
+      dest: "{{ dc_mcpw.wrapper.dest }}"
+      mode: "{{ dc_mcpw.wrapper.mode | default('0700') }}"
+      source_sha256: "{{ dc_mcpw.wrapper.expected_sha256 }}"
+      server_package: "{{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }}"
+      env_file: "{{ dc_mcpw.env_file.path }} (stat only; never read)"
+
+- name: Create the wrapper directory
+  ansible.builtin.file:
+    path: "{{ dc_mcpw.wrapper.dest | dirname }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+- name: Place the wrapper
+  ansible.builtin.copy:
+    content: "{{ dc_mcpw_src.content | b64decode }}"
+    dest: "{{ dc_mcpw.wrapper.dest }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: "{{ dc_mcpw.wrapper.mode | default('0700') }}"
+  register: dc_mcpw_placed
+
+- name: Read the placed wrapper back
+  ansible.builtin.stat:
+    path: "{{ dc_mcpw.wrapper.dest }}"
+    checksum_algorithm: sha256
+    get_mime: false
+  register: dc_mcpw_after
+
+- name: Confirm the placed wrapper is the reviewed file with exactly the accepted mode
+  ansible.builtin.assert:
+    that:
+      - dc_mcpw_after.stat.exists
+      - (dc_mcpw_after.stat.checksum | default('')) == dc_mcpw.wrapper.expected_sha256
+      - (dc_mcpw_after.stat.pw_name | default('')) == dc_openclaw_user
+      - (dc_mcpw_after.stat.gr_name | default('')) == dc_openclaw_user
+      - (dc_mcpw_after.stat.mode | default('')) == (dc_mcpw.wrapper.mode | default('0700'))
+    fail_msg: >-
+      The placed wrapper does not read back as the reviewed file with mode
+      {{ dc_mcpw.wrapper.mode | default('0700') }} owned by {{ dc_openclaw_user }}.
+      Remove {{ dc_mcpw.wrapper.dest }} before registering anything.
+    success_msg: >-
+      {{ dc_mcpw.wrapper.dest }} placed: sha256 matches,
+      {{ dc_mcpw_after.stat.mode }} {{ dc_openclaw_user }}:{{ dc_openclaw_user }}
+
+- name: Emit the wrapper placement and provenance receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-MCP-WRAPPER RECEIPT |
+      authority={{ dc_mcpw.authority.task_id }} / {{ dc_mcpw.authority.decision_memory_page_id }} |
+      wrapper={{ dc_mcpw.wrapper.dest }} sha256={{ dc_mcpw.wrapper.expected_sha256[:16] }}…
+      mode={{ dc_mcpw_after.stat.mode }} owner={{ dc_openclaw_user }}:{{ dc_openclaw_user }} |
+      server_package={{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }}
+      entrypoint={{ dc_mcpw.server_package.entrypoint }}
+      entrypoint_sha256={{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…
+      provenance={{ dc_mcpw.server_package.provenance | default('NOT RECORDED') | truncate(160) }} |
+      env_file={{ dc_mcpw.env_file.path }} mode={{ dc_mcpw_env.stat.mode | default('?') }} (never read) |
+      installed_nothing=true registered_nothing=true restarted_nothing=true |
+      NOT PROVEN HERE: that the server starts and answers over stdio — the
+      registration play's health check and the tool-surface probe settle that.
