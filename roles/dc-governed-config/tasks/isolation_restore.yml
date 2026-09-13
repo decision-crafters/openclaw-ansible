@@ -1,0 +1,68 @@
+---
+# Restore the service account home to the accepted isolation baseline.
+#
+#   sudo ansible-playbook playbooks/governed-isolation.yml \
+#     --tags isolation-restore -e ansible_become=false [-e dc_apply=true]
+#
+# Changes ONE thing: the mode bits of the home directory itself. Not
+# recursive, not the owner, not the config directory (whose mode is asserted,
+# never set here — if ~/.openclaw has drifted that is a different incident and
+# gets its own look rather than a silent chmod). Dry run by default.
+#
+# Ends by including isolation_verify.yml, so a restore that did not actually
+# restore the property is reported as such rather than as "changed=1".
+
+- name: Stat the home before touching it
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_home }}"
+  register: dc_iso_home_before
+
+- name: Refuse to change a directory the service account does not own
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_home }} is owned by {{ dc_iso_home_before.stat.pw_name | default('?') }},
+      not {{ dc_openclaw_user }}. A chmod here would be applied to someone else's
+      directory. Nothing has been changed.
+  when:
+    - not (dc_iso_home_before.stat.exists | default(false))
+      or (dc_iso_home_before.stat.pw_name | default('') != dc_openclaw_user)
+    - dc_fail_closed | bool
+
+- name: Note when the home is already at baseline
+  ansible.builtin.debug:
+    msg: >-
+      {{ dc_openclaw_home }} is already {{ dc_iso_home_before.stat.mode }}.
+      Already-correct is the goal state; the verify below still runs.
+  when: dc_iso_home_before.stat.mode | default('') == dc_isolation_home_mode
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "restore home mode (--tags isolation-restore)"
+    dc_apply_target: "{{ dc_openclaw_home }} (mode bits only, not recursive)"
+    dc_apply_overlay:
+      path: "{{ dc_openclaw_home }}"
+      mode_before: "{{ dc_iso_home_before.stat.mode | default('?') }}"
+      mode_after: "{{ dc_isolation_home_mode }}"
+      owner: "{{ dc_openclaw_user }} (unchanged)"
+
+- name: Restore the home mode
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_home }}"
+    state: directory
+    mode: "{{ dc_isolation_home_mode }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+
+- name: Verify the property from the outside, not from the module result
+  ansible.builtin.include_tasks: isolation_verify.yml
+
+- name: Emit the restore receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-ISOLATION RESTORE RECEIPT |
+      {{ dc_openclaw_home }}: {{ dc_iso_home_before.stat.mode | default('?') }}
+      -> {{ dc_isolation_home_mode }} |
+      mode bits only; owner, contents and ~/.openclaw untouched |
+      verified by isolation_verify (see the DC-ISOLATION RECEIPT above) |
+      CAUSE OF THE DRIFT IS NOT ESTABLISHED BY THIS PLAY — record it separately.

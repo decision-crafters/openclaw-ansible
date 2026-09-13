@@ -945,6 +945,24 @@ def scheduler_floors() -> list[tuple[str, bool]]:
         # a rewrite of the founder's agent — asserted by the string the assert
         # emits when preservation fails, so a copy of the play that dropped the
         # proof would fail this check.
+        # Account isolation is a stated property that nothing observed until
+        # 2026-09-13, when the runtime home was found at 0755. The baseline is a
+        # default the verify asserts against; the operator identity must stay
+        # out of this public repo; the listing test must run in BOTH directions.
+        ("ISOLATION the home-mode baseline is 0700",
+         d.get("dc_isolation_home_mode") == "0700"),
+        ("ISOLATION no operator identity is baked into this public repo",
+         d.get("dc_operator_user") == ""),
+        ("ISOLATION the verify tests both listing directions",
+         (tasks / "isolation_verify.yml").is_file()
+         and "Attempt to list the runtime home as the operator" in
+         (tasks / "isolation_verify.yml").read_text(errors="ignore")
+         and "Attempt to list the operator home as the runtime" in
+         (tasks / "isolation_verify.yml").read_text(errors="ignore")),
+        ("ISOLATION the restore re-verifies from the outside",
+         (tasks / "isolation_restore.yml").is_file()
+         and "include_tasks: isolation_verify.yml" in
+         (tasks / "isolation_restore.yml").read_text(errors="ignore")),
         ("DENY-ADD no artifact path is baked into this public repo",
          d.get("dc_deny_add_path") == ""),
         ("DENY-ADD the additive deny play proves field-for-field preservation",

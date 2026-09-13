@@ -447,6 +447,19 @@ dc_confirm_stop: false
 dc_agent_profile_path: ""
 dc_agent_id: ""
 
+# --- Account isolation (tasks/isolation_verify.yml, isolation_restore.yml) ----
+#
+# The accepted runtime-isolation baseline: the service account's home and its
+# config directory are 0700, and neither the operator nor the runtime can list
+# the other's home. Observed drifted to 0755 on 2026-09-13 with no established
+# cause. Verified, not assumed, from here on.
+dc_isolation_home_mode: '0700'
+# The operator account is a deployment binding. Empty here on purpose; the
+# verify play falls back to SUDO_USER and refuses if neither resolves.
+dc_operator_user: ""
+# Which backups the verify play names (name and mtime only, never contents).
+dc_isolation_backup_pattern: "openclaw.json.*"
+
 # Additive per-agent deny (tasks/agent_deny_add.yml). Names which agent, which
 # tools and under which authority — a deployment binding, so it lives beside
 # the private inventory, never here.

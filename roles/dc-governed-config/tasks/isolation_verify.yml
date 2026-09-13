@@ -1,0 +1,189 @@
+---
+# Verify the two-way account isolation between the operator and the runtime.
+#
+#   sudo ansible-playbook playbooks/governed-isolation.yml \
+#     --tags isolation-verify -e ansible_become=false
+#
+# Read-only. Stats two directories, attempts two listings that must FAIL, and
+# names the newest governed backup without opening it. Writes nothing.
+#
+# WHY THIS EXISTS
+#
+# The runtime isolation property is stated in prose in several places: the
+# service account's home is 0700, the operator cannot read the runtime's keys,
+# the runtime cannot read the operator's workspace. Until 2026-09-13 nothing in
+# this repository OBSERVED any of that. On that day, after the first live
+# deny-add, /home/openclaw was found at 0755 — changed during an operator
+# session as the service account, cause not established — and the only reason
+# it was noticed is that a file inside became readable that should not have
+# been. A control nobody checks is a control that drifts, and this one drifted
+# in the direction that looks like convenience.
+#
+# What is asserted, and what is deliberately not:
+#
+#   - the mode of the home and of the config directory: asserted equal to the
+#     accepted baseline (dc_isolation_home_mode), owner the service account;
+#   - the listing attempts: asserted to FAIL in both directions. A failed
+#     listing is the pass. Nothing here weakens either directory to make a
+#     read succeed — that would be the defect being tested for;
+#   - the newest backup: reported by name and mtime only. Root can read the
+#     file; this play does not, because "the backup exists" is the claim and
+#     its contents are the runtime's.
+#
+# The operator account is a deployment binding, not a repository fact. It is
+# taken from SUDO_USER when the play is run under sudo, or from
+# dc_operator_user in the private host_vars. Absent both, the play refuses:
+# guessing "tosin" here would bake an identity into a public role.
+
+- name: Resolve the operator account
+  ansible.builtin.set_fact:
+    dc_iso_operator: >-
+      {{ dc_operator_user | default('', true)
+         if (dc_operator_user | default('', true) | length > 0)
+         else (lookup('env', 'SUDO_USER') | default('', true)) }}
+
+- name: Refuse without an operator account to test against
+  ansible.builtin.fail:
+    msg: >-
+      No operator account resolved: dc_operator_user is unset and SUDO_USER is
+      empty. The isolation property is two-way and cannot be verified against
+      one side. Set dc_operator_user in the private host_vars, or run under
+      sudo. Nothing has been read.
+  when:
+    - dc_iso_operator | length == 0
+    - dc_fail_closed | bool
+
+- name: Refuse an operator account that is the service account
+  ansible.builtin.fail:
+    msg: >-
+      The operator account resolved to '{{ dc_iso_operator }}', which is the
+      service account. A one-account "isolation" test proves nothing.
+  when:
+    - dc_iso_operator == dc_openclaw_user
+    - dc_fail_closed | bool
+
+- name: Resolve the operator's home
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_iso_operator }}"
+
+- name: Record the operator's home
+  ansible.builtin.set_fact:
+    dc_iso_operator_home: "{{ ansible_facts.getent_passwd[dc_iso_operator][4] }}"
+
+# --- modes --------------------------------------------------------------------
+- name: Stat the service account home and config directory
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: dc_iso_stat
+  loop:
+    - "{{ dc_openclaw_home }}"
+    - "{{ dc_openclaw_home }}/.openclaw"
+
+- name: Report the observed modes
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item }}: exists={{ item.stat.exists | default(false) }}
+      mode={{ item.stat.mode | default('?') }}
+      owner={{ item.stat.pw_name | default('?') }}:{{ item.stat.gr_name | default('?') }}
+  loop: "{{ dc_iso_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Assert both directories are at the accepted baseline
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - item.stat.mode == dc_isolation_home_mode
+      - item.stat.pw_name == dc_openclaw_user
+    fail_msg: >-
+      ISOLATION DRIFT: {{ item.item }} is mode {{ item.stat.mode | default('missing') }}
+      owner {{ item.stat.pw_name | default('?') }}; the accepted baseline is
+      {{ dc_isolation_home_mode }} owned by {{ dc_openclaw_user }}.
+      Restore with --tags isolation-restore -e dc_apply=true. Nothing changed.
+    success_msg: "{{ item.item }} is {{ dc_isolation_home_mode }} {{ dc_openclaw_user }}"
+  loop: "{{ dc_iso_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: dc_fail_closed | bool
+
+# --- the listing attempts: a failure is the pass ------------------------------
+#
+# `ls -A <dir> >/dev/null` as the OTHER account. Output discarded on purpose:
+# the test is whether the listing is permitted, never what it would contain.
+- name: Attempt to list the runtime home as the operator
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_iso_operator }}"
+      - --
+      - ls
+      - -A
+      - "{{ dc_openclaw_home }}"
+  register: dc_iso_op_to_rt
+  changed_when: false
+  failed_when: false
+  timeout: 15
+
+- name: Attempt to list the operator home as the runtime
+  ansible.builtin.command:
+    argv:
+      - "{{ dc_runuser }}"
+      - -u
+      - "{{ dc_openclaw_user }}"
+      - --
+      - ls
+      - -A
+      - "{{ dc_iso_operator_home }}"
+  register: dc_iso_rt_to_op
+  changed_when: false
+  failed_when: false
+  timeout: 15
+
+- name: Assert both cross-account listings were refused
+  ansible.builtin.assert:
+    that:
+      - (dc_iso_op_to_rt.rc | default(0)) != 0
+      - (dc_iso_rt_to_op.rc | default(0)) != 0
+    fail_msg: >-
+      ISOLATION BROKEN: operator->runtime listing rc={{ dc_iso_op_to_rt.rc | default('?') }},
+      runtime->operator listing rc={{ dc_iso_rt_to_op.rc | default('?') }}.
+      A zero return means that account can enumerate the other's home. Do not
+      weaken anything to "fix" the other direction; restore the modes and re-run.
+    success_msg: >-
+      both directions refused (operator->runtime rc={{ dc_iso_op_to_rt.rc }},
+      runtime->operator rc={{ dc_iso_rt_to_op.rc }})
+  when: dc_fail_closed | bool
+
+# --- newest governed backup, by name only --------------------------------------
+- name: Find the newest governed backup without opening it
+  ansible.builtin.find:
+    paths: "{{ dc_openclaw_backup_dir }}"
+    patterns: "{{ dc_isolation_backup_pattern }}"
+    file_type: file
+  register: dc_iso_backups
+  failed_when: false
+
+- name: Record the newest backup
+  ansible.builtin.set_fact:
+    dc_iso_newest_backup: >-
+      {{ (dc_iso_backups.files | default([]) | sort(attribute='mtime') | last | default({}))
+         if (dc_iso_backups.files | default([]) | length > 0) else {} }}
+
+- name: Emit the isolation receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-ISOLATION RECEIPT |
+      home={{ dc_iso_stat.results[0].stat.mode | default('?') }}
+      config_dir={{ dc_iso_stat.results[1].stat.mode | default('?') }}
+      (baseline {{ dc_isolation_home_mode }}) |
+      operator={{ dc_iso_operator }} |
+      operator->runtime_rc={{ dc_iso_op_to_rt.rc | default('?') }}
+      runtime->operator_rc={{ dc_iso_rt_to_op.rc | default('?') }} (non-zero is the pass) |
+      newest_backup={{ (dc_iso_newest_backup.path | default('NONE FOUND')) | basename }}
+      mtime={{ '%Y-%m-%dT%H:%M:%SZ' | strftime(dc_iso_newest_backup.mtime | default(0), utc=true)
+               if dc_iso_newest_backup else 'n/a' }}
+      (name and time only; contents not read) |
+      read_only=true wrote_nothing=true

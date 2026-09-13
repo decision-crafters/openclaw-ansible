@@ -1,0 +1,38 @@
+---
+# Two-way account isolation between the operator and the runtime.
+#
+#   --tags isolation-verify    read-only: modes, cross-account listings (must
+#                              fail), newest governed backup by name only
+#   --tags isolation-restore   set the home mode back to the baseline; dry run
+#                              by default, -e dc_apply=true to write; ends by
+#                              running the verify
+#
+# Exists because on 2026-09-13 /home/openclaw was found at 0755 after a live
+# operator session, with no play anywhere that would have noticed.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Verify account isolation
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Observe the isolation property
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: isolation_verify
+  tags:
+    - isolation-verify
+
+- name: Restore account isolation
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Restore the home mode and re-verify
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: isolation_restore
+  tags:
+    - isolation-restore
