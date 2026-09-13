@@ -182,6 +182,60 @@
           "$comment": "The exact reversal, written down before the thing it reverses. An untested stop path is a claim, not a control."
         }
       }
+    },
+
+    "preconditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_root"],
+      "dependentRequired": { "write_admission": ["positive_control"] },
+      "$comment": "OPTIONAL block, added 2026-09-13 for the TASK-323 sequencing amendment (Founder-approved, Decision Memory 3da2bfbf792181fb961eebca635cb647). It names GOVERNED EVIDENCE FILES the validator must open and check before a grant may be applied: a write-admission receipt and a manual positive-control receipt + verification. None of these is a free-text PASS flag — each is a structured record the validator cross-checks against the grant, the cohort packet and each other (digests included). The block is optional in the SCHEMA because not every workload writes; the VALIDATOR requires it whenever the envelope permits a write-shaped tool, so a writing workload cannot be scheduled on assertion.",
+      "properties": {
+        "evidence_root": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "Directory the evidence paths below are relative to, itself relative to the grant file (typically \"..\" — the worker package root). The prepare play stages exactly these files beside the grant so the validator reads the same bytes the repository holds."
+        },
+        "write_admission": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["phase", "receipt", "allowlisted_fields", "admitted_tools"],
+          "$comment": "The operational admission of the ALREADY-APPROVED write allowlist. This is not a new Founder decision — the field allowlist lives in the accepted activation decision — it is the dated, host-observed receipt that the write path exists exactly as approved: tool filter, connection capabilities, page share, and agent-local denial on every other agent.",
+          "properties": {
+            "phase": { "type": "string", "minLength": 1 },
+            "receipt": { "type": "string", "minLength": 1 },
+            "allowlisted_fields": {
+              "type": "array", "minItems": 1, "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "$comment": "The exact writable surfaces the grant expects to have been admitted. The validator requires the receipt to admit EXACTLY these — a wider receipt is a widening, a narrower one means the workload was scheduled against a surface it does not have."
+            },
+            "admitted_tools": {
+              "type": "array", "minItems": 1, "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "$comment": "Every tool the admission receipt must show as observed. The validator also requires every one of them in envelope.permitted_tools — a grant still carrying a read-only envelope beside a write admission is a stale Phase-A grant and is refused."
+            }
+          }
+        },
+        "positive_control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "receipt", "verification", "cohort_packet", "cohort_packet_sha256"],
+          "$comment": "One manually triggered bounded write against a deliberately selected low-risk task, completed and independently verified BEFORE any recurring job exists. `required` is a constant: a grant cannot declare the gate optional. A workload that needs no positive control omits the whole block — and then may not permit a write-shaped tool.",
+          "properties": {
+            "required": { "const": true },
+            "receipt": { "type": "string", "minLength": 1 },
+            "verification": {
+              "type": "string", "minLength": 1,
+              "$comment": "Output of the independent post-write verifier (protected-field diff + ledger comparison), written by the verifier itself with input digests and a result digest the validator recomputes."
+            },
+            "cohort_packet": { "type": "string", "minLength": 1 },
+            "cohort_packet_sha256": {
+              "type": "string", "pattern": "^[0-9a-f]{64}$",
+              "$comment": "Pins the cohort the positive-control target must belong to. The validator hashes the staged packet and refuses on mismatch, so the target cannot be made in-cohort by editing the packet."
+            }
+          }
+        }
+      }
     }
   }
 }

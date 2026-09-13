@@ -73,6 +73,114 @@
     label: "{{ item.dest }}"
   changed_when: false
 
+# --- the pre-schedule write gate: stage the governed evidence ------------------
+#
+# A grant that permits a write-shaped tool must carry `preconditions` naming a
+# write-admission receipt, a manual positive-control receipt, its independent
+# verification and the pinned cohort packet (TASK-323 sequencing amendment,
+# 2026-09-13). Those files live beside the grant in the private repository. The
+# validator opens and cross-checks them; it does not take anyone's word. They
+# are staged next to the grant so the validator reads the same bytes the
+# repository holds, and unstaged before any refusal is raised.
+#
+# A path is refused here if it is absolute or climbs with `..`: an evidence
+# path that could point outside the package could point at anything.
+- name: Name the evidence files the grant's preconditions reference
+  ansible.builtin.set_fact:
+    dc_grant_evidence_files: >-
+      {{ [dc_grant_pre.get('write_admission', {}).get('receipt'),
+          dc_grant_pre.get('positive_control', {}).get('receipt'),
+          dc_grant_pre.get('positive_control', {}).get('verification'),
+          dc_grant_pre.get('positive_control', {}).get('cohort_packet')]
+         | select('string') | list }}
+    dc_grant_evidence_source_root: >-
+      {{ (dc_grant_path | dirname) ~ '/' ~ (dc_grant_pre.get('evidence_root', '.')) }}
+  vars:
+    dc_grant_pre: "{{ dc_grant.preconditions | default({}) }}"
+
+- name: Refuse an evidence path that could leave the package
+  ansible.builtin.assert:
+    that:
+      - dc_grant_evidence_files | select('match', '^/') | list | length == 0
+      - dc_grant_evidence_files | select('search', '(^|/)\\.\\.(/|$)') | list | length == 0
+    fail_msg: >-
+      A preconditions evidence path is absolute or contains '..':
+      {{ dc_grant_evidence_files }}. Evidence paths are plain relative paths
+      under preconditions.evidence_root. Nothing has been staged.
+    success_msg: "{{ dc_grant_evidence_files | length }} evidence file(s) named"
+
+- name: Read each evidence file from beside the grant
+  ansible.builtin.slurp:
+    src: "{{ dc_grant_evidence_source_root }}/{{ item }}"
+  loop: "{{ dc_grant_evidence_files }}"
+  register: dc_grant_evidence_raw
+  delegate_to: localhost
+  become: false
+  failed_when: false
+
+# The positive-control receipt may name the worker's own plain-text receipt by
+# a relative path; the validator checks its digest. Stage it too when present.
+- name: Name the worker receipt the positive-control receipt references
+  ansible.builtin.set_fact:
+    dc_grant_worker_receipt: >-
+      {{ (dc_grant_evidence_raw.results | default([]))
+         | selectattr('item', 'equalto', dc_grant_pc_receipt)
+         | selectattr('content', 'defined')
+         | map(attribute='content') | map('b64decode') | map('from_json')
+         | map(attribute='worker_receipt_path') | select('string') | list }}
+  vars:
+    dc_grant_pc_receipt: "{{ (dc_grant.preconditions | default({})).get('positive_control', {}).get('receipt', '') }}"
+  failed_when: false
+
+- name: Read the worker receipt when it is named
+  ansible.builtin.slurp:
+    src: "{{ dc_grant_evidence_source_root }}/{{ item }}"
+  loop: >-
+    {{ dc_grant_worker_receipt | default([])
+       | reject('match', '^/') | reject('search', '(^|/)\\.\\.(/|$)') | list }}
+  register: dc_grant_worker_receipt_raw
+  delegate_to: localhost
+  become: false
+  failed_when: false
+
+- name: Create the evidence staging root
+  ansible.builtin.file:
+    path: "{{ dc_grant_evidence_staging_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  changed_when: false
+  when: dc_grant_evidence_files | length > 0
+
+- name: Create the staging directories the evidence paths need
+  ansible.builtin.file:
+    path: "{{ dc_grant_evidence_staging_dir }}/{{ item | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  loop: >-
+    {{ (dc_grant_evidence_files + (dc_grant_worker_receipt | default([])))
+       | map('dirname') | reject('equalto', '') | unique | list }}
+  changed_when: false
+
+# A file that could not be read is simply not staged; the validator then
+# reports it MISSING by name. Ansible must not crash where the validator has a
+# sentence ready.
+- name: Stage the evidence files that were readable
+  ansible.builtin.copy:
+    content: "{{ item.content | b64decode }}"
+    dest: "{{ dc_grant_evidence_staging_dir }}/{{ item.item }}"
+    owner: root
+    group: root
+    mode: '0600'
+  loop: "{{ (dc_grant_evidence_raw.results | default([])) + (dc_grant_worker_receipt_raw.results | default([])) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.content is defined
+  changed_when: false
+
 # `ansible.builtin.script`, and every input a PATH rather than stdin. The script
 # module has no `stdin` parameter — that defect shipped once here, broke both an
 # apply and a rollback, and is now pinned by tests/dc_module_args.py.
@@ -83,6 +191,7 @@
       {{ dc_grant_staging_path | quote }}
       {{ dc_grant_schema_path | quote }}
       --agent-profile {{ dc_grant_profile_staging_path | quote }}
+      --evidence-root {{ dc_grant_evidence_staging_dir | quote }}
     executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
   register: dc_grant_check
   changed_when: false
@@ -97,6 +206,7 @@
   loop:
     - "{{ dc_grant_staging_path }}"
     - "{{ dc_grant_profile_staging_path }}"
+    - "{{ dc_grant_evidence_staging_dir }}"
   changed_when: false
 
 - name: Report what the validator said
@@ -156,6 +266,9 @@
       stop_condition={{ dc_grant.lifecycle.stop_condition }} |
       expires={{ dc_grant.lifecycle.expires_on }} |
       evidence={{ dc_grant.evidence.destination }} |
+      write_gate={{ 'preconditions checked from evidence: ' ~ (dc_grant_evidence_files | join(', '))
+                    if dc_grant_evidence_files | length > 0
+                    else 'none declared (read-only envelope)' }} |
       NOTHING WAS SCHEDULED. This validated a grant and rendered a plan. The
       apply path is separate, separately gated, and requires an accepted
       decision record naming this workload.

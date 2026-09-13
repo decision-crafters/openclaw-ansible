@@ -902,6 +902,29 @@ def scheduler_floors() -> list[tuple[str, bool]]:
         # live in the validator and are proven in tests/dc_scheduler_grant.py.
         ("SCHEDULER a grant cannot carry undeclared fields",
          schema.get("additionalProperties") is False),
+        # The pre-schedule write gate (TASK-323 sequencing amendment 2026-09-13):
+        # a writing workload is refused unless governed evidence of an admitted
+        # allowlist and one verified manual positive control exists. Pinned
+        # here as presence of the contract pieces; the behaviour is proven by
+        # mutation in tests/dc_scheduler_grant.py (W1–W26).
+        ("SCHEDULER the grant contract can name write-gate evidence",
+         "preconditions" in props
+         and "write_admission" in props["preconditions"].get("properties", {})
+         and "positive_control" in props["preconditions"].get("properties", {})),
+        ("SCHEDULER a positive control cannot be declared optional",
+         props.get("preconditions", {}).get("properties", {}).get("positive_control", {})
+         .get("properties", {}).get("required", {}).get("const") is True),
+        ("SCHEDULER the validator refuses a write tool without admission evidence",
+         "GRANT_WRITE_TOOL_WITHOUT_ADMISSION" in validator.read_text()
+         and "GRANT_POSITIVE_CONTROL_MISSING" in validator.read_text()
+         and "def check_preconditions" in validator.read_text()),
+        ("SCHEDULER prepare stages the evidence and passes it to the validator",
+         "--evidence-root" in prepare_play.read_text()
+         and "dc_grant_evidence_staging_dir" in prepare_play.read_text()),
+        ("SCHEDULER the evidence staging dir is removed before any refusal",
+         prepare_play.read_text().index("dc_grant_evidence_staging_dir }}\"\n  changed_when: false")
+         < prepare_play.read_text().index("Refuse a grant that does not validate")
+         if "dc_grant_evidence_staging_dir }}\"\n  changed_when: false" in prepare_play.read_text() else False),
         ("SCHEDULER a STOP condition is required",
          "stop_condition" in lifecycle_req),
         ("SCHEDULER a disable command is required",

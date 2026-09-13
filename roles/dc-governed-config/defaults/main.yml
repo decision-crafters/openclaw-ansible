@@ -1126,6 +1126,15 @@ dc_grant_schema_path: "{{ role_path }}/files/scheduler-grant.schema.json"
 dc_grant_staging_path: "/root/.dc-scheduler-grant.json"
 dc_grant_profile_staging_path: "/root/.dc-scheduler-profile.json"
 
+# Where scheduler_prepare.yml stages the governed evidence a grant's
+# `preconditions` block names (write-admission receipt, positive-control
+# receipt, its verification, the pinned cohort packet) so validate_grant.py can
+# open and cross-check them. Created 0700, removed before any refusal is raised.
+# The pre-schedule write gate of the 2026-09-13 TASK-323 sequencing amendment:
+# a grant that permits a write-shaped tool is refused unless that evidence
+# exists and agrees with itself — no flag satisfies it.
+dc_grant_evidence_staging_dir: "/root/.dc-scheduler-evidence"
+
 # The second gate on tasks/scheduler_apply.yml, beyond the repository-wide
 # dc_apply. Same shape as dc_confirm_stop and dc_agent_accept_list_risk: the
 # awkwardness IS the control.
