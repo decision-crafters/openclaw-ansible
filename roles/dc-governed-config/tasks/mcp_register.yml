@@ -116,12 +116,13 @@
   ansible.builtin.fail:
     msg: >-
       The server block contains a value shaped like a credential (a 40+
-      character token run, or a secret_/ntn_ prefix). Credentials are referenced
+      character token run other than a 64-hex sha256 pin, or a secret_/ntn_ prefix). Credentials are referenced
       by environment-variable NAME only; the value lives in the service account's
       0600 env file and never in a repository artifact. Nothing has been changed.
   when:
     - >-
-      ((dc_mcp_add.server | to_json | regex_search('[A-Za-z0-9_-]{40,}')) is not none)
+      ((dc_mcp_add.server | to_json | regex_replace('[0-9a-f]{64}', '')
+        | regex_search('[A-Za-z0-9_-]{40,}')) is not none)
       or ((dc_mcp_add.server | to_json | regex_search('(secret_|ntn_)[A-Za-z0-9]')) is not none)
     - dc_fail_closed | bool
 
@@ -234,24 +235,51 @@
   no_log: true
 
 # --- compose: create, or grow the include list and nothing else ---------------
+# A declared phase transition may ALSO change `args` — exactly from the recorded
+# Phase-A argument list to the recorded Phase-C one (the adapter's --phase flag).
+# Anything else about the existing server must be byte-identical.
+- name: Resolve the declared args transition, if any
+  ansible.builtin.set_fact:
+    dc_mcp_args_from: >-
+      {{ (dc_mcp_add.phase_transition | default({})).from_args
+         | default(dc_mcp_existing.args | default([])) }}
+    dc_mcp_args_to: >-
+      {{ (dc_mcp_add.phase_transition | default({})).to_args
+         | default(dc_mcp_existing.args | default([])) }}
+  no_log: true
+
+- name: Refuse a phase transition whose starting args are not the live ones
+  ansible.builtin.fail:
+    msg: >-
+      phase_transition.from_args does not equal the live server's args. The
+      transition is defined from the registered Phase-A shape; a different
+      starting point means a different server. Nothing has been changed.
+  when:
+    - (dc_mcp_existing | length) > 0
+    - dc_mcp_add.phase_transition is defined
+    - (dc_mcp_existing.args | default([])) != dc_mcp_args_from
+    - dc_fail_closed | bool
+
 - name: Compose the server entry
   ansible.builtin.set_fact:
     dc_mcp_new_entry: >-
       {{ dc_mcp_add.server
          if (dc_mcp_existing | length) == 0
-         else (dc_mcp_existing | combine({'toolFilter': {'include':
+         else (dc_mcp_existing | combine({'args': dc_mcp_args_to, 'toolFilter': {'include':
                 ((dc_mcp_existing.toolFilter.include | default([]))
                  + (dc_mcp_add.server.toolFilter.include
                     | difference(dc_mcp_existing.toolFilter.include | default([]))))}})) }}
   no_log: true
 
-- name: Prove an existing server changes only by growing its include list
+- name: Prove an existing server changes only by growing its include list (and the declared args transition)
   ansible.builtin.assert:
     that:
-      - (dc_mcp_new_entry | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
-        == (dc_mcp_existing | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
-      - (dc_mcp_add.server | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
-        == (dc_mcp_existing | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
+      - (dc_mcp_new_entry | dict2items | rejectattr('key', 'in', ['toolFilter', 'args']) | items2dict)
+        == (dc_mcp_existing | dict2items | rejectattr('key', 'in', ['toolFilter', 'args']) | items2dict)
+      - (dc_mcp_add.server | dict2items | rejectattr('key', 'in', ['toolFilter', 'args']) | items2dict)
+        == (dc_mcp_existing | dict2items | rejectattr('key', 'in', ['toolFilter', 'args']) | items2dict)
+      - (dc_mcp_add.server.args | default([])) == dc_mcp_args_to
+      - (dc_mcp_new_entry.args | default([])) == dc_mcp_args_to
       - (dc_mcp_existing.toolFilter.include | default([]))
         | difference(dc_mcp_new_entry.toolFilter.include) | length == 0
       - (dc_mcp_new_entry.toolFilter.include | symmetric_difference(
@@ -260,8 +288,9 @@
     fail_msg: >-
       ADDITIVE PRESERVATION NOT PROVEN for mcp.servers.{{ dc_mcp_add.server_name }}.
       The server already exists and the artifact would change something other
-      than growing toolFilter.include, or would drop an included tool. A
-      transport or credential change is a different act with its own artifact.
+      than growing toolFilter.include or the declared args transition, or would
+      drop an included tool. A transport or credential change is a different act
+      with its own artifact.
       Nothing has been changed.
     success_msg: >-
       {{ dc_mcp_add.server_name }}: include

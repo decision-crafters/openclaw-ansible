@@ -17,16 +17,16 @@
 #
 # WHAT THIS PLAY DOES, AND DOES NOT
 #
-#   does:   proves the wrapper SOURCE is the reviewed one (sha256), carries no
-#           token-shaped value and no placeholder; proves the server package is
-#           present at the declared root with the declared name/version and an
-#           entrypoint whose sha256 matches the artifact; proves the env file
-#           exists as the service account's 0600 file; then (apply) writes the
-#           wrapper 0700 owner:group service account, reads its stat back, and
-#           emits a receipt that IS the provenance line.
-#   does not: install the package (a separate act with its own receipt), read
-#           the env file (stat only, never slurp), register anything, restart
-#           anything.
+#   does:   proves the wrapper SOURCE and every file in the artifact's `files`
+#           map (the adapter, the cohort packet) are the reviewed bytes (sha256)
+#           and carry no token-shaped value or placeholder; proves the runtime
+#           interpreter meets the declared floor; proves the env file exists as
+#           the service account's 0600 file (stat only); then (apply) places the
+#           wrapper 0700 and each file at its declared mode, owner:group service
+#           account, reads every stat back, and emits a receipt that IS the
+#           provenance line.
+#   does not: install any package, read the env file (never slurp), register
+#           anything, restart anything.
 
 - name: Establish the CLI and confirm its verbs
   ansible.builtin.include_tasks: agent_common.yml
@@ -57,9 +57,10 @@
   ansible.builtin.fail:
     msg: >-
       {{ dc_mcp_wrapper_path }} is not valid JSON or lacks wrapper.source,
-      wrapper.dest, wrapper.expected_sha256, env_file.path, server_package.entrypoint,
-      server_package.entrypoint_sha256, server_package.package_json,
-      server_package.name or server_package.version. Nothing has been changed.
+      wrapper.dest, wrapper.expected_sha256, env_file.path, a non-empty files map,
+      runtime.binary, runtime.min_version, server_package.entrypoint,
+      server_package.entrypoint_sha256, server_package.name or
+      server_package.version. Nothing has been changed.
   when:
     - >-
       dc_mcpw is not defined
@@ -67,9 +68,11 @@
       or (dc_mcpw.wrapper.dest | default('') | length) == 0
       or (dc_mcpw.wrapper.expected_sha256 | default('') | length) == 0
       or (dc_mcpw.env_file.path | default('') | length) == 0
+      or (dc_mcpw.files | default({}) | length) == 0
+      or (dc_mcpw.runtime.binary | default('') | length) == 0
+      or (dc_mcpw.runtime.min_version | default('') | length) == 0
       or (dc_mcpw.server_package.entrypoint | default('') | length) == 0
       or (dc_mcpw.server_package.entrypoint_sha256 | default('') | length) == 0
-      or (dc_mcpw.server_package.package_json | default('') | length) == 0
       or (dc_mcpw.server_package.name | default('') | length) == 0
       or (dc_mcpw.server_package.version | default('') | length) == 0
     - dc_fail_closed | bool
@@ -88,13 +91,15 @@
 - name: Refuse an artifact that still carries template placeholders
   ansible.builtin.fail:
     msg: >-
-      The artifact contains a <placeholder> in wrapper, env_file or server_package.
-      The package identity, version, entrypoint digest and provenance are recorded
-      by the person who placed the package; an unfilled artifact cannot attest.
-      Nothing has been changed.
+      The artifact contains a <placeholder> in wrapper, env_file, files, runtime or
+      server_package (placed_by / placed_at / source_head are filled by the person
+      placing and are checked by the receipt, not here). An unfilled artifact
+      cannot attest. Nothing has been changed.
   when:
     - >-
-      ({'wrapper': dc_mcpw.wrapper, 'env_file': dc_mcpw.env_file, 'server_package': dc_mcpw.server_package}
+      ({'wrapper': dc_mcpw.wrapper, 'env_file': dc_mcpw.env_file, 'files': dc_mcpw.files, 'runtime': dc_mcpw.runtime,
+        'server_package': (dc_mcpw.server_package | dict2items
+                           | rejectattr('key', 'in', ['placed_by', 'placed_at', 'source_head']) | items2dict)}
        | to_json | regex_search('<[^>]*>')) is not none
     - dc_fail_closed | bool
 
@@ -147,81 +152,79 @@
       or (dc_mcpw_env.stat.mode | default('')) != (dc_mcpw.env_file.mode | default('0600'))
     - dc_fail_closed | bool
 
-# The bundle targets node18 and the MCP SDK declares node>=18. The host's node
-# is whatever the Gateway runs on; read it as the service account and refuse
-# below the floor rather than registering a server that dies at first spawn.
-- name: Read the node version as the service account
+# The runtime the wrapper execs — declared in the artifact (binary, version args,
+# floor). Read as the service account; refuse below the floor rather than
+# registering a server that dies at first spawn.
+- name: Read the runtime version as the service account
   ansible.builtin.command:
-    argv: ["/usr/bin/node", "--version"]
-  register: dc_mcpw_node
+    argv: "{{ [dc_mcpw.runtime.binary] + (dc_mcpw.runtime.version_args | default(['--version'])) }}"
+  register: dc_mcpw_rt
   changed_when: false
   failed_when: false
   become: true
   become_user: "{{ dc_openclaw_user }}"
 
-- name: Refuse when node is absent or below the floor the bundle targets
+- name: Refuse when the runtime is absent or below the declared floor
   ansible.builtin.assert:
     that:
-      - (dc_mcpw_node.rc | default(1)) == 0
+      - (dc_mcpw_rt.rc | default(1)) == 0
       - >-
-        (dc_mcpw_node.stdout | default('v0') | regex_replace('^v', '') | split('.') | first | int)
-        >= (dc_mcp_node_floor | int)
+        ((dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\\.[0-9]+') | default('0.0', true))
+        is version(dc_mcpw.runtime.min_version, '>=')
     fail_msg: >-
-      /usr/bin/node as {{ dc_openclaw_user }}: rc={{ dc_mcpw_node.rc | default('?') }},
-      version={{ dc_mcpw_node.stdout | default('?') | trim }}; the server bundle
-      targets node{{ dc_mcp_node_floor }} and the MCP SDK declares node>={{ dc_mcp_node_floor }}.
-      Nothing has been changed.
-    success_msg: "node {{ dc_mcpw_node.stdout | trim }} as {{ dc_openclaw_user }} (floor {{ dc_mcp_node_floor }})"
+      {{ dc_mcpw.runtime.binary }} as {{ dc_openclaw_user }}: rc={{ dc_mcpw_rt.rc | default('?') }},
+      output={{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | trim | truncate(80) }};
+      the artifact requires >= {{ dc_mcpw.runtime.min_version }}. Nothing has been changed.
+    success_msg: >-
+      {{ dc_mcpw.runtime.binary }}
+      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\\.[0-9]+(\\.[0-9]+)?') }}
+      as {{ dc_openclaw_user }} (floor {{ dc_mcpw.runtime.min_version }})
 
-- name: Stat the server entrypoint
-  ansible.builtin.stat:
-    path: "{{ dc_mcpw.server_package.entrypoint }}"
-    checksum_algorithm: sha256
-    get_mime: false
-  register: dc_mcpw_entry
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
-
-- name: Read the server package.json (identity only)
+# --- the files: the reviewed bytes, nothing secret, nothing unfilled -----------
+- name: Read each declared file from beside the artifact
   ansible.builtin.slurp:
-    src: "{{ dc_mcpw.server_package.package_json }}"
-  register: dc_mcpw_pkg_raw
-  become: true
-  become_user: "{{ dc_openclaw_user }}"
-  failed_when: false
+    src: >-
+      {{ (dc_mcp_wrapper_path | dirname | dirname) }}/{{
+         item.value.source | regex_replace('^dc-task-maintenance/', '') }}
+  loop: "{{ dc_mcpw.files | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dc_mcpw_files_src
+  delegate_to: localhost
+  become: false
 
-- name: Parse the package identity
-  ansible.builtin.set_fact:
-    dc_mcpw_pkg: >-
-      {{ (dc_mcpw_pkg_raw.content | default('e30=') | b64decode | from_json)
-         if (dc_mcpw_pkg_raw.content is defined) else {} }}
-  failed_when: false
-
-- name: Refuse when the server package is not the attested one
+- name: Refuse a declared file that is not the reviewed one or carries a secret shape
   ansible.builtin.assert:
     that:
-      - dc_mcpw_entry.stat.exists | default(false)
-      - dc_mcpw_entry.stat.isreg | default(false)
-      - (dc_mcpw_entry.stat.pw_name | default('')) == dc_openclaw_user
-      - not (dc_mcpw_entry.stat.wgrp | default(true))
-      - not (dc_mcpw_entry.stat.woth | default(true))
-      - (dc_mcpw_entry.stat.checksum | default('')) == dc_mcpw.server_package.entrypoint_sha256
-      - (dc_mcpw_pkg.name | default('')) == dc_mcpw.server_package.name
-      - (dc_mcpw_pkg.version | default('')) == dc_mcpw.server_package.version
+      - (item.content | b64decode | hash('sha256')) == item.item.value.sha256
+      - (item.content | b64decode | regex_replace('[0-9a-f]{64}', '') | regex_search('[A-Za-z0-9_-]{40,}')) is none
+      - (item.content | b64decode | regex_search('(secret_|ntn_)[A-Za-z0-9]{8,}')) is none
+      - item.item.value.dest is match('^/')
+      - item.item.value.mode | default('') in ['0400', '0500', '0600', '0700']
     fail_msg: >-
-      The server package on the host is not the one the artifact attests:
-      entrypoint exists={{ dc_mcpw_entry.stat.exists | default(false) }}
-      owner={{ dc_mcpw_entry.stat.pw_name | default('?') }}
-      sha256={{ (dc_mcpw_entry.stat.checksum | default('missing'))[:16] }}… vs
-      {{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…;
-      package.json name/version={{ dc_mcpw_pkg.name | default('?') }}/{{ dc_mcpw_pkg.version | default('?') }}
-      vs {{ dc_mcpw.server_package.name }}/{{ dc_mcpw.server_package.version }}.
-      A server whose identity is not proven is not wired to the Gateway. Placing
-      the package is a separate act with its own receipt; this play installs
-      nothing. Nothing has been changed.
+      {{ item.item.key }}: source does not hash to {{ item.item.value.sha256[:16] }}…, or
+      contains a token-shaped value, or its dest/mode is not an absolute path with a
+      service-account-only mode. Nothing has been changed.
     success_msg: >-
-      server package attested: {{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }},
-      entrypoint sha256 {{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…, owner {{ dc_openclaw_user }}
+      {{ item.item.key }} is the reviewed file ({{ item.item.value.sha256[:16] }}…),
+      mode {{ item.item.value.mode }}
+  loop: "{{ dc_mcpw_files_src.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Confirm the declared entrypoint is one of the declared files with the same digest
+  ansible.builtin.assert:
+    that:
+      - dc_mcpw.server_package.entrypoint in (dc_mcpw.files | dict2items | map(attribute='value.dest') | list)
+      - >-
+        (dc_mcpw.files | dict2items | selectattr('value.dest', 'equalto', dc_mcpw.server_package.entrypoint)
+         | map(attribute='value.sha256') | first) == dc_mcpw.server_package.entrypoint_sha256
+    fail_msg: >-
+      server_package.entrypoint / entrypoint_sha256 do not match a declared file. The
+      entrypoint the wrapper execs must be one of the attested files. Nothing has been changed.
+    success_msg: >-
+      entrypoint {{ dc_mcpw.server_package.entrypoint }} attested
+      ({{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…)
 
 - name: Gate the write
   ansible.builtin.include_tasks: apply_gate.yml
@@ -234,6 +237,7 @@
       mode: "{{ dc_mcpw.wrapper.mode | default('0700') }}"
       source_sha256: "{{ dc_mcpw.wrapper.expected_sha256 }}"
       server_package: "{{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }}"
+      files: "{{ dc_mcpw.files | dict2items | map(attribute='value.dest') | list }}"
       env_file: "{{ dc_mcpw.env_file.path }} (stat only; never read)"
 
 - name: Create the wrapper directory
@@ -252,6 +256,53 @@
     group: "{{ dc_openclaw_user }}"
     mode: "{{ dc_mcpw.wrapper.mode | default('0700') }}"
   register: dc_mcpw_placed
+
+- name: Create the declared file directories
+  ansible.builtin.file:
+    path: "{{ item.value.dest | dirname }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+  loop: "{{ dc_mcpw.files | dict2items }}"
+  loop_control:
+    label: "{{ item.value.dest | dirname }}"
+
+- name: Place each declared file at its declared mode
+  ansible.builtin.copy:
+    content: "{{ item.content | b64decode }}"
+    dest: "{{ item.item.value.dest }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: "{{ item.item.value.mode }}"
+  loop: "{{ dc_mcpw_files_src.results }}"
+  loop_control:
+    label: "{{ item.item.value.dest }}"
+
+- name: Read each placed file back
+  ansible.builtin.stat:
+    path: "{{ item.value.dest }}"
+    checksum_algorithm: sha256
+    get_mime: false
+  loop: "{{ dc_mcpw.files | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dc_mcpw_files_after
+
+- name: Confirm every placed file is the reviewed one at its declared mode
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - (item.stat.checksum | default('')) == item.item.value.sha256
+      - (item.stat.pw_name | default('')) == dc_openclaw_user
+      - (item.stat.mode | default('')) == item.item.value.mode
+    fail_msg: >-
+      {{ item.item.key }} did not read back as the reviewed file at mode
+      {{ item.item.value.mode }}; remove the directory before registering anything
+    success_msg: "{{ item.item.key }} placed: sha256 matches, {{ item.stat.mode }} {{ dc_openclaw_user }}"
+  loop: "{{ dc_mcpw_files_after.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
 
 - name: Read the placed wrapper back
   ansible.builtin.stat:
@@ -286,7 +337,10 @@
       server_package={{ dc_mcpw.server_package.name }}@{{ dc_mcpw.server_package.version }}
       entrypoint={{ dc_mcpw.server_package.entrypoint }}
       entrypoint_sha256={{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…
-      provenance={{ dc_mcpw.server_package.provenance | default('NOT RECORDED') | truncate(160) }} |
+      files={{ dc_mcpw.files | dict2items | map(attribute='key') | list }}
+      runtime={{ dc_mcpw.runtime.binary }}
+      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\\.[0-9]+(\\.[0-9]+)?') }}
+      source_head={{ dc_mcpw.server_package.source_head | default('NOT RECORDED') }} |
       env_file={{ dc_mcpw.env_file.path }} mode={{ dc_mcpw_env.stat.mode | default('?') }} (never read) |
       installed_nothing=true registered_nothing=true restarted_nothing=true |
       NOT PROVEN HERE: that the server starts and answers over stdio — the

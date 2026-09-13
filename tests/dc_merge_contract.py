@@ -1075,13 +1075,17 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          and "get_checksum: false" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
          and "slurp:\n    src: \"{{ dc_mcpw.env_file.path" not in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
          and "installed_nothing=true" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")),
-        ("MCP-WRAPPER the node version is read as the service account and gated to a floor before the write gate",
-         d.get("dc_mcp_node_floor") == 18
-         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when node is absent or below the floor")
+        ("MCP-WRAPPER the runtime version is read as the service account and gated to the artifact's floor before the write gate",
+         (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when the runtime is absent or below the declared floor")
          < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")),
+        ("MCP-WRAPPER every declared file is hashed against the artifact before the write gate and read back after",
+         (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse a declared file that is not the reviewed one")
+         < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")
+         and "Confirm every placed file is the reviewed one at its declared mode" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
+         and "Confirm the declared entrypoint is one of the declared files" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")),
         ("MCP-WRAPPER the source digest, secret shape and package identity are asserted before the write gate",
          (tasks / "mcp_wrapper_place.yml").is_file()
-         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when the server package is not the attested one")
+         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Confirm the declared entrypoint is one of the declared files")
          < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")
          and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("carries a secret shape")
          < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")),
@@ -1094,6 +1098,12 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          < (tasks / "mcp_register.yml").read_text(errors="ignore").index("--dry-run")),
         ("MCP-REGISTER a credential-bearing key (env/headers/oauth/clientKey) in the server block is refused",
          "Refuse a credential-bearing key in the server block" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER a 64-hex sha256 pin in args is not mistaken for a secret, other long runs still are",
+         "regex_replace('[0-9a-f]{64}', '')" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and "regex_search('[A-Za-z0-9_-]{40,}')" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER an existing server may change only its include list and a declared args transition",
+         "Refuse a phase transition whose starting args are not the live ones" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and "rejectattr('key', 'in', ['toolFilter', 'args'])" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
         ("MCP-REGISTER an exclude filter or an include outside allowed_tools is refused",
          (tasks / "mcp_register.yml").is_file()
          and "'exclude' in" in (tasks / "mcp_register.yml").read_text(errors="ignore")
