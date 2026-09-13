@@ -482,6 +482,11 @@ dc_mcp_command_mode: "0700"
 # package identity to attest. Empty by default; deployment binding.
 dc_mcp_wrapper_path: ""
 
+# Node major version floor for a stdio MCP server bundle (TASK-323: bundle
+# target node18; @modelcontextprotocol/sdk engines node>=18). Read as the
+# service account; refused below this before any placement.
+dc_mcp_node_floor: 18
+
 # Tools that MUST be denied on the deployed profile. Checked against, not
 # written — the profile is the source of truth and this is the floor it has to
 # clear. The seven session tools appear in no PRM-5 revision and were permitted

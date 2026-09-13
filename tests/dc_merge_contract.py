@@ -1075,6 +1075,10 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          and "get_checksum: false" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
          and "slurp:\n    src: \"{{ dc_mcpw.env_file.path" not in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")
          and "installed_nothing=true" in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")),
+        ("MCP-WRAPPER the node version is read as the service account and gated to a floor before the write gate",
+         d.get("dc_mcp_node_floor") == 18
+         and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when node is absent or below the floor")
+         < (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("include_tasks: apply_gate.yml")),
         ("MCP-WRAPPER the source digest, secret shape and package identity are asserted before the write gate",
          (tasks / "mcp_wrapper_place.yml").is_file()
          and (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").index("Refuse when the server package is not the attested one")

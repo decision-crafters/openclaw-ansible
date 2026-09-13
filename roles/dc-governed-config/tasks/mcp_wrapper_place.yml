@@ -147,6 +147,32 @@
       or (dc_mcpw_env.stat.mode | default('')) != (dc_mcpw.env_file.mode | default('0600'))
     - dc_fail_closed | bool
 
+# The bundle targets node18 and the MCP SDK declares node>=18. The host's node
+# is whatever the Gateway runs on; read it as the service account and refuse
+# below the floor rather than registering a server that dies at first spawn.
+- name: Read the node version as the service account
+  ansible.builtin.command:
+    argv: ["/usr/bin/node", "--version"]
+  register: dc_mcpw_node
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+
+- name: Refuse when node is absent or below the floor the bundle targets
+  ansible.builtin.assert:
+    that:
+      - (dc_mcpw_node.rc | default(1)) == 0
+      - >-
+        (dc_mcpw_node.stdout | default('v0') | regex_replace('^v', '') | split('.') | first | int)
+        >= (dc_mcp_node_floor | int)
+    fail_msg: >-
+      /usr/bin/node as {{ dc_openclaw_user }}: rc={{ dc_mcpw_node.rc | default('?') }},
+      version={{ dc_mcpw_node.stdout | default('?') | trim }}; the server bundle
+      targets node{{ dc_mcp_node_floor }} and the MCP SDK declares node>={{ dc_mcp_node_floor }}.
+      Nothing has been changed.
+    success_msg: "node {{ dc_mcpw_node.stdout | trim }} as {{ dc_openclaw_user }} (floor {{ dc_mcp_node_floor }})"
+
 - name: Stat the server entrypoint
   ansible.builtin.stat:
     path: "{{ dc_mcpw.server_package.entrypoint }}"
