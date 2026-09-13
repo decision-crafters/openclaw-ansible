@@ -166,10 +166,16 @@
   register: dc_iso_backups
   failed_when: false
 
+# Newest by CTIME, not mtime. The backup plays copy with remote_src, which
+# carries the SOURCE file's modification time onto the copy: the pre-deny-add
+# backup of 2026-09-13 reports an mtime of 2026-08-19 — the config's last write
+# before that day. Sorting by mtime would therefore rank backups by when the
+# config was last edited before each one, not by when each was taken. ctime is
+# set when the backup file itself is created and cannot be carried over.
 - name: Record the newest backup
   ansible.builtin.set_fact:
     dc_iso_newest_backup: >-
-      {{ (dc_iso_backups.files | default([]) | sort(attribute='mtime') | last | default({}))
+      {{ (dc_iso_backups.files | default([]) | sort(attribute='ctime') | last | default({}))
          if (dc_iso_backups.files | default([]) | length > 0) else {} }}
 
 - name: Emit the isolation receipt
@@ -183,7 +189,7 @@
       operator->runtime_rc={{ dc_iso_op_to_rt.rc | default('?') }}
       runtime->operator_rc={{ dc_iso_rt_to_op.rc | default('?') }} (non-zero is the pass) |
       newest_backup={{ (dc_iso_newest_backup.path | default('NONE FOUND')) | basename }}
-      mtime={{ '%Y-%m-%dT%H:%M:%SZ' | strftime(dc_iso_newest_backup.mtime | default(0), utc=true)
-               if dc_iso_newest_backup else 'n/a' }}
-      (name and time only; contents not read) |
+      created={{ '%Y-%m-%dT%H:%M:%SZ' | strftime(dc_iso_newest_backup.ctime | default(0), utc=true)
+                 if dc_iso_newest_backup else 'n/a' }}
+      (name and creation time only; contents not read; mtime is the source's, not the copy's) |
       read_only=true wrote_nothing=true
