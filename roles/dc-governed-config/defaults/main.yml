@@ -465,6 +465,13 @@ dc_isolation_backup_pattern: "openclaw.json.*"
 # the private inventory, never here.
 dc_deny_add_path: ""
 
+# --- MCP registration (tasks/mcp_register.yml, --tags mcp-register) -------------
+# The artifact naming ONE server, its phase, the tools its filter may include,
+# and the server block — credentials by env-var NAME only. Empty by default for
+# the same reason as dc_deny_add_path: which server, under which task, is a
+# deployment binding for the private repository. The play refuses without it.
+dc_mcp_register_path: ""
+
 # Tools that MUST be denied on the deployed profile. Checked against, not
 # written — the profile is the source of truth and this is the floor it has to
 # clear. The seven session tools appear in no PRM-5 revision and were permitted
@@ -624,6 +631,16 @@ dc_agent_memory_mode: '0700'
 #
 # Checked twice by the play: once against the install list, once against the
 # workspace as it exists on the host afterwards. Those are different claims.
+# Optional sha256 pins for installed workspace files, path -> hex digest. The
+# install is a plain copy and the post-install check proves only mode and uid,
+# so without this map a stale or edited skill installs cleanly. With it, every
+# named file is hashed on the controller BEFORE the write gate and on the host
+# AFTER the copy; either mismatch refuses. Keys must be in
+# dc_agent_workspace_files. Empty = no digest gate, and the receipt says so.
+# Derive it, do not type it: the TASK-323 package emits it from its skill pin
+# (`scripts/skill_pin_verify.py --emit-ansible-digests`).
+dc_agent_workspace_digests: {}
+
 dc_agent_workspace_excluded:
   - admission
   - openclaw.json

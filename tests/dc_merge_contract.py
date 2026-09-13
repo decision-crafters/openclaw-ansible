@@ -428,6 +428,19 @@ def workspace_floors() -> list[tuple[str, bool]]:
          "AGENTS.md" in files),
         ("WORKSPACE TOOLS.md is installed", "TOOLS.md" in files),
         ("WORKSPACE IDENTITY.md is installed", "IDENTITY.md" in files),
+        # Digest gate: a plain copy proves mode and uid, not bytes. With a map
+        # declared, the source is hashed before the write gate and the host
+        # after the copy; without one the receipt says the bytes are unpinned.
+        ("WORKSPACE a digest map is declared (empty by default)",
+         isinstance(d.get("dc_agent_workspace_digests"), dict) and d.get("dc_agent_workspace_digests") == {}),
+        ("WORKSPACE pinned files are hashed with sha256 before the write gate and after the copy",
+         "checksum_algorithm: sha256" in ws_text
+         and ws_text.index("Hash the pinned files at the source") < ws_text.index("include_tasks: apply_gate.yml")
+         and ws_text.index("Install the governance files read-only") < ws_text.index("Hash the pinned files as installed")),
+        ("WORKSPACE a digest for a file not being installed is refused",
+         "Refuse a digest for a file that is not being installed" in ws_text),
+        ("WORKSPACE the receipt states when bytes are unpinned",
+         "digests_verified=" in ws_text and "bytes not pinned" in ws_text),
         ("WORKSPACE SOUL.md is installed", "SOUL.md" in files),
         ("WORKSPACE admission material is excluded", "admission" in excluded),
         (f"WORKSPACE nothing excluded appears in the install list"
@@ -988,6 +1001,35 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          (tasks / "isolation_restore.yml").read_text(errors="ignore")),
         ("DENY-ADD no artifact path is baked into this public repo",
          d.get("dc_deny_add_path") == ""),
+        # MCP registration: the widest single change this role can make, so
+        # the artifact gates are pinned here as presence, and the no_log on the
+        # patch is pinned because the block may name an env var.
+        ("MCP-REGISTER no artifact path is baked into this public repo",
+         d.get("dc_mcp_register_path") == ""),
+        ("MCP-REGISTER the play exists and is tagged in the admission playbook",
+         (tasks / "mcp_register.yml").is_file()
+         and "tasks_from: mcp_register" in
+         (ROLE.parent.parent / "playbooks" / "governed-admission.yml").read_text(errors="ignore")
+         and "- mcp-register" in
+         (ROLE.parent.parent / "playbooks" / "governed-admission.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER a token-shaped value in the artifact is refused before the dry run",
+         (tasks / "mcp_register.yml").is_file()
+         and (tasks / "mcp_register.yml").read_text(errors="ignore").index("shaped like a secret")
+         < (tasks / "mcp_register.yml").read_text(errors="ignore").index("--dry-run")),
+        ("MCP-REGISTER a template placeholder in the artifact is refused",
+         (tasks / "mcp_register.yml").is_file()
+         and "template placeholders" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER the patch and dry run run under no_log",
+         (tasks / "mcp_register.yml").is_file()
+         and (tasks / "mcp_register.yml").read_text(errors="ignore").count("no_log: true") >= 4),
+        ("MCP-REGISTER every other server is asserted preserved and the read-back must equal the composition",
+         (tasks / "mcp_register.yml").is_file()
+         and "Prove every other server is preserved" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and "Confirm the runtime holds exactly the composed object" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER an exclude filter or an include outside allowed_tools is refused",
+         (tasks / "mcp_register.yml").is_file()
+         and "'exclude' in" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and "difference(dc_mcp_add.allowed_tools" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
         ("DENY-ADD the additive deny play proves field-for-field preservation",
          (tasks / "agent_deny_add.yml").is_file()
          and "ADDITIVE PRESERVATION NOT PROVEN" in

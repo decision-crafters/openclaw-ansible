@@ -180,3 +180,22 @@
         tasks_from: agent_deny_add
   tags:
     - deny-add
+
+# Register ONE MCP server, or grow ONE server's toolFilter.include, from an
+# artifact. mcp.servers.<name> is Gateway-wide (TASK-225), so this is the
+# widest single change the role can make: every other server is asserted
+# preserved, the artifact may carry credentials by env-var name only (a value
+# shaped like a token is refused), the patch runs under no_log, and the
+# receipt says what is NOT proven — agent-local denial, which --tags
+# tool-surface settles per agent. Restarts the Gateway. Dry run by default.
+- name: Register or extend an MCP server
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Apply the MCP registration artifact
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: mcp_register
+  tags:
+    - mcp-register

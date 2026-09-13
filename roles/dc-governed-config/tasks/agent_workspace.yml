@@ -196,6 +196,50 @@
     success_msg: "'{{ item }}' correctly excluded"
   loop: "{{ dc_agent_workspace_excluded }}"
 
+# --- digest gate, source side --------------------------------------------------
+#
+# A pinned file is hashed where it is read from, before anything is written.
+# A copy that lands 0444 root-owned proves the install is tamper-resistant
+# afterwards; it says nothing about whether the bytes were the pinned ones.
+- name: Refuse a digest for a file that is not being installed
+  ansible.builtin.assert:
+    that:
+      - (dc_agent_workspace_digests | default({}) | dict2items | map(attribute='key') | list)
+        | difference(dc_agent_workspace_files) | length == 0
+    fail_msg: >-
+      dc_agent_workspace_digests names a path that is not in
+      dc_agent_workspace_files:
+      {{ (dc_agent_workspace_digests | default({}) | dict2items | map(attribute='key') | list)
+         | difference(dc_agent_workspace_files) }}. A digest for a file that is
+      not installed is a claim nothing checks. Nothing has been changed.
+    success_msg: "{{ dc_agent_workspace_digests | default({}) | length }} digest(s) declared, all for installed files"
+
+- name: Hash the pinned files at the source
+  ansible.builtin.stat:
+    path: "{{ dc_ws_src }}/{{ item.key }}"
+    checksum_algorithm: sha256
+    get_mime: false
+  loop: "{{ dc_agent_workspace_digests | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dc_ws_src_digests
+  delegate_to: localhost
+  become: false
+
+- name: Refuse a source file whose sha256 is not the pinned one
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+      - (item.stat.checksum | default('')) == item.item.value
+    fail_msg: >-
+      {{ item.item.key }}: source sha256 {{ (item.stat.checksum | default('missing'))[:16] }}…
+      is not the pinned {{ item.item.value[:16] }}…. The file about to be installed
+      is not the file the pin describes. Nothing has been changed.
+    success_msg: "{{ item.item.key }} matches its pin"
+  loop: "{{ dc_ws_src_digests.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
 - name: Gate the write
   ansible.builtin.include_tasks: apply_gate.yml
   vars:
@@ -363,6 +407,31 @@
     success_msg: "{{ item }} installed 0444 root"
   loop: "{{ dc_agent_workspace_files }}"
 
+# --- digest gate, host side -----------------------------------------------------
+- name: Hash the pinned files as installed
+  ansible.builtin.stat:
+    path: "{{ dc_ws_real.stdout | trim }}/{{ item.key }}"
+    checksum_algorithm: sha256
+    get_mime: false
+  loop: "{{ dc_agent_workspace_digests | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: dc_ws_host_digests
+
+- name: Confirm every pinned file landed with its pinned sha256
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+      - (item.stat.checksum | default('')) == item.item.value
+    fail_msg: >-
+      {{ item.item.key }}: installed sha256 {{ (item.stat.checksum | default('missing'))[:16] }}…
+      is not the pinned {{ item.item.value[:16] }}…. What landed is not what was
+      pinned; remove the workspace and re-run rather than trusting it.
+    success_msg: "{{ item.item.key }} installed with its pinned sha256"
+  loop: "{{ dc_ws_host_digests.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
 # The exclusion is verified on the HOST, not just in the variable. The assert
 # above proves the list was clean; this proves the directory is — they are
 # different claims, and the one that matters is the one about the machine an
@@ -386,6 +455,9 @@
       agent={{ dc_agent_id }} |
       workspace={{ dc_ws_real.stdout | trim }} (1755 {{ dc_openclaw_user }}) |
       installed={{ dc_agent_workspace_files | length }} files 0444 root |
+      digests_verified={{ (dc_agent_workspace_digests | default({}) | length)
+                          if (dc_agent_workspace_digests | default({}) | length) > 0
+                          else 'none (no dc_agent_workspace_digests declared — bytes not pinned)' }} |
       state_dirs={{ dc_agent_workspace_state_dirs | join(', ') }}
       ({{ dc_agent_memory_mode }} {{ dc_openclaw_user }} — Gateway writes these,
       the agent does not) |

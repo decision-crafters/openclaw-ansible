@@ -1,0 +1,473 @@
+---
+# Register ONE MCP server on the Gateway, or extend ONE server's tool filter,
+# additively — from an artifact, never by hand.
+#
+#   sudo ansible-playbook playbooks/governed-admission.yml \
+#     --tags mcp-register -e dc_mcp_register_path=/path/to/server.json \
+#     -e ansible_become=false [-e dc_apply=true]
+#
+# WHY THIS EXISTS
+#
+# `mcp.servers.<name>` is GATEWAY-WIDE: a registered server is callable by every
+# agent that does not deny its tools, and its `toolFilter` is server-global
+# (TASK-225, verified on 2026.7.1-2). Registering one is therefore the widest
+# single change this role can make to what the runtime can reach, and the
+# TASK-323 admission packet says exactly how it may happen: from an artifact
+# in the private repository, validated by the runtime's own dry run, with every
+# other server proven untouched, and never by typing `config patch` by hand.
+#
+# WHAT THE ARTIFACT MAY AND MAY NOT CARRY
+#
+# It names the server, the phase, the tools its filter may include, and the
+# server block itself. It may reference a credential ONLY by environment
+# variable name (`${VAR}`); any value shaped like a token — a 40+ character
+# run, a `secret_`/`ntn_` prefix — is refused before the runtime sees it, and
+# so is any `<placeholder>` left from a template. The patch and the dry run run
+# under no_log; the apply gate is shown key NAMES, not values. The audit's
+# report redaction covers `config get mcp.servers` afterwards.
+#
+# ADDITIVE, AND PROVEN
+#
+# The new `mcp.servers` object is composed from the LIVE read: every other
+# server byte-identical, the named server either created from the artifact or,
+# if it already exists, changed only in `toolFilter.include` and only by
+# growing. Writing the whole composed object makes the merge-vs-replace
+# semantics of `config patch` on an object irrelevant: the read-back must
+# equal the composition either way, and that equality is asserted.
+#
+# NOT PROVEN HERE, BY DESIGN
+#
+# That the registered tools are absent from every other agent's enumeration.
+# `--tags tool-surface` on each agent settles that, and the admission packet's
+# STOP rule says registration is rolled back if it cannot be shown.
+
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Refuse without an MCP registration artifact
+  ansible.builtin.assert:
+    that:
+      - dc_mcp_register_path | default('') | length > 0
+    fail_msg: >-
+      dc_mcp_register_path must name an artifact
+      ({"server_name": ..., "phase": ..., "allowed_tools": [...], "server": {...},
+      "authority": {...}}). There is no default: which server, which tools and
+      under which task are deployment bindings and belong in a private
+      repository beside the inventory. Nothing has been read.
+    success_msg: "reading {{ dc_mcp_register_path }}"
+
+- name: Read the MCP registration artifact
+  ansible.builtin.slurp:
+    src: "{{ dc_mcp_register_path }}"
+  register: dc_mcp_raw
+  delegate_to: localhost
+  become: false
+
+- name: Parse the artifact
+  ansible.builtin.set_fact:
+    dc_mcp_add: "{{ dc_mcp_raw.content | b64decode | from_json }}"
+  failed_when: false
+
+- name: Refuse an artifact that will not parse or is incomplete
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_mcp_register_path }} is not valid JSON, or lacks a non-empty
+      `server_name`, a `server` object, a non-empty `allowed_tools` list or a
+      `phase`. Nothing has been changed.
+  when:
+    - >-
+      dc_mcp_add is not defined
+      or (dc_mcp_add.server_name | default('') | length) == 0
+      or (dc_mcp_add.server | default({}) | length) == 0
+      or (dc_mcp_add.allowed_tools | default([]) | length) == 0
+      or (dc_mcp_add.phase | default('') | length) == 0
+    - dc_fail_closed | bool
+
+- name: Refuse an artifact that names no canonical authority
+  ansible.builtin.fail:
+    msg: >-
+      The artifact carries no authority.task_id / authority.decision_memory_page_id.
+      Registering a Gateway-wide server is a governed act; name the task and the
+      accepted decision it implements. Nothing has been changed.
+  when:
+    - >-
+      (dc_mcp_add.authority.task_id | default('') | length) == 0
+      or (dc_mcp_add.authority.decision_memory_page_id | default('') | length) == 0
+    - dc_fail_closed | bool
+
+# --- the artifact may carry names, never values ------------------------------
+- name: Refuse an artifact that still carries template placeholders
+  ansible.builtin.fail:
+    msg: >-
+      The server block contains a <placeholder>. The transport keys are settled
+      by `--tags schema-evidence` and the dry run, then written into the
+      artifact by a person; an unfilled template cannot be applied.
+      Nothing has been changed.
+  when:
+    - dc_mcp_add.server | to_json | regex_search('<[^>]*>')
+    - dc_fail_closed | bool
+
+- name: Refuse an artifact that carries anything shaped like a secret
+  ansible.builtin.fail:
+    msg: >-
+      The server block contains a value shaped like a credential (a 40+
+      character token run, or a secret_/ntn_ prefix). Credentials are referenced
+      by environment-variable NAME only; the value lives in the service account's
+      0600 env file and never in a repository artifact. Nothing has been changed.
+  when:
+    - >-
+      (dc_mcp_add.server | to_json | regex_search('[A-Za-z0-9_-]{40,}'))
+      or (dc_mcp_add.server | to_json | regex_search('(secret_|ntn_)[A-Za-z0-9]'))
+    - dc_fail_closed | bool
+
+- name: Refuse a filter that is not an explicit, bounded include
+  ansible.builtin.fail:
+    msg: >-
+      toolFilter must be exactly {include: [...]} with a non-empty list, no
+      exclude (an exclude list admits everything not named), and every included
+      tool must appear in the artifact's own allowed_tools
+      ({{ dc_mcp_add.allowed_tools | default([]) }}). Nothing has been changed.
+  when:
+    - >-
+      (dc_mcp_add.server.toolFilter | default({}) | length) == 0
+      or (dc_mcp_add.server.toolFilter.include | default([]) | length) == 0
+      or ('exclude' in (dc_mcp_add.server.toolFilter | default({})))
+      or ((dc_mcp_add.server.toolFilter.include | default([]))
+          | difference(dc_mcp_add.allowed_tools | default([])) | length) > 0
+    - dc_fail_closed | bool
+
+# --- live read ------------------------------------------------------------------
+- name: Read the live MCP registration surface
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'mcp.servers'] }}"
+  register: dc_mcp_live_raw
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 30
+
+# rc=1 with nothing set is the accepted "no server registered" reading (host
+# baseline 2026-09-13). Anything else that is not JSON is refused.
+- name: Parse the live servers (unset means none)
+  ansible.builtin.set_fact:
+    dc_mcp_live: >-
+      {{ (dc_mcp_live_raw.stdout | default('') | from_json)
+         if ((dc_mcp_live_raw.rc | default(1)) == 0 and (dc_mcp_live_raw.stdout | default('') | trim | length) > 0)
+         else {} }}
+  no_log: true
+
+- name: Refuse when the live surface is not an object
+  ansible.builtin.fail:
+    msg: >-
+      `config get mcp.servers` returned something that is not an object
+      (rc={{ dc_mcp_live_raw.rc | default('?') }}). Refusing to compose over an
+      unreadable surface. Nothing has been changed.
+  when:
+    - dc_mcp_live is not mapping
+    - dc_fail_closed | bool
+
+- name: Locate any existing entry for this server
+  ansible.builtin.set_fact:
+    dc_mcp_existing: "{{ dc_mcp_live[dc_mcp_add.server_name] | default({}, true) }}"
+  no_log: true
+
+# --- compose: create, or grow the include list and nothing else ---------------
+- name: Compose the server entry
+  ansible.builtin.set_fact:
+    dc_mcp_new_entry: >-
+      {{ dc_mcp_add.server
+         if (dc_mcp_existing | length) == 0
+         else (dc_mcp_existing | combine({'toolFilter': {'include':
+                ((dc_mcp_existing.toolFilter.include | default([]))
+                 + (dc_mcp_add.server.toolFilter.include
+                    | difference(dc_mcp_existing.toolFilter.include | default([]))))}})) }}
+  no_log: true
+
+- name: Prove an existing server changes only by growing its include list
+  ansible.builtin.assert:
+    that:
+      - (dc_mcp_new_entry | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
+        == (dc_mcp_existing | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
+      - (dc_mcp_add.server | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
+        == (dc_mcp_existing | dict2items | rejectattr('key', 'equalto', 'toolFilter') | items2dict)
+      - (dc_mcp_existing.toolFilter.include | default([]))
+        | difference(dc_mcp_new_entry.toolFilter.include) | length == 0
+      - (dc_mcp_new_entry.toolFilter.include | symmetric_difference(
+            (dc_mcp_existing.toolFilter.include | default([])) + dc_mcp_add.server.toolFilter.include)) | length == 0
+      - dc_mcp_new_entry.toolFilter.include | length == (dc_mcp_new_entry.toolFilter.include | unique | length)
+    fail_msg: >-
+      ADDITIVE PRESERVATION NOT PROVEN for mcp.servers.{{ dc_mcp_add.server_name }}.
+      The server already exists and the artifact would change something other
+      than growing toolFilter.include, or would drop an included tool. A
+      transport or credential change is a different act with its own artifact.
+      Nothing has been changed.
+    success_msg: >-
+      {{ dc_mcp_add.server_name }}: include
+      {{ dc_mcp_existing.toolFilter.include | default([]) | length }} ->
+      {{ dc_mcp_new_entry.toolFilter.include | length }}, nothing else differs
+  when: (dc_mcp_existing | length) > 0
+
+- name: Note when the server is already registered exactly as requested
+  ansible.builtin.debug:
+    msg: >-
+      DC-MCP-REGISTER | mcp.servers.{{ dc_mcp_add.server_name }} already carries
+      this filter. Already-registered is the goal state; the patch is a no-op.
+  when:
+    - (dc_mcp_existing | length) > 0
+    - dc_mcp_new_entry == dc_mcp_existing
+
+- name: Compose the new mcp.servers object
+  ansible.builtin.set_fact:
+    dc_mcp_new_servers: "{{ dc_mcp_live | combine({dc_mcp_add.server_name: dc_mcp_new_entry}) }}"
+  no_log: true
+
+- name: Prove every other server is preserved
+  ansible.builtin.assert:
+    that:
+      - (dc_mcp_new_servers | dict2items | rejectattr('key', 'equalto', dc_mcp_add.server_name) | items2dict)
+        == (dc_mcp_live | dict2items | rejectattr('key', 'equalto', dc_mcp_add.server_name) | items2dict)
+      - (dc_mcp_new_servers | length) == (dc_mcp_live | length) + (1 if (dc_mcp_existing | length) == 0 else 0)
+    fail_msg: >-
+      The composed mcp.servers does not preserve the other servers. The whole
+      object is written back, so any drift here would change a server nobody
+      named. Nothing has been changed.
+    success_msg: >-
+      mcp.servers composed: {{ dc_mcp_new_servers | list }}
+      ({{ 'created' if (dc_mcp_existing | length) == 0 else 'extended' }} {{ dc_mcp_add.server_name }})
+
+- name: Compose the patch
+  ansible.builtin.set_fact:
+    dc_mcp_patch_body:
+      mcp:
+        servers: "{{ dc_mcp_new_servers }}"
+  no_log: true
+
+# --- the runtime's own gate --------------------------------------------------
+- name: Ask the runtime to validate the patch without applying it
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin', '--dry-run'] }}"
+    stdin: "{{ dc_mcp_patch_body | to_json }}"
+  register: dc_mcp_dryrun
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 120
+
+# Shown redacted by value shape, the same rule the audit report applies: the
+# runtime may echo the server block, and the block may name an env var but
+# must never contain a token. The regex is the belt on top of that refusal.
+- name: Report what the dry run said (redacted by value shape)
+  ansible.builtin.debug:
+    msg: >-
+      rc={{ dc_mcp_dryrun.rc | default('?') }} |
+      {{ ((dc_mcp_dryrun.stdout | default('')) ~ ' ' ~ (dc_mcp_dryrun.stderr | default('')))
+         | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>')
+         | regex_replace('((secret_|ntn_)[A-Za-z0-9]+)', '<REDACTED>')
+         | trim | truncate(1200) }}
+
+- name: Refuse a patch the runtime rejects
+  ansible.builtin.fail:
+    msg: >-
+      `config patch --dry-run` rejected the registration
+      (rc={{ dc_mcp_dryrun.rc | default('?') }}). The transport keys in the
+      artifact are what the runtime is objecting to, most likely; settle them
+      against `--tags schema-evidence` before retrying. Nothing written.
+  when:
+    - (dc_mcp_dryrun.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Confirm the dry run changed nothing
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'mcp.servers'] }}"
+  register: dc_mcp_after_dry
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 30
+
+- name: Assert the dry run was in fact dry
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((dc_mcp_after_dry.stdout | default('') | from_json)
+          if ((dc_mcp_after_dry.rc | default(1)) == 0 and (dc_mcp_after_dry.stdout | default('') | trim | length) > 0)
+          else {}) == dc_mcp_live
+    fail_msg: >-
+      mcp.servers changed during a --dry-run. The dry run was not dry, and
+      nothing further should be trusted from this play.
+    success_msg: "dry run left mcp.servers unchanged"
+
+# The gate sees NAMES: the server, the phase, the filter, and which keys the
+# block carries. Never the block itself — apply_gate.yml prints its overlay.
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: >-
+      mcp.servers.{{ dc_mcp_add.server_name }}
+      ({{ 'create' if (dc_mcp_existing | length) == 0 else 'extend include' }},
+      phase {{ dc_mcp_add.phase }}, --tags mcp-register)
+    dc_apply_overlay:
+      authority: "{{ dc_mcp_add.authority }}"
+      server: "{{ dc_mcp_add.server_name }}"
+      phase: "{{ dc_mcp_add.phase }}"
+      tool_filter_include: "{{ dc_mcp_new_entry.toolFilter.include }}"
+      server_keys: "{{ dc_mcp_add.server | dict2items | map(attribute='key') | list }}"
+      credential_by_name_only: true
+      other_servers_untouched: >-
+        {{ dc_mcp_live | dict2items | map(attribute='key')
+           | reject('equalto', dc_mcp_add.server_name) | list }}
+      note: >-
+        Gateway-wide surface; every other agent must be probed with
+        --tags tool-surface afterwards. Gateway restarts.
+
+# --- write --------------------------------------------------------------------
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+- name: Back up the config before the registration
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: >-
+      {{ dc_openclaw_backup_dir }}/openclaw.json.pre-mcp-register.{{
+         ansible_facts['date_time'].iso8601_basic_short }}
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Apply the registration
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'patch', '--stdin'] }}"
+    stdin: "{{ dc_mcp_patch_body | to_json }}"
+  register: dc_mcp_patch
+  changed_when: dc_mcp_patch.rc == 0
+  failed_when: false
+  no_log: true
+  timeout: 120
+  notify: Restart openclaw gateway
+
+- name: Refuse when the patch failed
+  ansible.builtin.fail:
+    msg: >-
+      `config patch` failed (rc={{ dc_mcp_patch.rc | default('?') }}).
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_mcp_patch.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Validate the whole config after the patch
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+  register: dc_mcp_validate
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse when the config no longer validates
+  ansible.builtin.fail:
+    msg: >-
+      The config does not validate after the patch
+      (rc={{ dc_mcp_validate.rc | default('?') }}):
+      {{ dc_mcp_validate.stdout | default('') | regex_replace('([A-Za-z0-9_-]{40,})', '<REDACTED-LONG>') | trim }}
+      Recover with playbooks/governed-rollback.yml.
+  when:
+    - (dc_mcp_validate.rc | default(1)) != 0
+    - dc_fail_closed | bool
+
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+- name: Let the gateway settle
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_mcp_h1
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 15
+
+- name: Sample the unit state again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + dc_life_show }}"
+  register: dc_mcp_h2
+  changed_when: false
+  failed_when: false
+
+- name: Extract both samples
+  ansible.builtin.set_fact:
+    dc_mcp_s1: "{{ dict(dc_mcp_h1.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_mcp_s2: "{{ dict(dc_mcp_h2.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway survived the registration
+  ansible.builtin.assert:
+    that:
+      - dc_mcp_s2.ActiveState | default('') == 'active'
+      - dc_mcp_s2.SubState | default('') == 'running'
+      - (dc_mcp_s2.NRestarts | default(0) | int) == (dc_mcp_s1.NRestarts | default(0) | int)
+    fail_msg: >-
+      The gateway is not stable after registering {{ dc_mcp_add.server_name }}.
+      NRestarts {{ dc_mcp_s1.NRestarts | default('?') }} -> {{ dc_mcp_s2.NRestarts | default('?') }}.
+      A server whose process cannot start takes the Gateway with it; recover
+      with playbooks/governed-rollback.yml.
+    success_msg: >-
+      gateway active and stable
+      (NRestarts held at {{ dc_mcp_s2.NRestarts | default('0') }} across 15s)
+
+# --- verify from the runtime, not from what we wrote ---------------------------
+- name: Read mcp.servers back from the runtime
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'get', 'mcp.servers'] }}"
+  register: dc_mcp_final
+  changed_when: false
+  failed_when: false
+  no_log: true
+  timeout: 30
+
+- name: Confirm the runtime holds exactly the composed object
+  ansible.builtin.assert:
+    that:
+      - (dc_mcp_final.rc | default(1)) == 0
+      - (dc_mcp_final.stdout | default('{}') | from_json) == dc_mcp_new_servers
+    fail_msg: >-
+      The runtime's mcp.servers after the patch is not the composed object.
+      Either {{ dc_mcp_add.server_name }} differs from what was proven, or
+      another server changed — including the possibility that `config patch`
+      merged rather than replaced. Recover with playbooks/governed-rollback.yml.
+    success_msg: >-
+      runtime read-back: mcp.servers == composed object;
+      {{ dc_mcp_add.server_name }} include={{ dc_mcp_new_entry.toolFilter.include }};
+      other servers byte-identical to the pre-patch read
+
+- name: Emit the registration receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-MCP-REGISTER RECEIPT |
+      server={{ dc_mcp_add.server_name }} phase={{ dc_mcp_add.phase }}
+      ({{ 'created' if (dc_mcp_existing | length) == 0 else 'extended' }}) |
+      authority={{ dc_mcp_add.authority.task_id }} /
+      {{ dc_mcp_add.authority.decision_memory_page_id }} |
+      include_before={{ dc_mcp_existing.toolFilter.include | default([]) }}
+      include_after={{ dc_mcp_new_entry.toolFilter.include }} |
+      server_keys={{ dc_mcp_add.server | dict2items | map(attribute='key') | list }} |
+      others_untouched={{ dc_mcp_live | dict2items | map(attribute='key')
+                          | reject('equalto', dc_mcp_add.server_name) | list }} |
+      config_validate=rc={{ dc_mcp_validate.rc | default('?') }} |
+      gateway={{ dc_mcp_s2.ActiveState | default('?') }}/{{ dc_mcp_s2.SubState | default('?') }}
+      NRestarts={{ dc_mcp_s2.NRestarts | default('?') }} (stable 15s) |
+      credential=by env-var name only; value never read by this play |
+      NOT PROVEN HERE: the tool-name spelling this build exposes, and that the
+      tools are ABSENT from every other agent. Run --tags tool-surface on each
+      agent now; if agent-local denial cannot be shown on main and dc-research,
+      roll this registration back (playbooks/governed-rollback.yml) rather than
+      leaving the surface Gateway-wide.
