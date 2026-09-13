@@ -1026,6 +1026,13 @@ def scheduler_floors() -> list[tuple[str, bool]]:
          (tasks / "mcp_register.yml").is_file()
          and "Prove every other server is preserved" in (tasks / "mcp_register.yml").read_text(errors="ignore")
          and "Confirm the runtime holds exactly the composed object" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-REGISTER a stdio command that is absent or not the service account's executable is refused before the dry run",
+         (tasks / "mcp_register.yml").is_file()
+         and "Refuse a stdio server whose command is absent" in (tasks / "mcp_register.yml").read_text(errors="ignore")
+         and (tasks / "mcp_register.yml").read_text(errors="ignore").index("Refuse a stdio server whose command is absent")
+         < (tasks / "mcp_register.yml").read_text(errors="ignore").index("--dry-run")),
+        ("MCP-REGISTER a credential-bearing key (env/headers/oauth/clientKey) in the server block is refused",
+         "Refuse a credential-bearing key in the server block" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
         ("MCP-REGISTER an exclude filter or an include outside allowed_tools is refused",
          (tasks / "mcp_register.yml").is_file()
          and "'exclude' in" in (tasks / "mcp_register.yml").read_text(errors="ignore")

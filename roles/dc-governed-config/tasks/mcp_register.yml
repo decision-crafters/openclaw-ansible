@@ -136,6 +136,59 @@
           | difference(dc_mcp_add.allowed_tools | default([])) | length) > 0
     - dc_fail_closed | bool
 
+# --- a stdio command must already exist, as the service account's own file ------
+#
+# The schema (2026.7.1-2, read 2026-09-13) declares `command`/`args` for a
+# stdio server and no substitution for `env` values, so the TASK-323 shape is
+# a wrapper the service account owns that reads its 0600 env file and execs
+# the server. Registering a command that is absent or someone else's file
+# would either take the Gateway down at restart or run a process nobody
+# admitted. Both are refused here, before the runtime is asked anything.
+- name: Stat the stdio command as the service account
+  ansible.builtin.stat:
+    path: "{{ dc_mcp_add.server.command }}"
+    get_mime: false
+  register: dc_mcp_cmd
+  become: true
+  become_user: "{{ dc_openclaw_user }}"
+  when: (dc_mcp_add.server.transport | default('stdio')) == 'stdio' and (dc_mcp_add.server.command | default('') | length) > 0
+
+- name: Refuse a stdio server whose command is absent, not executable, or not the service account's
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_mcp_add.server.command | default('<none>') }} must exist, be executable,
+      and be owned by {{ dc_openclaw_user }} with no group/other write bit before
+      it is registered as a stdio MCP server
+      (exists={{ dc_mcp_cmd.stat.exists | default(false) }},
+      executable={{ dc_mcp_cmd.stat.executable | default(false) }},
+      owner={{ dc_mcp_cmd.stat.pw_name | default('?') }},
+      mode={{ dc_mcp_cmd.stat.mode | default('?') }}). A wrapper that does not
+      exist yet means the server package has not been placed or its provenance
+      recorded. Nothing has been changed.
+  when:
+    - (dc_mcp_add.server.transport | default('stdio')) == 'stdio'
+    - >-
+      (dc_mcp_add.server.command | default('') | length) == 0
+      or not (dc_mcp_cmd.stat.exists | default(false))
+      or not (dc_mcp_cmd.stat.executable | default(false))
+      or (dc_mcp_cmd.stat.pw_name | default('')) != dc_openclaw_user
+      or (dc_mcp_cmd.stat.wgrp | default(true))
+      or (dc_mcp_cmd.stat.woth | default(true))
+    - dc_fail_closed | bool
+
+- name: Refuse a credential-bearing key in the server block
+  ansible.builtin.fail:
+    msg: >-
+      The server block carries {{ dc_mcp_add.server | dict2items | map(attribute='key')
+      | select('in', ['env', 'headers', 'oauth', 'clientKey', 'client_key']) | list }}.
+      The TASK-323 shape keeps every credential out of openclaw.json: the wrapper
+      reads the 0600 env file itself. Nothing has been changed.
+  when:
+    - >-
+      (dc_mcp_add.server | dict2items | map(attribute='key')
+       | select('in', ['env', 'headers', 'oauth', 'clientKey', 'client_key']) | list | length) > 0
+    - dc_fail_closed | bool
+
 # --- live read ------------------------------------------------------------------
 - name: Read the live MCP registration surface
   ansible.builtin.command:
