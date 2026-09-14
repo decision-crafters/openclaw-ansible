@@ -855,6 +855,24 @@ def _inject_exit(mod, work: list[str], transcript: bool = False) -> int:
             sys.argv = argv
 
 
+def _token_shape_rule_behaves() -> bool:
+    """Mirror the wrapper play's token-shape rule in Python and prove its four cases:
+    a 64-hex digest and a 64-hyphen comment rule are not tokens; a 44-char alphanumeric
+    run is; so is the same run with a dash rule spliced into it."""
+    import re  # noqa: PLC0415
+
+    def flagged(text: str) -> bool:
+        stripped = re.sub(r"[-_]{4,}", "", re.sub(r"[0-9a-f]{64}", "", text))
+        return re.search(r"[A-Za-z0-9_-]{40,}", stripped) is not None
+
+    return (
+        not flagged("# " + "-" * 64 + "\nx = 1\n")
+        and not flagged("sha = 'abdc925797046ecebb46094b1d0b6e61632c1f374c16c9f21c5b27300949f8a9'\n")
+        and flagged("KEY = 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefgh'\n")
+        and flagged("AbCdEfGhIjKlMnOpQrSt----UvWxYz0123456789abcdefgh")
+    )
+
+
 def _when_regex_search_is_boolean(tasks_dir) -> bool:
     """Walk every task file; for each `when` item containing regex_search, require an
     explicit boolean comparison (`is not none`, `is none`) or negation (`not (`)."""
@@ -1101,6 +1119,12 @@ def scheduler_floors() -> list[tuple[str, bool]]:
         ("MCP-REGISTER a 64-hex sha256 pin in args is not mistaken for a secret, other long runs still are",
          "regex_replace('[0-9a-f]{64}', '')" in (tasks / "mcp_register.yml").read_text(errors="ignore")
          and "regex_search('[A-Za-z0-9_-]{40,}')" in (tasks / "mcp_register.yml").read_text(errors="ignore")),
+        ("MCP-WRAPPER a comment rule of hyphens/underscores is not a token shape; a 40+ alphanumeric run still is (both file checks)",
+         (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").count("regex_replace('[-_]{4,}', '')") == 2
+         and _token_shape_rule_behaves()),
+        ("MCP-WRAPPER the runtime version renders in the success message and receipt (single-escaped regex inside the template)",
+         (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore").count("regex_search('[0-9]+\\.[0-9]+(\\.[0-9]+)?') }}") == 2
+         and "regex_search('[0-9]+\\\\.[0-9]+(\\\\.[0-9]+)?') }}" not in (tasks / "mcp_wrapper_place.yml").read_text(errors="ignore")),
         ("MCP-REGISTER an existing server may change only its include list and a declared args transition",
          "Refuse a phase transition whose starting args are not the live ones" in (tasks / "mcp_register.yml").read_text(errors="ignore")
          and "rejectattr('key', 'in', ['toolFilter', 'args'])" in (tasks / "mcp_register.yml").read_text(errors="ignore")),

@@ -115,7 +115,7 @@
   ansible.builtin.assert:
     that:
       - (dc_mcpw_src.content | b64decode | hash('sha256')) == dc_mcpw.wrapper.expected_sha256
-      - not (dc_mcpw_src.content | b64decode | regex_search('[A-Za-z0-9_-]{40,}'))
+      - not (dc_mcpw_src.content | b64decode | regex_replace('[-_]{4,}', '') | regex_search('[A-Za-z0-9_-]{40,}'))
       - not (dc_mcpw_src.content | b64decode | regex_search('(secret_|ntn_)[A-Za-z0-9]'))
       - (dc_mcpw_src.content | b64decode) is search('^#!/')
     fail_msg: >-
@@ -177,10 +177,14 @@
       the artifact requires >= {{ dc_mcpw.runtime.min_version }}. Nothing has been changed.
     success_msg: >-
       {{ dc_mcpw.runtime.binary }}
-      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\\.[0-9]+(\\.[0-9]+)?') }}
+      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\.[0-9]+(\.[0-9]+)?') }}
       as {{ dc_openclaw_user }} (floor {{ dc_mcpw.runtime.min_version }})
 
 # --- the files: the reviewed bytes, nothing secret, nothing unfilled -----------
+# Token shape = a run of 40+ [A-Za-z0-9_-] AFTER removing 64-hex digests and runs of
+# 4+ punctuation ([-_]). A comment rule of hyphens is not a token (false positive seen
+# on the host 2026-09-14); a real token split by dashes still is, because only the
+# dashes are removed and the alphanumerics rejoin.
 - name: Read each declared file from beside the artifact
   ansible.builtin.slurp:
     src: >-
@@ -197,7 +201,9 @@
   ansible.builtin.assert:
     that:
       - (item.content | b64decode | hash('sha256')) == item.item.value.sha256
-      - (item.content | b64decode | regex_replace('[0-9a-f]{64}', '') | regex_search('[A-Za-z0-9_-]{40,}')) is none
+      - >-
+        (item.content | b64decode | regex_replace('[0-9a-f]{64}', '') | regex_replace('[-_]{4,}', '')
+         | regex_search('[A-Za-z0-9_-]{40,}')) is none
       - (item.content | b64decode | regex_search('(secret_|ntn_)[A-Za-z0-9]{8,}')) is none
       - item.item.value.dest is match('^/')
       - item.item.value.mode | default('') in ['0400', '0500', '0600', '0700']
@@ -339,7 +345,7 @@
       entrypoint_sha256={{ dc_mcpw.server_package.entrypoint_sha256[:16] }}…
       files={{ dc_mcpw.files | dict2items | map(attribute='key') | list }}
       runtime={{ dc_mcpw.runtime.binary }}
-      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\\.[0-9]+(\\.[0-9]+)?') }}
+      {{ (dc_mcpw_rt.stdout ~ ' ' ~ dc_mcpw_rt.stderr) | regex_search('[0-9]+\.[0-9]+(\.[0-9]+)?') }}
       source_head={{ dc_mcpw.server_package.source_head | default('NOT RECORDED') }} |
       env_file={{ dc_mcpw.env_file.path }} mode={{ dc_mcpw_env.stat.mode | default('?') }} (never read) |
       installed_nothing=true registered_nothing=true restarted_nothing=true |
