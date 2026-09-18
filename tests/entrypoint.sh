@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLAYBOOK_ARGS=(-e ci_test=true -e ansible_become=false --connection=local)
+# Keep task-level become_user active so pnpm runs as the service user, not root.
+PLAYBOOK_ARGS=(-e ci_test=true --connection=local)
 
 # --- Step 1: Convergence ---
 echo "===> Step 1: Convergence test"
-ansible-playbook playbook.yml "${PLAYBOOK_ARGS[@]}"
+bash run-playbook.sh "${PLAYBOOK_ARGS[@]}"
 echo "===> Convergence: PASSED"
 
 # --- Step 2: Verification ---
 echo "===> Step 2: Verification"
 ansible-playbook tests/verify.yml "${PLAYBOOK_ARGS[@]}"
 echo "===> Verification: PASSED"
+
+echo "===> Installer entrypoint user switching"
+bash tests/installer-user.sh
+
+echo "===> Existing development checkout upgrade"
+bash tests/development-upgrade.sh
 
 # --- Step 3: Idempotency ---
 echo "===> Step 3: Idempotency test"

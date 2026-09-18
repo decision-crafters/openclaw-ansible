@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Preserve service-user privilege switching when either installer script is launched as root, and repair existing root-owned development checkouts before updating and building as the service user.
+- Fix local installation failing after package setup by removing tasks that reference the deleted banner template; run the Docker installer harness in CI.
+- Reuse fresh apt metadata on repeated installations while refreshing immediately when the NodeSource repository is added.
+- Remove unused configuration, service, and banner templates; document the native Gateway and onboarding-owned security configuration accurately. Thanks @tosin2013 for the report.
+- Update the Ansible lint toolchain and GitHub Actions dependencies, with Python 3.14 for CI.
+- Exclude checkout metadata and local Ansible caches from Docker test images so the harness also works from Git worktrees.
+- Preserve service-user privilege switching in the Docker test harness to avoid recurring pnpm ownership changes.
 - Remove the OpenClaw service user from the root-equivalent Docker group, including on existing installations. Thanks @Tonynanra for the report.
 - Document expected results for post-install security verification and link the checks from setup documentation. Thanks @justinfiore for the report.
 
