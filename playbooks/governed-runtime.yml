@@ -1,0 +1,28 @@
+---
+# Governed OpenClaw RUNTIME upgrade — the package, not the config.
+#
+#   ansible-playbook playbooks/governed-runtime.yml --tags runtime-upgrade                    (dry run)
+#   ansible-playbook playbooks/governed-runtime.yml --tags runtime-upgrade -e dc_apply=true   (apply)
+#
+# Rollback lives in governed-rollback.yml (--tags runtime-rollback), for the same
+# reason config rollback does: the recovery entry point should not share a file
+# with the thing it recovers from.
+#
+# The version installed is dc_runtime_target_version, set in the private inventory
+# (host_vars) or on the command line — never a default here. Everything the play
+# refuses on runs before the apply gate; see tasks/runtime_upgrade.yml.
+
+- name: Confirm a governed target exists
+  ansible.builtin.import_playbook: governed-preflight-target.yml
+
+- name: Upgrade the OpenClaw runtime under governance
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Install, prove and restart into the target build
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: runtime_upgrade
+  tags:
+    - runtime-upgrade

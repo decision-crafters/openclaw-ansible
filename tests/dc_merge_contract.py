@@ -1350,12 +1350,107 @@ def validator_floors() -> list[tuple[str, bool]]:
     ]
 
 
+def _runtime_diff_behaves(checker: Path) -> list[tuple[str, bool]]:
+    """Import files/config_diff.py and prove its four cases rather than grepping it."""
+    import importlib.util
+    import tempfile
+    if not checker.is_file():
+        return [("RUNTIME config_diff.py present", False)]
+    spec = importlib.util.spec_from_file_location("config_diff", checker)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    before = {"agents": {"defaults": {"model": {"primary": "codex/x"}}, "list": [{"id": "a", "model": {"primary": "codex/y"}}]},
+              "gateway": {"bind": "loopback"}}
+    only_routes = {"agents": {"defaults": {"model": {"primary": "openai/x"}}, "list": [{"id": "a", "model": {"primary": "openai/y"}}]},
+                   "gateway": {"bind": "loopback"}}
+    also_bind = {"agents": {"defaults": {"model": {"primary": "openai/x"}}, "list": [{"id": "a", "model": {"primary": "openai/y"}}]},
+                 "gateway": {"bind": "lan"}}
+    allow = ["agents.defaults.model", "agents.list.*.model"]
+    routes = mod.changed_paths(before, only_routes)
+    with tempfile.TemporaryDirectory() as tmp:
+        b = Path(tmp) / "b.json"; b.write_text(json.dumps(before))
+        a = Path(tmp) / "a.json"; a.write_text(json.dumps(also_bind))
+        rc_outside = mod.main(["config_diff.py", str(b), str(a), "--allow", ",".join(allow)])
+        rc_unreadable = mod.main(["config_diff.py", str(b), str(Path(tmp) / "missing.json")])
+    return [
+        ("RUNTIME config_diff: list indices collapse to * (agents.list.*.model.primary)",
+         "agents.list.*.model.primary" in routes),
+        ("RUNTIME config_diff: route-only change is inside the allowlist", mod.outside(routes, allow) == []),
+        ("RUNTIME config_diff: a change outside the allowlist exits 1", rc_outside == 1),
+        ("RUNTIME config_diff: unreadable input exits 2", rc_unreadable == 2),
+    ]
+
+
+def runtime_floors() -> list[tuple[str, bool]]:
+    """Floors on the governed runtime upgrade/rollback plays (TASK-282).
+
+    The install role runs `pnpm install -g openclaw@latest` with no pin, gate or
+    backup. These pin the properties that make the upgrade path controlled: the
+    target is never defaulted, the method is the installer the host was built
+    with, doctor --fix is off unless authorised, and the order inside the play is
+    gate -> backups/record -> install -> prove the new build -> unit -> restart ->
+    prove the process. tests read source text; the diff checker is imported.
+    """
+    tasks = ROLE / "tasks"
+    up = (tasks / "runtime_upgrade.yml").read_text(errors="ignore") if (tasks / "runtime_upgrade.yml").is_file() else ""
+    rb = (tasks / "runtime_rollback.yml").read_text(errors="ignore") if (tasks / "runtime_rollback.yml").is_file() else ""
+    fixture = json.loads((ROLE / "files" / "schema-keys.json").read_text())
+    governed_roots = ("gateway.bind", "agents.defaults.sandbox", "tools", "plugins.deny", "plugins.allow", "channels", "bindings")
+    allow = DEFAULTS.get("dc_doctor_fix_allowed_keys", [])
+    probes = DEFAULTS.get("dc_cli_surface_probes", [])
+    return [
+        ("RUNTIME dc_runtime_target_version has no default (must be named per invocation)",
+         DEFAULTS.get("dc_runtime_target_version") == ""),
+        ("RUNTIME method is the installer the host was built with (pnpm)", DEFAULTS.get("dc_runtime_upgrade_method") == "pnpm"),
+        ("RUNTIME doctor --fix is off by default", DEFAULTS.get("dc_runtime_doctor_fix") is False),
+        ("RUNTIME downgrades refused by default", DEFAULTS.get("dc_runtime_allow_downgrade") is False),
+        ("RUNTIME doctor-fix allowlist is non-empty and names no governed root",
+         len(allow) > 0 and not any(str(a).startswith(r) for a in allow for r in governed_roots)),
+        ("RUNTIME upgrade: apply gate precedes the install",
+         _task_index(up, "Gate the write") < _task_index(up, "Install the target build")),
+        ("RUNTIME upgrade: config backup, unit backup and rollback record precede the install",
+         max(_task_index(up, "Back up the config before the runtime changes"),
+             _task_index(up, "Back up the gateway unit before the runtime changes"),
+             _task_index(up, "Write the rollback record")) < _task_index(up, "Install the target build")),
+        ("RUNTIME upgrade: the new build validates the config before the unit is touched or restarted",
+         _task_index(up, "Install the target build") < _task_index(up, "Validate the current config with the NEW build")
+         < _task_index(up, "Point ExecStart at the new entrypoint") < _task_index(up, "Restart the gateway before verifying it")),
+        ("RUNTIME upgrade: the governance overlay is checked against the NEW schema before the restart",
+         _task_index(up, "Check the governance overlay against the NEW schema") < _task_index(up, "Restart the gateway before verifying it")),
+        ("RUNTIME upgrade: version and running-process asserts follow the restart, then verify.yml",
+         _task_index(up, "Restart the gateway before verifying it") < _task_index(up, "Confirm the running process is the new build")
+         < _task_index(up, "Verify the governed controls survived the upgrade")),
+        ("RUNTIME upgrade: doctor --fix is gated on dc_runtime_doctor_fix, backed up first, diffed before any restart",
+         "when: dc_runtime_doctor_fix | bool" in up
+         and _task_index(up, "Back up the config before doctor --fix") < _task_index(up, "Run doctor --fix under the new build")
+         < _task_index(up, "Diff what doctor changed against the allowlist") < _task_index(up, "Restart the gateway before verifying it")),
+        ("RUNTIME upgrade: a pgrep of the gateway process is compared to the new entrypoint",
+         "pgrep" in up and "dc_ru_entry_new in (dc_ru_pgrep.stdout" in up),
+        ("RUNTIME plays never call systemd directly or use become_user (runuser + XDG via dc_life_systemctl only)",
+         all(x not in up + rb for x in ("ansible.builtin.systemd", "become_user", "- systemctl"))),
+        ("RUNTIME rollback: selects the record by filename (sort), includes the apply gate, validates before restarting",
+         "map(attribute='path') | sort | last" in rb and "mtime" not in rb
+         and _task_index(rb, "Gate the write") < _task_index(rb, "Reinstall the previous build")
+         < _task_index(rb, "Validate the config with the restored build before restarting") < _task_index(rb, "Restart the gateway on the restored build")),
+        ("RUNTIME rollback: preserves the current config before restoring", _task_index(rb, "Preserve the current config") < _task_index(rb, "Restore the recorded config")),
+        ("RUNTIME schema-keys.json is stamped with the build the defaults say it was distilled from",
+         fixture.get("_openclaw_version") == DEFAULTS.get("dc_runtime_schema_fixture_version")),
+        ("RUNTIME cli-surface probes the upstream `update` verb (diffed, not used)",
+         any(p.get("name") == "update" for p in probes)),
+        ("RUNTIME the governance overlay is built in one file both govern and runtime-upgrade include",
+         (tasks / "overlay_build.yml").is_file() and "Build the governance overlay" in (tasks / "overlay_build.yml").read_text()
+         and "include_tasks: overlay_build.yml" in (tasks / "main.yml").read_text() and "include_tasks: overlay_build.yml" in up),
+        ("RUNTIME every entrypoint derivation refuses a path that does not exist",
+         all("Refuse an entrypoint that does not exist" in (tasks / f).read_text() for f in ("agent_common.yml", "main.yml", "rollback.yml"))),
+    ] + _runtime_diff_behaves(ROLE / "files" / "config_diff.py")
+
+
 def main() -> int:
     merged = combine_recursive(ONBOARDED, OVERLAY)
     sandbox = merged["agents"]["defaults"]["sandbox"]
     tools = merged["tools"]
 
-    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + workspace_floors() + admit_harness_floors() + injection_floors() + scheduler_floors() + [
+    checks: list[tuple[str, bool]] = safety_floors() + schema_floors() + validator_floors() + no_deployment_identifiers() + target_floors() + workspace_floors() + admit_harness_floors() + injection_floors() + scheduler_floors() + runtime_floors() + [
         # Governance wins over permissive onboarding values.
         ("sandbox.mode overridden off -> %s" % SANDBOX_MODE, sandbox["mode"] == SANDBOX_MODE),
         ("workspaceAccess overridden rw -> %s" % WORKSPACE, sandbox["workspaceAccess"] == WORKSPACE),

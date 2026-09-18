@@ -37,6 +37,23 @@
       {{ dc_openclaw_entrypoint if (dc_openclaw_entrypoint | length > 0)
          else (dc_entrypoint_probe.stdout | default('') | trim) }}
 
+- name: Stat the entrypoint the unit names
+  ansible.builtin.stat:
+    path: "{{ dc_openclaw_entrypoint }}"
+  register: dc_entry_stat
+  when: dc_openclaw_entrypoint | length > 0
+
+- name: Refuse an entrypoint that does not exist
+  ansible.builtin.fail:
+    msg: >-
+      ExecStart names {{ dc_openclaw_entrypoint }}, which does not exist. The runtime was
+      upgraded or moved without the unit following it; `--tags runtime-upgrade` (dry) shows
+      the derived path and `--tags runtime-rollback` restores the recorded one.
+  when:
+    - dc_openclaw_entrypoint | length > 0
+    - not (dc_entry_stat.stat.exists | default(false))
+    - dc_fail_closed | bool
+
 - name: Refuse to continue without an entrypoint to ask for the schema
   ansible.builtin.fail:
     msg: >-
@@ -89,55 +106,10 @@
     - dc_config_current is not defined
     - dc_fail_closed | bool
 
-# Built as a fact rather than a template so the merge is a data operation with
-# one obvious precedence rule, instead of a rendering that has to reproduce
-# every key onboarding wrote.
+# The overlay itself lives in overlay_build.yml so the runtime-upgrade play can
+# validate the same data against a new build's schema. Pure include; no value here.
 - name: Build the governance overlay
-  ansible.builtin.set_fact:
-    dc_governance_overlay:
-      agents:
-        defaults:
-          sandbox:
-            mode: "{{ dc_sandbox_mode }}"
-            scope: "{{ dc_sandbox_scope }}"
-            workspaceAccess: "{{ dc_sandbox_workspace_access }}"
-            docker:
-              network: "{{ dc_sandbox_docker_network }}"
-      tools:
-        allow: "{{ dc_tools_allow }}"
-        deny: "{{ dc_tools_deny }}"
-        exec:
-          mode: "{{ dc_tools_exec_mode }}"
-        elevated:
-          enabled: "{{ dc_tools_elevated_enabled | bool }}"
-      gateway:
-        bind: "{{ dc_gateway_bind }}"
-      plugins:
-        deny: "{{ dc_plugins_deny }}"
-
-# `plugins.allow` is deliberately NOT written when empty, which differs from how
-# this role treats tools.allow.
-#
-# For tools, OpenClaw documents that a non-empty allow-list blocks everything
-# outside it — so empty means inactive, and writing [] to clear an inherited
-# list is safe and necessary. For PLUGINS that behaviour is not documented
-# anywhere verified. The host's config (inspected 2026-08-15) has no
-# plugins.allow at all, so writing [] would introduce a key whose empty-list
-# semantics are an assumption.
-#
-# If OpenClaw read [] as "permit nothing" rather than "no allow-list", it would
-# disable every plugin — including slack, the operator's only route to this
-# Gateway, and ollama, the model provider. That is the exact shape of the
-# gateway.bind failure: a plausible reading of an unverified value, applied to a
-# live daemon.
-#
-# deny wins over allow and over per-plugin enablement, so deny alone is
-# sufficient. An absent key cannot be misread.
-- name: Include a plugin allow-list only when one is deliberately configured
-  ansible.builtin.set_fact:
-    dc_governance_overlay: >-
-      {{ dc_governance_overlay | combine({'plugins': {'allow': dc_plugins_allow}}, recursive=True) }}
-  when: dc_plugins_allow | length > 0
+  ansible.builtin.include_tasks: overlay_build.yml
 
 # Checked before the schema gate, because this failure is not a schema failure.
 # `plugins.deny: ["slack"]` is perfectly legal config — the schema would accept

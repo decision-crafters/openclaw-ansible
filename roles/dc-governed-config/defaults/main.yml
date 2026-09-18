@@ -1401,6 +1401,13 @@ dc_cli_surface_probes:
   - name: "doctor"
     argv: ["doctor", "--help"]
     requires: []
+  # `openclaw update` is the upstream self-update path. The runtime-upgrade play
+  # does NOT use it (it restarts the Gateway outside the governed handler and its
+  # rollback is opaque); it is probed so the surface is diffed across builds, not
+  # depended on. Nothing is required of it.
+  - name: "update"
+    argv: ["update", "--help"]
+    requires: []
 
 dc_cli_surface_report: >-
   /tmp/openclaw-cli-surface-{{
@@ -1720,3 +1727,87 @@ dc_memory_evidence_path: "/root/.dc-memory-evidence.json"
 dc_memory_report: >-
   /tmp/openclaw-memory-posture-{{
      ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+
+# --- Runtime upgrade / rollback (tasks/runtime_upgrade.yml, tasks/runtime_rollback.yml) -----
+#
+# The install role runs `pnpm install -g openclaw@latest` with no pin, no gate and
+# no backup, so re-running `--tags install` on a live host is an uncontrolled
+# upgrade. These plays are the controlled path: dry run by default, `-e dc_apply=true`
+# to mutate, backups and a rollback RECORD written before the install, the new
+# build proven (`--version`, `config validate`, the governance overlay against the
+# new schema) BEFORE the unit is pointed at it, and the running process checked
+# after the restart. TASK-282 is the canonical task; the 2026-08-31 Founder
+# decision is the authority. Nothing here is a default to leave set.
+#
+# Method is pinned to pnpm — the same installer, store and env the install role
+# uses — so the rollback is symmetric (`pnpm install -g openclaw@<previous>`).
+# `openclaw update` is deliberately not used: it restarts the Gateway itself,
+# outside the runuser/XDG handler that checks lingering and unit presence, and
+# its rollback is not observable from here.
+dc_runtime_target_version: ""            # REQUIRED at invocation (host_vars or -e); the play refuses when empty
+dc_runtime_previous_version: ""          # derived at preflight; rollback reads its record unless this is set
+dc_runtime_upgrade_method: "pnpm"        # the only accepted value
+dc_runtime_package: "openclaw"
+dc_runtime_pnpm: "/usr/bin/pnpm"
+dc_runtime_node: "/usr/bin/node"
+# Mirrors roles/openclaw/tasks/openclaw-release.yml so the upgraded package lands
+# in the same global store the original install used.
+dc_runtime_pnpm_env:
+  - "PNPM_HOME={{ dc_openclaw_home }}/.local/share/pnpm"
+  - "HOME={{ dc_openclaw_home }}"
+  - >-
+    PATH={{ dc_openclaw_home }}/.local/bin:{{ dc_openclaw_home }}/.local/share/pnpm/bin:{{
+    dc_openclaw_home }}/.local/share/pnpm:/usr/local/bin:/usr/bin:/bin
+dc_runtime_unit_path: "{{ dc_openclaw_home }}/.config/systemd/user/{{ dc_openclaw_service }}"
+dc_runtime_version_re: '[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?'
+dc_runtime_allow_downgrade: false        # downgrading is the rollback play's job
+dc_runtime_registry_check: true          # `pnpm view <pkg>@<target>` must resolve before the gate
+dc_runtime_min_free_mb: 500
+dc_runtime_fix_execstart: true           # rewrite ONLY the index.js token in ExecStart to the new path
+# `openclaw doctor --fix` is a THIRD configuration-mutation path (TASK-242). Off.
+# Preflight greps openclaw.json for the v2026.8.1 migration triggers; if any is
+# present the play refuses unless this is true, and then runs doctor only after a
+# pre-doctor-fix backup, with a before/after dotted-path diff: any change outside
+# dc_doctor_fix_allowed_keys is a STOP before the restart.
+dc_runtime_doctor_fix: false
+dc_runtime_migration_patterns:
+  - "codex/"
+  - "openai-codex/"
+  - "openprose"
+dc_doctor_fix_allowed_keys:
+  - agents.defaults.model
+  - agents.list.*.model
+  - plugins.entries.openprose
+# Provider plugins v2026.8.1 installs ON DEMAND at Gateway start (needs network,
+# unproven here). If the current config names one, the play refuses.
+dc_runtime_on_demand_providers:
+  - byteplus
+  - comfyui
+  - mistral
+  - novita
+  - opencode
+  - synthetic
+  - volcengine
+  - vydra
+  - xiaomi
+# Schema roots the new build may introduce with behaviour defaulting ON. Reported
+# in the receipt, never adjudicated here — memory posture is TASK-226's decision.
+dc_runtime_watch_roots:
+  - activeMemory
+  - dreaming
+  - selfLearning
+  - grounded
+dc_runtime_record_prefix: "runtime-upgrade"
+dc_runtime_rollback_record: ""           # explicit record path; default = newest by filename timestamp
+dc_runtime_rollback_restore_config: true
+dc_runtime_install_timeout: 600
+dc_runtime_report: >-
+  /tmp/openclaw-runtime-upgrade-{{ ansible_facts['date_time'].iso8601_basic_short | default('run') }}.txt
+dc_runtime_schema_raw_report: >-
+  /tmp/openclaw-schema-raw-{{ dc_runtime_target_version | default('target') }}-{{
+  ansible_facts['date_time'].iso8601_basic_short | default('run') }}.json
+# The build files/schema-keys.json was distilled from. tests/dc_merge_contract.py
+# asserts the fixture's stamp equals this, so the fixture cannot silently describe
+# a build that is gone. Bump it when you regenerate the fixture
+# (files/distill_schema_keys.py) after an upgrade.
+dc_runtime_schema_fixture_version: "2026.7.1-2"

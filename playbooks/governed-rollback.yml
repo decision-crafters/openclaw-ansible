@@ -26,3 +26,20 @@
         tasks_from: rollback
   tags:
     - rollback
+
+# Runtime rollback: reinstall the previous OpenClaw build named in the newest
+# runtime-upgrade record, restore the unit and (by default) the config it names, and
+# prove the running process is the previous build. Distinct from the config rollback
+# above: that play judges backups by the LIVE schema, which after an upgrade is the
+# new build's. See tasks/runtime_rollback.yml.
+- name: Roll back the OpenClaw runtime to the recorded previous build
+  hosts: "{{ dc_target | default('openclaw_hosts') }}"
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Restore the previous runtime from its record
+      ansible.builtin.include_role:
+        name: dc-governed-config
+        tasks_from: runtime_rollback
+  tags:
+    - runtime-rollback

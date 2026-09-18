@@ -54,6 +54,27 @@
     - dc_audit_entrypoint | length == 0
     - dc_fail_closed | bool
 
+# The unit can name a path that no longer exists: the pnpm store path embeds the
+# version and a content hash, so an upgrade that did not rewrite ExecStart leaves a
+# dangling entrypoint. awk still finds it; only stat notices.
+- name: Stat the entrypoint the unit names
+  ansible.builtin.stat:
+    path: "{{ dc_audit_entrypoint }}"
+  register: dc_agent_entry_stat
+  when: dc_audit_entrypoint | length > 0
+
+- name: Refuse an entrypoint that does not exist
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_openclaw_service }} ExecStart names {{ dc_audit_entrypoint }}, which does not
+      exist. The runtime was upgraded or moved without the unit following it.
+      `--tags runtime-upgrade` (dry) shows the derived path; `--tags runtime-rollback`
+      restores the recorded one.
+  when:
+    - dc_audit_entrypoint | length > 0
+    - not (dc_agent_entry_stat.stat.exists | default(false))
+    - dc_fail_closed | bool
+
 - name: Confirm the config verbs this build has
   ansible.builtin.command:
     argv: "{{ dc_audit_cli + ['config', '--help'] }}"

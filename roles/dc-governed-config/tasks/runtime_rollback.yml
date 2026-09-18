@@ -1,0 +1,367 @@
+---
+# Governed runtime rollback: restore the package, unit and (by default) config named
+# in the newest runtime-upgrade RECORD, then prove the running process is the
+# previous build.
+#
+#   ./dc runtime-rollback            dry run: shows the record it would use
+#   ./dc runtime-rollback --apply    restores from that record
+#
+# Why a record and not `rollback.yml`: that play picks the newest backup the LIVE
+# schema accepts. After an upgrade the live schema is the NEW build's, so a
+# pre-upgrade config may be judged by a schema it never met. This play restores the
+# explicit files the upgrade wrote down before it installed anything, and validates
+# the restored config with the RESTORED binary — the only judge that matters for it.
+#
+# The service-account uid is resolved inline rather than through agent_common.yml,
+# because agent_common derives the CLI from the unit's entrypoint — and a broken
+# entrypoint may be exactly what is being rolled back.
+
+- name: Resolve the service account uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ dc_openclaw_user }}"
+
+- name: Record the service account uid
+  ansible.builtin.set_fact:
+    dc_life_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+    dc_openclaw_uid: "{{ ansible_facts.getent_passwd[dc_openclaw_user][1] }}"
+    dc_rr_node: "{{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env', 'HOME=' ~ dc_openclaw_home, dc_runtime_node] }}"
+    dc_rr_pnpm: "{{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env'] + dc_runtime_pnpm_env + [dc_runtime_pnpm] }}"
+
+- name: List the runtime-upgrade records
+  ansible.builtin.find:
+    paths: "{{ dc_openclaw_backup_dir }}"
+    patterns: "{{ dc_runtime_record_prefix }}.*.json"
+    file_type: file
+  register: dc_rr_records
+
+# Ordered by the timestamp in the NAME. select_backup.py learned that modification time is the
+# source's, not the copy's, and can put an old file first.
+- name: Choose the record
+  ansible.builtin.set_fact:
+    dc_rr_record_path: >-
+      {{ dc_runtime_rollback_record if (dc_runtime_rollback_record | length > 0)
+         else ((dc_rr_records.files | map(attribute='path') | sort | last)
+               if (dc_rr_records.files | length > 0) else '') }}
+
+- name: Refuse without a record to restore from
+  ansible.builtin.fail:
+    msg: >-
+      No {{ dc_runtime_record_prefix }}.*.json under {{ dc_openclaw_backup_dir }} and
+      dc_runtime_rollback_record is empty. This play restores from a record the upgrade
+      wrote; without one it would be installing blind. For a config-only rollback use
+      `./dc rollback`.
+  when: dc_rr_record_path | length == 0
+
+- name: Read the record
+  ansible.builtin.slurp:
+    src: "{{ dc_rr_record_path }}"
+  register: dc_rr_record_raw
+
+- name: Parse the record
+  ansible.builtin.set_fact:
+    dc_rr: "{{ dc_rr_record_raw.content | b64decode | from_json }}"
+
+- name: Refuse an incomplete record
+  ansible.builtin.assert:
+    that:
+      - dc_rr.previous_version | default('') | length > 0
+      - dc_rr.previous_entrypoint | default('') | length > 0
+      - dc_rr.config_backup | default('') | length > 0
+      - dc_rr.unit_backup | default('') | length > 0
+      - dc_rr.unit_path | default('') | length > 0
+      - (dc_runtime_previous_version | length == 0) or (dc_runtime_previous_version == dc_rr.previous_version)
+    fail_msg: >-
+      {{ dc_rr_record_path }} lacks a required field, or dc_runtime_previous_version
+      ('{{ dc_runtime_previous_version }}') disagrees with the record ('{{ dc_rr.previous_version | default('?') }}').
+    success_msg: >-
+      record {{ dc_rr_record_path }}: restore {{ dc_rr.previous_version }}
+      (status={{ dc_rr.status | default('?') }})
+
+- name: Stat the record's backups
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: ["{{ dc_rr.config_backup }}", "{{ dc_rr.unit_backup }}", "{{ dc_rr.previous_entrypoint }}"]
+  register: dc_rr_stats
+
+- name: Refuse when a named backup is missing
+  ansible.builtin.fail:
+    msg: "{{ item.item }} does not exist; the record cannot be honoured as written."
+  when: not (item.stat.exists | default(false))
+  loop: "{{ dc_rr_stats.results[0:2] }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Ask the registry for the previous build when the store no longer has it
+  ansible.builtin.command:
+    argv: "{{ dc_rr_pnpm + ['view', dc_runtime_package ~ '@' ~ dc_rr.previous_version, 'version', '--json'] }}"
+    stdin: ""
+  register: dc_rr_view
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  when: not (dc_rr_stats.results[2].stat.exists | default(false))
+
+- name: Refuse when the previous build is reachable neither in the store nor the registry
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_rr.previous_entrypoint }} is gone from the store and
+      `pnpm view {{ dc_runtime_package }}@{{ dc_rr.previous_version }}` rc={{ dc_rr_view.rc | default('?') }}.
+      Nothing to restore from.
+  when:
+    - not (dc_rr_stats.results[2].stat.exists | default(false))
+    - >-
+      (dc_rr_view.rc | default(1)) != 0
+      or (dc_rr_view.stdout | default('') | regex_search(dc_rr.previous_version)) is none
+
+- name: Read the current unit's entrypoint and version, if any
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_rr.unit_path }}
+  register: dc_rr_cur_entry
+  changed_when: false
+  failed_when: false
+
+- name: Ask the current entrypoint for its version
+  ansible.builtin.command:
+    argv: "{{ dc_rr_node + [dc_rr_cur_entry.stdout | trim, '--version'] }}"
+    stdin: ""
+  register: dc_rr_cur_version
+  changed_when: false
+  failed_when: false
+  timeout: 60
+  when: (dc_rr_cur_entry.stdout | default('') | trim | length) > 0
+
+- name: Emit the rollback preflight receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-ROLLBACK PREFLIGHT | record={{ dc_rr_record_path }} |
+      from={{ (dc_rr_cur_version.stdout | default('?')) | regex_search(dc_runtime_version_re) | default('?', true) }} |
+      restore={{ dc_rr.previous_version }} |
+      previous_entrypoint_in_store={{ dc_rr_stats.results[2].stat.exists | default(false) }} |
+      config_backup={{ dc_rr.config_backup }} (restore={{ dc_runtime_rollback_restore_config | bool }}) |
+      unit_backup={{ dc_rr.unit_backup }} | {{ 'APPLYING' if (dc_apply | bool) else 'DRY RUN' }}
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "runtime rollback -> {{ dc_rr.previous_version }} (--tags runtime-rollback)"
+    dc_apply_target: >-
+      pnpm global {{ dc_runtime_package }} + {{ dc_rr.unit_path }} +
+      {{ dc_openclaw_config_path if (dc_runtime_rollback_restore_config | bool) else 'config left as is' }}
+    dc_apply_overlay: "{{ dc_rr }}"
+
+- name: Fix this run's timestamp
+  ansible.builtin.set_fact:
+    dc_rr_ts: "{{ ansible_facts['date_time'].iso8601_basic_short }}"
+
+- name: Preserve the current config so the rollback is itself reversible
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-runtime-rollback.{{ dc_rr_ts }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Preserve the current unit
+  ansible.builtin.copy:
+    src: "{{ dc_rr.unit_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/{{ dc_openclaw_service }}.pre-runtime-rollback.{{ dc_rr_ts }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Reinstall the previous build
+  ansible.builtin.command:
+    argv: "{{ dc_rr_pnpm + ['install', '-g', dc_runtime_package ~ '@' ~ dc_rr.previous_version] }}"
+    stdin: ""
+  register: dc_rr_install
+  changed_when: dc_rr_install.rc == 0
+  failed_when: dc_rr_install.rc != 0
+  timeout: "{{ dc_runtime_install_timeout | int }}"
+
+- name: Resolve the restored package directory
+  ansible.builtin.command:
+    argv: "{{ dc_rr_pnpm + ['root', '-g'] }}"
+    stdin: ""
+  register: dc_rr_root
+  changed_when: false
+  timeout: 60
+
+- name: Resolve the restored entrypoint through the store link
+  ansible.builtin.command:
+    argv: ["readlink", "-f", "{{ dc_rr_root.stdout | trim }}/{{ dc_runtime_package }}"]
+  register: dc_rr_pkgdir
+  changed_when: false
+
+- name: Record the restored entrypoint
+  ansible.builtin.set_fact:
+    dc_rr_entry: "{{ dc_rr_pkgdir.stdout | trim }}/dist/index.js"
+
+- name: Stat the restored entrypoint
+  ansible.builtin.stat:
+    path: "{{ dc_rr_entry }}"
+  register: dc_rr_entry_stat
+
+- name: Ask the restored build for its version
+  ansible.builtin.command:
+    argv: "{{ dc_rr_node + [dc_rr_entry, '--version'] }}"
+    stdin: ""
+  register: dc_rr_version
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse when the restored build is not the previous version
+  ansible.builtin.assert:
+    that:
+      - dc_rr_entry_stat.stat.exists | default(false)
+      - >-
+        ((dc_rr_version.stdout ~ ' ' ~ dc_rr_version.stderr)
+         | regex_search(dc_runtime_version_re) | default('', true)) == dc_rr.previous_version
+    fail_msg: >-
+      Restored entrypoint {{ dc_rr_entry }} exists={{ dc_rr_entry_stat.stat.exists | default(false) }},
+      version '{{ (dc_rr_version.stdout ~ ' ' ~ dc_rr_version.stderr) | trim | truncate(80) }}'
+      != {{ dc_rr.previous_version }}.
+      Unit untouched.
+    success_msg: "restored build reports {{ dc_rr.previous_version }} at {{ dc_rr_entry }}"
+
+- name: Restore the unit byte-for-byte when the store path is the recorded one
+  ansible.builtin.copy:
+    src: "{{ dc_rr.unit_backup }}"
+    dest: "{{ dc_rr.unit_path }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0644'
+  when: dc_rr_entry == dc_rr.previous_entrypoint
+
+- name: Otherwise point ExecStart at the derived entrypoint
+  ansible.builtin.replace:
+    path: "{{ dc_rr.unit_path }}"
+    regexp: '^(ExecStart=.*)\S+/index\.js'
+    replace: '\1{{ dc_rr_entry }}'
+  when: dc_rr_entry != dc_rr.previous_entrypoint
+
+- name: Reload the user unit definitions
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['daemon-reload'] }}"
+  changed_when: true
+
+- name: Restore the recorded config
+  ansible.builtin.copy:
+    src: "{{ dc_rr.config_backup }}"
+    dest: "{{ dc_openclaw_config_path }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  when: dc_runtime_rollback_restore_config | bool
+
+- name: Validate the config with the restored build before restarting
+  ansible.builtin.command:
+    argv: "{{ dc_rr_node + [dc_rr_entry, 'config', 'validate'] }}"
+    stdin: ""
+  register: dc_rr_validate
+  changed_when: false
+  failed_when: dc_rr_validate.rc != 0
+  timeout: 120
+
+- name: Clear the failed state so systemd will start the unit again
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['reset-failed', dc_openclaw_service] }}"
+  register: dc_rr_reset
+  changed_when: dc_rr_reset.rc == 0
+  failed_when: false
+
+- name: Restart the gateway on the restored build
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['restart', dc_openclaw_service] }}"
+  changed_when: true
+
+- name: Let the gateway run long enough to fail twice if it is going to
+  ansible.builtin.wait_for:
+    timeout: 25
+
+- name: Read the unit state and restart counter
+  ansible.builtin.command:
+    argv: >-
+      {{ dc_life_systemctl + dc_life_show
+         + [dc_openclaw_service, '--property=ActiveState,SubState,NRestarts,ExecMainStatus'] }}
+  register: dc_rr_first
+  changed_when: false
+  failed_when: false
+
+- name: Watch for a restart that a single sample would miss
+  ansible.builtin.wait_for:
+    timeout: 20
+
+- name: Read the unit state and restart counter again
+  ansible.builtin.command:
+    argv: >-
+      {{ dc_life_systemctl + dc_life_show
+         + [dc_openclaw_service, '--property=ActiveState,SubState,NRestarts,ExecMainStatus'] }}
+  register: dc_rr_second
+  changed_when: false
+  failed_when: false
+
+- name: Extract the two samples
+  ansible.builtin.set_fact:
+    dc_rr_s1: "{{ dict(dc_rr_first.stdout_lines | default([]) | map('split', '=') | list) }}"
+    dc_rr_s2: "{{ dict(dc_rr_second.stdout_lines | default([]) | map('split', '=') | list) }}"
+
+- name: Confirm the gateway is running and stable
+  ansible.builtin.assert:
+    that:
+      - dc_rr_s2.ActiveState | default('') == 'active'
+      - dc_rr_s2.SubState | default('') == 'running'
+      - (dc_rr_s2.NRestarts | default(0) | int) == (dc_rr_s1.NRestarts | default(0) | int)
+    fail_msg: >-
+      Restored {{ dc_rr.previous_version }} but the unit is not stable:
+      ActiveState={{ dc_rr_s2.ActiveState | default('?') }} SubState={{ dc_rr_s2.SubState | default('?') }}
+      NRestarts {{ dc_rr_s1.NRestarts | default('?') }} -> {{ dc_rr_s2.NRestarts | default('?') }}.
+      `journalctl --user -u {{ dc_openclaw_service }} -n 40` as {{ dc_openclaw_user }}.
+    success_msg: "gateway active and stable (NRestarts held at {{ dc_rr_s2.NRestarts | default('0') }} across 20s)"
+
+- name: Find the running gateway process
+  ansible.builtin.command:
+    argv: ["pgrep", "-af", "openclaw/dist/index.js gateway"]
+  register: dc_rr_pgrep
+  changed_when: false
+  failed_when: false
+
+- name: Confirm the running process is the restored build
+  ansible.builtin.assert:
+    that:
+      - (dc_rr_pgrep.stdout_lines | default([]) | length) == 1
+      - dc_rr_entry in (dc_rr_pgrep.stdout | default(''))
+    fail_msg: >-
+      gateway processes: {{ dc_rr_pgrep.stdout | default('') | truncate(300) }}
+      — expected exactly one running {{ dc_rr_entry }}
+    success_msg: "running process is {{ dc_rr_entry }}"
+
+- name: Mark the record rolled back
+  ansible.builtin.copy:
+    content: >-
+      {{ dc_rr | combine({'rolled_back': dc_rr_ts, 'status': 'rolled-back',
+                          'restored_entrypoint': dc_rr_entry}) | to_nice_json }}
+    dest: "{{ dc_rr_record_path }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Emit the rollback receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-ROLLBACK RECEIPT | record={{ dc_rr_record_path }} | restored={{ dc_rr.previous_version }} |
+      method=pnpm install -g {{ dc_runtime_package }}@{{ dc_rr.previous_version }} |
+      entrypoint={{ dc_rr_entry }} (exists=true) |
+      execstart={{ 'restored-from-record' if dc_rr_entry == dc_rr.previous_entrypoint else 'rewritten-derived' }} |
+      config={{ ('restored ' ~ dc_rr.config_backup) if (dc_runtime_rollback_restore_config | bool) else 'left-as-is' }}
+      (validated by the restored binary rc{{ dc_rr_validate.rc }}) |
+      pre-rollback.config={{ dc_openclaw_backup_dir }}/openclaw.json.pre-runtime-rollback.{{ dc_rr_ts }} |
+      gateway.active={{ dc_rr_s2.ActiveState | default('?') }}/{{ dc_rr_s2.SubState | default('?') }} |
+      NRestarts={{ dc_rr_s2.NRestarts | default('?') }} (stable across 20s) | process.entrypoint={{ dc_rr_entry }}

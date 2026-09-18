@@ -84,6 +84,34 @@ explanation. That is intended.
 
 Set `dc_openclaw_service` to whatever unit onboarding installed.
 
+## Runtime upgrade and rollback (TASK-282)
+
+`roles/openclaw` installs `openclaw@latest` with no pin, gate or backup, so re-running
+`--tags install` on a live host is an uncontrolled upgrade. The controlled path is
+`playbooks/governed-runtime.yml --tags runtime-upgrade` (dry run by default,
+`-e dc_apply=true` to mutate) with `governed-rollback.yml --tags runtime-rollback` as
+its inverse. The target build is `dc_runtime_target_version`, set in the private
+inventory or on the command line — never defaulted here.
+
+Order inside the upgrade play is the control: everything that can refuse runs before
+the apply gate (version parse, registry resolution, free space, migration triggers,
+on-demand provider plugins, `config validate` on the running build); then backups of
+`openclaw.json` and the user unit plus a rollback **record** are written; then
+`pnpm install -g openclaw@<target>` as the service account through the same env the
+install role uses; then the NEW build is proven before the unit is touched
+(`--version`, `config validate`, the governance overlay from `overlay_build.yml`
+against the new schema); then only the `index.js` token in `ExecStart` is rewritten,
+the unit reloaded, the gateway restarted, and the RUNNING process checked (`pgrep`
+argv equals the new entrypoint; `--version` through the unit's entrypoint; two
+NRestarts samples; `verify.yml`). `openclaw doctor --fix` is off by default and, when
+authorised, runs only after a backup with a before/after dotted-path diff against
+`dc_doctor_fix_allowed_keys` (`files/config_diff.py`). Rollback restores the exact
+files the record names and validates the restored config with the restored binary,
+because `--tags rollback` judges backups by the LIVE schema, which after an upgrade is
+the new build's. `files/schema-keys.json` is regenerated with
+`files/distill_schema_keys.py` and its stamp is asserted against
+`dc_runtime_schema_fixture_version` by the merge contract.
+
 ## Evidence
 
 `tasks/verify.yml` re-reads the config **from disk** — not from the value just

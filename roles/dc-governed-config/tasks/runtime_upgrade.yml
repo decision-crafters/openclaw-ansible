@@ -1,0 +1,733 @@
+---
+# Governed runtime upgrade: move the installed OpenClaw package from the running
+# build to dc_runtime_target_version, prove the new build before pointing the unit
+# at it, restart, and prove the running process is the new build.
+#
+#   ./dc runtime-upgrade            dry run: preflight + PREFLIGHT receipt, nothing written
+#   ./dc runtime-upgrade --apply    backups, record, install, prove, ExecStart, restart, verify
+#   ./dc runtime-rollback --apply   the symmetric path (tasks/runtime_rollback.yml)
+#
+# Canonical authority: TASK-282 and the 2026-08-31 Founder decision. This play adds
+# no authority; the version it installs is the one host_vars names.
+#
+# ORDER IS THE CONTROL. Everything that can refuse runs before the apply gate; the
+# backups and the rollback record are written before the install; the new build is
+# proven (`--version`, `config validate`, the governance overlay against the NEW
+# schema) before the unit is touched; the running process is checked after the
+# restart, not the file. tests/dc_merge_contract.py pins that order.
+
+# --- A. establish -------------------------------------------------------------
+- name: Establish the CLI and confirm its verbs
+  ansible.builtin.include_tasks: agent_common.yml
+
+- name: Read the gateway unit
+  ansible.builtin.slurp:
+    src: "{{ dc_runtime_unit_path }}"
+  register: dc_ru_unit_raw
+
+- name: Extract the ExecStart line and its index.js token
+  ansible.builtin.set_fact:
+    dc_ru_unit_text: "{{ dc_ru_unit_raw.content | b64decode }}"
+    dc_ru_execstart_old: >-
+      {{ (dc_ru_unit_raw.content | b64decode | regex_findall('(?m)^ExecStart=.*$')) | first | default('') }}
+    dc_ru_entry_tokens: >-
+      {{ dc_ru_unit_raw.content | b64decode | regex_findall('(?m)^ExecStart=.*$') | join(' ')
+         | regex_findall('\S+/index\.js') }}
+
+- name: Refuse a unit whose ExecStart does not name exactly one entrypoint
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_runtime_unit_path }} ExecStart names {{ dc_ru_entry_tokens | length }} index.js
+      token(s): {{ dc_ru_entry_tokens }}. This play rewrites exactly one; refusing to guess.
+  when:
+    - (dc_ru_entry_tokens | length) != 1
+    - dc_fail_closed | bool
+
+- name: Record the current entrypoint
+  ansible.builtin.set_fact:
+    dc_ru_entry_old: "{{ dc_ru_entry_tokens | first }}"
+    dc_openclaw_entrypoint: "{{ dc_audit_entrypoint }}"
+    # node as the service account, HOME set, no PATH assumptions: the form every
+    # call to a build NOT yet named by the unit uses below.
+    dc_ru_node: "{{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env', 'HOME=' ~ dc_openclaw_home, dc_runtime_node] }}"
+    dc_ru_pnpm: "{{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env'] + dc_runtime_pnpm_env + [dc_runtime_pnpm] }}"
+
+- name: Read the running build's version
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['--version'] }}"
+    stdin: ""
+  register: dc_ru_version_raw
+  changed_when: false
+  failed_when: false
+  timeout: 30
+
+- name: Parse the current version
+  ansible.builtin.set_fact:
+    dc_ru_current: >-
+      {{ (dc_ru_version_raw.stdout ~ ' ' ~ dc_ru_version_raw.stderr) | regex_search(dc_runtime_version_re)
+         | default('', true) }}
+
+- name: Refuse when the current version cannot be parsed
+  ansible.builtin.fail:
+    msg: >-
+      `openclaw --version` returned rc={{ dc_ru_version_raw.rc | default('?') }}
+      '{{ (dc_ru_version_raw.stdout ~ ' ' ~ dc_ru_version_raw.stderr) | trim | truncate(120) }}',
+      which does not match {{ dc_runtime_version_re }}. Will not compare garbage.
+  when:
+    - dc_ru_current | length == 0
+    - dc_fail_closed | bool
+
+- name: Refuse without a target version
+  ansible.builtin.assert:
+    that:
+      - dc_runtime_target_version | length > 0
+      - (dc_runtime_target_version | regex_search('^' ~ dc_runtime_version_re ~ '$')) is not none
+      - dc_runtime_upgrade_method == 'pnpm'
+    fail_msg: >-
+      dc_runtime_target_version must be set to the exact build to install (host_vars or
+      -e), matching {{ dc_runtime_version_re }}; got '{{ dc_runtime_target_version }}'.
+      dc_runtime_upgrade_method must be 'pnpm' (got '{{ dc_runtime_upgrade_method }}').
+    success_msg: "target {{ dc_runtime_target_version }} via {{ dc_runtime_upgrade_method }}"
+
+- name: Nothing to do when the host already runs the target
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-UPGRADE | current={{ dc_ru_current }} == target — nothing to do.
+      Run the read-only revalidation tags if that is what you came for.
+  when: dc_ru_current == dc_runtime_target_version
+
+- name: End the play when already at the target
+  ansible.builtin.meta: end_play
+  when: dc_ru_current == dc_runtime_target_version
+
+- name: Refuse a downgrade
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_runtime_target_version }} is older than the running {{ dc_ru_current }}.
+      Downgrading is the rollback play's job (`./dc runtime-rollback`), which restores
+      from a record rather than installing blind. Set dc_runtime_allow_downgrade=true
+      only with a reason.
+  when:
+    - >-
+      (dc_runtime_target_version | regex_replace('-.*$', ''))
+      is version(dc_ru_current | regex_replace('-.*$', ''), '<')
+    - not (dc_runtime_allow_downgrade | bool)
+    - dc_fail_closed | bool
+
+- name: Ask the registry whether the target exists
+  ansible.builtin.command:
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env'] + dc_runtime_pnpm_env
+         + [dc_runtime_pnpm, 'view', dc_runtime_package ~ '@' ~ dc_runtime_target_version,
+            'version', '--json'] }}
+    stdin: ""
+  register: dc_ru_view
+  changed_when: false
+  failed_when: false
+  timeout: 120
+  when: dc_runtime_registry_check | bool
+
+- name: Refuse when the registry does not resolve the target
+  ansible.builtin.fail:
+    msg: >-
+      `pnpm view {{ dc_runtime_package }}@{{ dc_runtime_target_version }}` rc={{ dc_ru_view.rc | default('?') }}
+      stdout='{{ dc_ru_view.stdout | default('') | trim | truncate(120) }}'
+      stderr='{{ dc_ru_view.stderr | default('') | trim | truncate(200) }}'. The target must resolve to
+      exactly that version before anything is backed up or installed.
+  when:
+    - dc_runtime_registry_check | bool
+    - >-
+      (dc_ru_view.rc | default(1)) != 0
+      or (dc_ru_view.stdout | default('') | regex_search(dc_runtime_target_version)) is none
+    - dc_fail_closed | bool
+
+- name: Measure free space under the service account's home
+  ansible.builtin.set_fact:
+    dc_ru_free_mb: >-
+      {{ ((ansible_facts.mounts | selectattr('mount', 'in', dc_openclaw_home)
+           | sort(attribute='mount') | last | default({'size_available': 0})).size_available | int) // 1048576 }}
+
+- name: Refuse without headroom for a second package tree
+  ansible.builtin.fail:
+    msg: >-
+      {{ dc_ru_free_mb }} MB free under {{ dc_openclaw_home }}; floor is {{ dc_runtime_min_free_mb }} MB.
+      A half-installed package tree is the failure this floor prevents.
+  when:
+    - (dc_ru_free_mb | int) < (dc_runtime_min_free_mb | int)
+    - dc_fail_closed | bool
+
+- name: Read the current config for the migration preflight
+  ansible.builtin.slurp:
+    src: "{{ dc_openclaw_config_path }}"
+  register: dc_ru_config_raw
+
+- name: Classify migration triggers and on-demand providers in the current config
+  ansible.builtin.set_fact:
+    dc_ru_config: "{{ dc_ru_config_raw.content | b64decode | from_json }}"
+    dc_ru_triggers: >-
+      {{ dc_runtime_migration_patterns | select('in', dc_ru_config_raw.content | b64decode) | list }}
+    dc_ru_on_demand: >-
+      {{ (((dc_ru_config_raw.content | b64decode | from_json).plugins | default({})).entries | default({}) | list)
+         | intersect(dc_runtime_on_demand_providers) }}
+    dc_ru_model_refs: >-
+      {{ [((dc_ru_config_raw.content | b64decode | from_json).agents | default({})).defaults | default({})
+          | json_query('model.primary')]
+         + ((((dc_ru_config_raw.content | b64decode | from_json).agents | default({})).list | default([]))
+            | map(attribute='model.primary', default='') | list) }}
+
+- name: Refuse when the config names a provider the new build installs on demand
+  ansible.builtin.fail:
+    msg: >-
+      plugins.entries names {{ dc_ru_on_demand }}, which v2026.8.1 installs on demand at Gateway
+      start. That needs network and is unproven here; migrate those entries deliberately
+      (a `govern` decision) before upgrading.
+  when:
+    - dc_ru_on_demand | length > 0
+    - dc_fail_closed | bool
+
+- name: Refuse when migration triggers are present and doctor --fix is not authorised
+  ansible.builtin.fail:
+    msg: >-
+      openclaw.json contains {{ dc_ru_triggers }}, which v2026.8.1 migrates with `openclaw doctor --fix`
+      — a third configuration-mutation path (TASK-242). Two routes: change the model routes through
+      the governed plays (`model-pin` / `govern`) first, or re-run with -e dc_runtime_doctor_fix=true
+      to let doctor run under the {{ dc_doctor_fix_allowed_keys }} allowlist with a before/after diff.
+  when:
+    - dc_ru_triggers | length > 0
+    - not (dc_runtime_doctor_fix | bool)
+    - dc_fail_closed | bool
+
+- name: Validate the current config with the current build (baseline)
+  ansible.builtin.command:
+    argv: "{{ dc_audit_cli + ['config', 'validate'] }}"
+    stdin: ""
+  register: dc_ru_validate_before
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Sample the unit state before anything changes
+  ansible.builtin.command:
+    argv: >-
+      {{ dc_life_systemctl + dc_life_show + [dc_openclaw_service, '--property=ActiveState,SubState,NRestarts'] }}
+  register: dc_ru_state_before
+  changed_when: false
+  failed_when: false
+
+- name: Emit the preflight receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-UPGRADE PREFLIGHT | current={{ dc_ru_current }} | target={{ dc_runtime_target_version }} |
+      method={{ dc_runtime_upgrade_method }} | entrypoint={{ dc_ru_entry_old }} | unit={{ dc_runtime_unit_path }} |
+      registry={{ dc_ru_view.stdout | default('skipped') | trim | truncate(40) }} |
+      config.validate(current)=rc{{ dc_ru_validate_before.rc | default('?') }} |
+      model_refs={{ dc_ru_model_refs | reject('equalto', '') | list }} |
+      migration_triggers={{ dc_ru_triggers if dc_ru_triggers | length > 0 else 'none' }} |
+      on_demand_providers={{ dc_ru_on_demand if dc_ru_on_demand | length > 0 else 'none' }} |
+      doctor_fix={{ 'AUTHORISED' if (dc_runtime_doctor_fix | bool) else 'disabled' }} |
+      free_mb={{ dc_ru_free_mb }} | unit.state={{ dc_ru_state_before.stdout_lines | default([]) | join(',') }} |
+      would_backup=openclaw.json,{{ dc_openclaw_service }},{{ dc_runtime_record_prefix }} record |
+      {{ 'APPLYING' if (dc_apply | bool) else 'DRY RUN' }}
+
+- name: Gate the write
+  ansible.builtin.include_tasks: apply_gate.yml
+  vars:
+    dc_apply_what: "runtime upgrade {{ dc_ru_current }} -> {{ dc_runtime_target_version }} (--tags runtime-upgrade)"
+    dc_apply_target: >-
+      pnpm global {{ dc_runtime_package }} + {{ dc_runtime_unit_path }} ExecStart;
+      openclaw.json backup-only unless dc_runtime_doctor_fix
+    dc_apply_overlay:
+      current: "{{ dc_ru_current }}"
+      target: "{{ dc_runtime_target_version }}"
+      method: "{{ dc_runtime_upgrade_method }}"
+      entrypoint_old: "{{ dc_ru_entry_old }}"
+      doctor_fix: "{{ dc_runtime_doctor_fix | bool }}"
+      triggers: "{{ dc_ru_triggers }}"
+
+# --- B. backups and the rollback record (after the gate, before the install) ---
+- name: Fix the timestamp every backup of this run shares
+  ansible.builtin.set_fact:
+    dc_ru_ts: "{{ ansible_facts['date_time'].iso8601_basic_short }}"
+    dc_ru_record: >-
+      {{ dc_openclaw_backup_dir }}/{{ dc_runtime_record_prefix }}.{{
+      ansible_facts['date_time'].iso8601_basic_short }}.json
+
+- name: Ensure the backup directory exists
+  ansible.builtin.file:
+    path: "{{ dc_openclaw_backup_dir }}"
+    state: directory
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0700'
+
+- name: Back up the config before the runtime changes
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-runtime-upgrade.{{ dc_ru_ts }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Back up the gateway unit before the runtime changes
+  ansible.builtin.copy:
+    src: "{{ dc_runtime_unit_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/{{ dc_openclaw_service }}.pre-runtime-upgrade.{{ dc_ru_ts }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+# Written BEFORE the install so a failure mid-flight still leaves everything the
+# rollback play needs. Selected by the timestamp in its NAME, never by mtime.
+- name: Write the rollback record
+  ansible.builtin.copy:
+    content: >-
+      {{ {'previous_version': dc_ru_current, 'target_version': dc_runtime_target_version,
+          'previous_entrypoint': dc_ru_entry_old, 'previous_execstart': dc_ru_execstart_old,
+          'config_backup': dc_openclaw_backup_dir ~ '/openclaw.json.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_backup': dc_openclaw_backup_dir ~ '/' ~ dc_openclaw_service
+                         ~ '.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_path': dc_runtime_unit_path, 'method': dc_runtime_upgrade_method,
+          'started': dc_ru_ts, 'status': 'started'} | to_nice_json }}
+    dest: "{{ dc_ru_record }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+# --- C. install and prove the new build before the unit is touched -----------
+- name: Install the target build into the service account's global store
+  ansible.builtin.command:
+    argv: "{{ dc_ru_pnpm + ['install', '-g', dc_runtime_package ~ '@' ~ dc_runtime_target_version] }}"
+    stdin: ""
+  register: dc_ru_install
+  changed_when: dc_ru_install.rc == 0
+  failed_when: false
+  timeout: "{{ dc_runtime_install_timeout | int }}"
+
+- name: Refuse when the install failed
+  ansible.builtin.fail:
+    msg: >-
+      pnpm install rc={{ dc_ru_install.rc }}: {{ dc_ru_install.stderr | default('') | trim | truncate(400) }}.
+      The global store may be partially changed; the unit and the running process are untouched.
+      Recover with `./dc runtime-rollback --apply` (record {{ dc_ru_record }}).
+  when: dc_ru_install.rc != 0
+
+- name: Resolve the new package directory
+  ansible.builtin.command:
+    argv: "{{ dc_ru_pnpm + ['root', '-g'] }}"
+    stdin: ""
+  register: dc_ru_root
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Resolve the new entrypoint through the store link
+  ansible.builtin.command:
+    argv: ["readlink", "-f", "{{ dc_ru_root.stdout | trim }}/{{ dc_runtime_package }}"]
+  register: dc_ru_pkgdir
+  changed_when: false
+  failed_when: false
+
+- name: Record the new entrypoint
+  ansible.builtin.set_fact:
+    dc_ru_entry_new: "{{ dc_ru_pkgdir.stdout | trim }}/dist/index.js"
+
+- name: Stat the new entrypoint
+  ansible.builtin.stat:
+    path: "{{ dc_ru_entry_new }}"
+  register: dc_ru_entry_new_stat
+
+- name: Refuse when the new entrypoint does not exist
+  ansible.builtin.fail:
+    msg: >-
+      pnpm reported root '{{ dc_ru_root.stdout | default('') | trim }}' but {{ dc_ru_entry_new }} does not
+      exist. The unit still points at {{ dc_ru_entry_old }} and the old process is serving.
+      Recover with `./dc runtime-rollback --apply`.
+  when: not (dc_ru_entry_new_stat.stat.exists | default(false))
+
+- name: Ask the new build for its version
+  ansible.builtin.command:
+    argv: "{{ dc_ru_node + [dc_ru_entry_new, '--version'] }}"
+    stdin: ""
+  register: dc_ru_new_version
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Refuse when the new build is not the target
+  ansible.builtin.assert:
+    that:
+      - (dc_ru_new_version.rc | default(1)) == 0
+      - >-
+        ((dc_ru_new_version.stdout ~ ' ' ~ dc_ru_new_version.stderr)
+         | regex_search(dc_runtime_version_re) | default('', true)) == dc_runtime_target_version
+    fail_msg: >-
+      {{ dc_ru_entry_new }} --version rc={{ dc_ru_new_version.rc | default('?') }}
+      '{{ (dc_ru_new_version.stdout ~ ' ' ~ dc_ru_new_version.stderr) | trim | truncate(120) }}' is not
+      {{ dc_runtime_target_version }}. Unit untouched. `./dc runtime-rollback --apply`.
+    success_msg: "new build reports {{ dc_runtime_target_version }}"
+
+- name: Validate the current config with the NEW build
+  ansible.builtin.command:
+    argv: "{{ dc_ru_node + [dc_ru_entry_new, 'config', 'validate'] }}"
+    stdin: ""
+  register: dc_ru_validate_new
+  changed_when: false
+  failed_when: false
+  timeout: 120
+
+- name: Refuse a config the new build rejects
+  ansible.builtin.fail:
+    msg: >-
+      The {{ dc_runtime_target_version }} build rejects the current openclaw.json (rc={{ dc_ru_validate_new.rc }}):
+      {{ (dc_ru_validate_new.stdout ~ ' ' ~ dc_ru_validate_new.stderr) | trim | truncate(600) }}.
+      The OLD process is still serving it. Migrate under governance or `./dc runtime-rollback --apply`.
+  when: dc_ru_validate_new.rc != 0
+
+- name: Obtain the NEW build's config schema
+  ansible.builtin.command:
+    argv: "{{ dc_ru_node + [dc_ru_entry_new, 'config', 'schema'] }}"
+    stdin: ""
+  register: dc_ru_schema
+  changed_when: false
+  failed_when: false
+  timeout: 180
+
+- name: Refuse without a schema from the new build
+  ansible.builtin.fail:
+    msg: >-
+      The new build produced no schema (rc={{ dc_ru_schema.rc }}); refusing to restart into a
+      build nothing can check.
+  when: (dc_ru_schema.rc | default(1)) != 0 or (dc_ru_schema.stdout | default('') | length) < 10000
+
+- name: Build the governance overlay
+  ansible.builtin.include_tasks: overlay_build.yml
+
+- name: Stage the new schema where the validator can read it
+  ansible.builtin.copy:
+    content: "{{ dc_ru_schema.stdout }}"
+    dest: "{{ dc_schema_staging_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+  changed_when: false
+
+- name: Check the governance overlay against the NEW schema
+  ansible.builtin.script:
+    cmd: >-
+      files/validate_overlay.py
+      {{ dc_governance_overlay | to_json | quote }}
+      {{ dc_schema_staging_path | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: dc_ru_overlay_check
+  changed_when: false
+  failed_when: false
+
+- name: Preserve the new build's raw schema for diff and fixture regeneration
+  ansible.builtin.copy:
+    src: "{{ dc_schema_staging_path }}"
+    dest: "{{ dc_runtime_schema_raw_report }}"
+    remote_src: true
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+  changed_when: false
+
+- name: Remove the staged schema
+  ansible.builtin.file:
+    path: "{{ dc_schema_staging_path }}"
+    state: absent
+  changed_when: false
+
+- name: Refuse an overlay the new schema rejects
+  ansible.builtin.fail:
+    msg: >-
+      The governance overlay `--tags govern` writes is illegal under the {{ dc_runtime_target_version }}
+      schema: {{ dc_ru_overlay_check.stdout | default('') | trim | truncate(600) }}. Do not restart into
+      a build that would reject the next governed write. Unit untouched; `./dc runtime-rollback --apply`.
+  when: (dc_ru_overlay_check.rc | default(1)) != 0
+
+- name: Note which watched schema roots the new build declares
+  ansible.builtin.set_fact:
+    dc_ru_watch_hits: "{{ dc_runtime_watch_roots | select('in', dc_ru_schema.stdout) | list }}"
+
+# --- C2. optional, authorised migration through doctor --fix ------------------
+- name: Back up the config before doctor --fix
+  ansible.builtin.copy:
+    src: "{{ dc_openclaw_config_path }}"
+    dest: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-doctor-fix.{{ dc_ru_ts }}"
+    remote_src: true
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+  when: dc_runtime_doctor_fix | bool
+
+- name: Run doctor --fix under the new build
+  ansible.builtin.command:
+    argv: >-
+      {{ [dc_runuser, '-u', dc_openclaw_user, '--', 'env', 'HOME=' ~ dc_openclaw_home,
+          'XDG_RUNTIME_DIR=/run/user/' ~ dc_openclaw_uid, dc_runtime_node, dc_ru_entry_new, 'doctor', '--fix'] }}
+    stdin: ""
+  register: dc_ru_doctor
+  changed_when: dc_ru_doctor.rc == 0
+  failed_when: false
+  timeout: "{{ dc_doctor_timeout | int }}"
+  when: dc_runtime_doctor_fix | bool
+
+- name: Stage the config before and after doctor --fix for the diff
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: '0600'
+  loop:
+    - src: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-doctor-fix.{{ dc_ru_ts }}"
+      dest: "/root/.dc-config-before.json"
+    - src: "{{ dc_openclaw_config_path }}"
+      dest: "/root/.dc-config-after.json"
+  changed_when: false
+  when: dc_runtime_doctor_fix | bool
+
+- name: Diff what doctor changed against the allowlist
+  ansible.builtin.script:
+    cmd: >-
+      files/config_diff.py /root/.dc-config-before.json /root/.dc-config-after.json
+      --allow {{ dc_doctor_fix_allowed_keys | join(',') | quote }}
+    executable: "{{ ansible_python_interpreter | default('/usr/bin/python3') }}"
+  register: dc_ru_doctor_diff
+  changed_when: false
+  failed_when: false
+  when: dc_runtime_doctor_fix | bool
+
+- name: Remove the staged diff inputs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: ["/root/.dc-config-before.json", "/root/.dc-config-after.json"]
+  changed_when: false
+  when: dc_runtime_doctor_fix | bool
+
+- name: Refuse when doctor changed anything outside the allowlist
+  ansible.builtin.fail:
+    msg: >-
+      doctor --fix changed configuration outside {{ dc_doctor_fix_allowed_keys }}:
+      {{ dc_ru_doctor_diff.stdout | default('') | trim | truncate(600) }}. The file changed; the old
+      process is untouched. `./dc runtime-rollback --apply` restores config and runtime.
+  when:
+    - dc_runtime_doctor_fix | bool
+    - (dc_ru_doctor_diff.rc | default(2)) != 0
+
+- name: Report the doctor --fix result
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-DOCTOR-FIX | rc={{ dc_ru_doctor.rc | default('?') }} |
+      {{ dc_ru_doctor_diff.stdout | default('') | trim | truncate(400) }} |
+      backup={{ dc_openclaw_backup_dir }}/openclaw.json.pre-doctor-fix.{{ dc_ru_ts }}
+  when: dc_runtime_doctor_fix | bool
+
+# --- C3. point the unit at the new build ---------------------------------------
+- name: Refuse to leave the unit on the old entrypoint
+  ansible.builtin.fail:
+    msg: >-
+      ExecStart names {{ dc_ru_entry_old }}; the new build is {{ dc_ru_entry_new }} and
+      dc_runtime_fix_execstart is false. Nothing restarted; the old process is serving.
+  when:
+    - dc_ru_entry_new != dc_ru_entry_old
+    - not (dc_runtime_fix_execstart | bool)
+
+- name: Point ExecStart at the new entrypoint
+  ansible.builtin.replace:
+    path: "{{ dc_runtime_unit_path }}"
+    regexp: '^(ExecStart=.*){{ dc_ru_entry_old | regex_escape }}'
+    replace: '\1{{ dc_ru_entry_new }}'
+  when: dc_ru_entry_new != dc_ru_entry_old
+  notify: Restart openclaw gateway
+
+- name: Re-read the unit
+  ansible.builtin.slurp:
+    src: "{{ dc_runtime_unit_path }}"
+  register: dc_ru_unit_after
+
+- name: Confirm exactly the ExecStart line changed
+  ansible.builtin.assert:
+    that:
+      - >-
+        (dc_ru_unit_after.content | b64decode | regex_findall('(?m)^ExecStart=.*$') | join(' ')
+         | regex_findall('\S+/index\.js')) == [dc_ru_entry_new]
+      - >-
+        (dc_ru_unit_text | regex_replace(dc_ru_entry_old | regex_escape, dc_ru_entry_new))
+        == (dc_ru_unit_after.content | b64decode)
+    fail_msg: >-
+      The unit differs from the original in more than the entrypoint token; refusing to reload it.
+      Backup: {{ dc_openclaw_backup_dir }}/{{ dc_openclaw_service }}.pre-runtime-upgrade.{{ dc_ru_ts }}
+    success_msg: "unit ExecStart -> {{ dc_ru_entry_new }}"
+
+- name: Reload the user unit definitions
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['daemon-reload'] }}"
+  changed_when: true
+
+- name: Update the rollback record
+  ansible.builtin.copy:
+    content: >-
+      {{ {'previous_version': dc_ru_current, 'target_version': dc_runtime_target_version,
+          'previous_entrypoint': dc_ru_entry_old, 'previous_execstart': dc_ru_execstart_old,
+          'new_entrypoint': dc_ru_entry_new,
+          'config_backup': dc_openclaw_backup_dir ~ '/openclaw.json.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_backup': dc_openclaw_backup_dir ~ '/' ~ dc_openclaw_service
+                         ~ '.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_path': dc_runtime_unit_path, 'method': dc_runtime_upgrade_method,
+          'doctor_fix_ran': dc_runtime_doctor_fix | bool,
+          'execstart_action': ('rewritten' if dc_ru_entry_new != dc_ru_entry_old else 'unchanged'),
+          'started': dc_ru_ts, 'status': 'installed'} | to_nice_json }}
+    dest: "{{ dc_ru_record }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+# --- D. restart and prove the running process -----------------------------------
+- name: Restart the gateway before verifying it
+  ansible.builtin.meta: flush_handlers
+
+- name: Force a restart when the entrypoint did not change
+  ansible.builtin.command:
+    argv: "{{ dc_life_systemctl + ['restart', dc_openclaw_service] }}"
+  changed_when: true
+  when: dc_ru_entry_new == dc_ru_entry_old
+
+- name: Re-derive the entrypoint from the unit that is now in force
+  ansible.builtin.shell:
+    cmd: >-
+      awk -F' ' '/^ExecStart=/ {for (i=1; i<=NF; i++) if ($i ~ /index\.js$/) {print $i; exit}}'
+      {{ dc_runtime_unit_path }}
+  register: dc_ru_entry_final_probe
+  changed_when: false
+
+- name: Ask the unit's entrypoint for its version after the restart
+  ansible.builtin.command:
+    argv: "{{ dc_ru_node + [dc_ru_entry_final_probe.stdout | trim, '--version'] }}"
+    stdin: ""
+  register: dc_ru_version_after
+  changed_when: false
+  failed_when: false
+  timeout: 60
+
+- name: Find the running gateway process
+  ansible.builtin.command:
+    argv: ["pgrep", "-af", "openclaw/dist/index.js gateway"]
+  register: dc_ru_pgrep
+  changed_when: false
+  failed_when: false
+
+- name: Confirm the running process is the new build
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((dc_ru_version_after.stdout ~ ' ' ~ dc_ru_version_after.stderr)
+         | regex_search(dc_runtime_version_re) | default('', true)) == dc_runtime_target_version
+      - (dc_ru_pgrep.stdout_lines | default([]) | length) == 1
+      - dc_ru_entry_new in (dc_ru_pgrep.stdout | default(''))
+    fail_msg: >-
+      After the restart: unit entrypoint version=
+      '{{ (dc_ru_version_after.stdout ~ ' ' ~ dc_ru_version_after.stderr) | trim | truncate(80) }}',
+      gateway processes={{ dc_ru_pgrep.stdout_lines | default([]) | length }}:
+      {{ dc_ru_pgrep.stdout | default('') | truncate(300) }}. The PROCESS must run {{ dc_ru_entry_new }}.
+      `./dc runtime-rollback --apply`.
+    success_msg: "running process is {{ dc_runtime_target_version }} at {{ dc_ru_entry_new }}"
+
+- name: Validate the config through the running build
+  ansible.builtin.command:
+    argv: "{{ dc_ru_node + [dc_ru_entry_new, 'config', 'validate'] }}"
+    stdin: ""
+  register: dc_ru_validate_after
+  changed_when: false
+  failed_when: dc_ru_validate_after.rc != 0
+  timeout: 120
+
+- name: Point the verifier at the new entrypoint
+  ansible.builtin.set_fact:
+    dc_openclaw_entrypoint: "{{ dc_ru_entry_new }}"
+
+- name: Verify the governed controls survived the upgrade
+  ansible.builtin.include_tasks: verify.yml
+
+- name: Mark the record verified
+  ansible.builtin.copy:
+    content: >-
+      {{ {'previous_version': dc_ru_current, 'target_version': dc_runtime_target_version,
+          'previous_entrypoint': dc_ru_entry_old, 'previous_execstart': dc_ru_execstart_old,
+          'new_entrypoint': dc_ru_entry_new,
+          'config_backup': dc_openclaw_backup_dir ~ '/openclaw.json.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_backup': dc_openclaw_backup_dir ~ '/' ~ dc_openclaw_service
+                         ~ '.pre-runtime-upgrade.' ~ dc_ru_ts,
+          'unit_path': dc_runtime_unit_path, 'method': dc_runtime_upgrade_method,
+          'doctor_fix_ran': dc_runtime_doctor_fix | bool,
+          'execstart_action': ('rewritten' if dc_ru_entry_new != dc_ru_entry_old else 'unchanged'),
+          'started': dc_ru_ts, 'status': 'verified'} | to_nice_json }}
+    dest: "{{ dc_ru_record }}"
+    owner: "{{ dc_openclaw_user }}"
+    group: "{{ dc_openclaw_user }}"
+    mode: '0600'
+
+- name: Compose the report and receipt fields
+  ansible.builtin.set_fact:
+    dc_ru_cfg_backup: "{{ dc_openclaw_backup_dir }}/openclaw.json.pre-runtime-upgrade.{{ dc_ru_ts }}"
+    dc_ru_unit_backup: "{{ dc_openclaw_backup_dir }}/{{ dc_openclaw_service }}.pre-runtime-upgrade.{{ dc_ru_ts }}"
+    dc_ru_execstart_action: "{{ 'rewritten' if dc_ru_entry_new != dc_ru_entry_old else 'unchanged' }}"
+    dc_ru_doctor_summary: >-
+      {{ ('ran rc=' ~ (dc_ru_doctor.rc | default('?')) ~ ' ' ~ (dc_ru_doctor_diff.stdout | default('') | trim))
+         if (dc_runtime_doctor_fix | bool) else 'not-run (no migration triggers)' }}
+    dc_ru_watch_summary: "{{ dc_ru_watch_hits if dc_ru_watch_hits | length > 0 else 'none' }}"
+    dc_ru_revalidation: >-
+      cli-surface schema-evidence doctor audit sandbox-audit isolation-verify subagent-conformance
+      plugin-inspect memory-evidence slack-evidence
+
+- name: Write the upgrade report
+  ansible.builtin.copy:
+    content: |
+      DC RUNTIME UPGRADE REPORT — {{ dc_ru_ts }}
+      previous={{ dc_ru_current }} installed={{ dc_runtime_target_version }} method={{ dc_runtime_upgrade_method }}
+      registry: {{ dc_ru_view.stdout | default('skipped') | trim }}
+      install rc={{ dc_ru_install.rc }}
+      entrypoint.old={{ dc_ru_entry_old }}
+      entrypoint.new={{ dc_ru_entry_new }}
+      execstart.old={{ dc_ru_execstart_old }}
+      execstart={{ dc_ru_execstart_action }}
+      config.validate(current build)=rc{{ dc_ru_validate_before.rc | default('?') }}
+      config.validate(new build, before restart)=rc{{ dc_ru_validate_new.rc }}
+      config.validate(running build)=rc{{ dc_ru_validate_after.rc }}
+      overlay vs new schema: rc{{ dc_ru_overlay_check.rc | default('?') }}
+      {{ dc_ru_overlay_check.stdout | default('') | trim }}
+      schema bytes={{ dc_ru_schema.stdout | length }} raw={{ dc_runtime_schema_raw_report }}
+      watched roots declared by the new schema: {{ dc_ru_watch_summary }}
+      doctor_fix: {{ dc_ru_doctor_summary }}
+      migration_triggers={{ dc_ru_triggers }} on_demand_providers={{ dc_ru_on_demand }}
+      model_refs={{ dc_ru_model_refs }}
+      backups: {{ dc_ru_cfg_backup }} ; {{ dc_ru_unit_backup }}
+      record: {{ dc_ru_record }}
+      process: {{ dc_ru_pgrep.stdout | default('') | trim }}
+      REVALIDATION NOT RUN BY THIS PLAY: {{ dc_ru_revalidation }}
+    dest: "{{ dc_runtime_report }}"
+    owner: "{{ dc_audit_report_owner }}"
+    group: "{{ dc_audit_report_owner }}"
+    mode: '0600'
+
+- name: Emit the upgrade receipt
+  ansible.builtin.debug:
+    msg: >-
+      DC-RUNTIME-UPGRADE RECEIPT | previous={{ dc_ru_current }} | installed={{ dc_runtime_target_version }} |
+      method=pnpm install -g {{ dc_runtime_package }}@{{ dc_runtime_target_version }} |
+      entrypoint.old={{ dc_ru_entry_old }} |
+      entrypoint.new={{ dc_ru_entry_new }} (exists=true version={{ dc_runtime_target_version }}) |
+      execstart={{ dc_ru_execstart_action }} | config.validate(new)=rc{{ dc_ru_validate_after.rc }} |
+      overlay.schema={{ 'accepted' if (dc_ru_overlay_check.rc | default(1)) == 0 else 'REJECTED' }} |
+      doctor_fix={{ dc_ru_doctor_summary }} |
+      new_schema_roots_watch={{ dc_ru_watch_summary }} (REPORTED, not adjudicated — see memory-evidence) |
+      config.backup={{ dc_ru_cfg_backup }} | unit.backup={{ dc_ru_unit_backup }} | record={{ dc_ru_record }} |
+      process.entrypoint={{ dc_ru_entry_new }} (matches unit) |
+      report={{ dc_runtime_report }} | raw_schema={{ dc_runtime_schema_raw_report }} |
+      REVALIDATION NOT RUN BY THIS PLAY: {{ dc_ru_revalidation }} |
+      rollback=./dc runtime-rollback --apply
